@@ -307,8 +307,17 @@ def main():
     controller.engine = engine
 
     global ADMIN
+    # Built React bundle. CI bakes it into the image at /app/webui_dist; a
+    # source checkout can point OASIS_WEB_DIST at webui/dist.
+    static_dir = env("OASIS_WEB_DIST") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "webui_dist")
+    if not os.path.isfile(os.path.join(static_dir, "index.html")):
+        log("warn", f"no built frontend at {static_dir} - the admin UI will "
+                    f"show build instructions. Run `npm run build` in webui/, "
+                    f"or use the published image.")
     ADMIN = WebAdmin(store, conf, STATUS, pool, LOGS, controller,
-                     password=env("OASIS_WEB_PASSWORD"), log=log)
+                     password=env("OASIS_WEB_PASSWORD"), static_dir=static_dir,
+                     log=log)
 
     oneshot = env("OASIS_ONESHOT") == "1"
     idle = env_int("OASIS_IDLE", 30)

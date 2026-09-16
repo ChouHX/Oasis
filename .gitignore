@@ -19,6 +19,10 @@ oasis_gui/oasis_config.json
 __pycache__/
 *.py[cod]
 
+# ---- frontend ----
+node_modules/
+webui/dist/
+
 # ---- build output ----
 dist/
 build/

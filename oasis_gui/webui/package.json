@@ -1,0 +1,22 @@
+{
+  "name": "oasis-webui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Oasis 控制台的 Web 管理界面（React + Ant Design）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "antd": "5.29.3",
+    "@ant-design/icons": "5.5.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "4.3.4",
+    "vite": "5.4.11"
+  }
+}

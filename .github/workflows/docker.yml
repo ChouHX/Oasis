@@ -16,6 +16,7 @@ on:
       - "oasis_gui/requirements.txt"
       - "oasis_gui/service.py"
       - "oasis_gui/core/**"
+      - "oasis_gui/webui/**"
       - ".github/workflows/docker.yml"
   pull_request:
     paths:
@@ -65,6 +66,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # The Playwright base layer is the expensive part and never changes
-          # between builds, so keep it warm.
+          # between builds, so keep it warm. The node stage keeps its own.
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -5,4 +5,10 @@
 !core/
 !core/*.py
 !requirements.txt
+!webui/
+!webui/**
 !Dockerfile
+
+# the frontend stage runs npm install itself
+webui/node_modules/
+webui/dist/
