@@ -510,6 +510,78 @@ socks5://127.0.0.1:10808|socks5://用户:密码@PROXY_HOST:PORT
 
 > 排查期间我一度根据前端 bundle 里 `Iy({...captcha...})` 判断"verify 现在要 captcha"，**那是错的**——那段代码属于 landing2/closed 注册入口，不是 `/registration` 的邮箱步骤。以真实抓包为准。
 
+## Web 管理界面
+
+服务端带一个网页管理界面，页面结构与桌面端一一对应（仪表盘 / 邮箱池 / 代理池 /
+预约记录 / 日志 / 设置）。**只用标准库**，不引额外依赖，镜像不变大。
+
+```
+http://<服务器>:8080/
+```
+
+### 认证是强制的
+
+界面能**启停引擎、看到账号池、导出凭据**，所以 `OASIS_WEB_PASSWORD` 没设时
+服务会**直接拒绝启动**，而不是"开着但没锁"：
+
+```
+[error] OASIS_WEB_PASSWORD is not set - the admin UI exposes the account pool
+        and can start/stop the engine, so it will not be served without a
+        password. Set it in .env.
+```
+
+实现细节：
+
+- 密码用 `hmac.compare_digest` **常量时间比较**，不留时序侧信道
+- 登录成功发 `oasis_session` Cookie（`HttpOnly` + `SameSite=Lax`，12 小时）
+- **未认证时所有 `/api/*` 一律 401**，`/` 只返回登录页——包括 `POST /api/start`
+  和 `/api/export`，实测六个接口全部挡住
+- 登录失败限流：同一实例 15 分钟内 6 次即 429
+
+### 双重防护
+
+`docker-compose.yml` 里端口已经绑在 `127.0.0.1`，公网访问不到：
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
+
+要远程访问就用 SSH 隧道：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@服务器
+# 然后本地开 http://127.0.0.1:8080
+```
+
+**不要把 8080 直接暴露到公网**——密码只是一层，界面上还有导出全部凭据的按钮。
+
+### 运行时可调项会落盘
+
+网页上改的线程数、模式、场次、超时会写进 `oasis_config.json`（默认在数据库
+同目录，跟着 volume 持久化），**下一轮就生效，不用重启**。
+
+优先级：`.env` 里**实际设置了**的变量在启动时写入文件；没设的沿用文件里的值。
+也就是 `.env` 描述部署，网页描述这次运行。
+
+### 接口
+
+| 路径 | 说明 |
+| --- | --- |
+| `GET /` | 管理页面（未登录时是登录页） |
+| `POST /login`、`/logout` | 会话 |
+| `GET /api/state` | 统计 + 本机信息 + 配置 + 运行状态 |
+| `GET /api/accounts?status=&page=` | 账号列表（每页 50） |
+| `GET /api/registrations` | 预约记录 |
+| `GET /api/proxies` | 代理池健康度（地址里的 `user:pass` 已遮罩） |
+| `GET /api/log?since=` | 增量日志（环形缓冲 2000 行） |
+| `POST /api/start`、`/api/stop` | 启停 |
+| `POST /api/config` | 改配置并落盘 |
+| `POST /api/accounts/reset`、`/api/accounts/delete` | 重置 / 清理 |
+| `POST /api/vacuum` | SQLite 压缩 |
+| `GET /api/export?what=creds\|accounts` | 导出 |
+| `GET /health`、`/stats` | 给监控用的极简探针 |
+
 ## iCloud 隐藏邮箱（HME）接入
 
 对接本地部署的 iCloud Hide-My-Email 服务（默认 `http://127.0.0.1:8081`）。

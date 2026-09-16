@@ -34,16 +34,21 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core import registrar, sysinfo                # noqa: E402
+from core.webui import LogRing, WebAdmin            # noqa: E402
 from core.engine import Engine                     # noqa: E402
+from core.config import Config                      # noqa: E402
 from core.proxy_pool import ProxyPool              # noqa: E402
 from core.store import Store                       # noqa: E402
 
-STOP = threading.Event()
+STOP = threading.Event()      # shutdown
+WAKE = threading.Event()      # "start a round now", set by the web UI
+LOGS = LogRing()
 
 
 def env(name, default=""):
@@ -68,32 +73,87 @@ def split_list(raw):
 
 def log(level, msg):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] {msg}", flush=True)
+    LOGS.add(level, msg)
+
+
+# env var -> config key, for the keys an operator may also edit in the web UI.
+# Only variables actually set are written into the file, so a deployment that
+# sets none of them still gets the DEFAULTS.
+ENV_KEYS = {
+    "OASIS_MODE": "mode",
+    "OASIS_SHOWS": "shows",
+    "OASIS_THREADS": "threads",
+    "OASIS_LINK_TIMEOUT": "link_timeout",
+    "OASIS_THINK_TIME": "think_time",
+    "OASIS_HTTP_TIMEOUT": "http_timeout",
+    "OASIS_VERIFY_SUCCESS": "verify_success",
+    "OASIS_SEND_CAPTCHA": "send_captcha",
+    "OASIS_SUCCESS_TIMEOUT": "success_timeout",
+    "OASIS_FRONT_PROXY": "front_proxy",
+    "OASIS_MAIL_PROXY": "mail_proxy",
+    "OASIS_GOOGLE_PROXY": "google_proxy",
+    "OASIS_HME_BASE": "hme_base",
+    "OASIS_HME_PASSWORD": "hme_password",
+    "OASIS_STRICT_EGRESS": "strict_egress",
+}
+_INT_KEYS = ("threads", "link_timeout", "think_time", "http_timeout",
+             "success_timeout")
+_BOOL_KEYS = ("verify_success", "send_captcha", "strict_egress")
 
 
 def build_config():
-    mode = env("OASIS_MODE", "browser").lower()
-    threads = env_int("OASIS_THREADS", 0)
-    note = ""
-    if threads <= 0:
-        threads, note = sysinfo.recommend_threads(mode)
-        log("info", f"OASIS_THREADS unset -> {threads} worker(s) ({note})")
-    return {
+    """Returns (conf, boot).
+
+    `conf` is the persisted Config that the engine and the web UI both read, so
+    an edit made in the browser survives a restart. `boot` holds the two values
+    that stay deployment-only - the account pool path and the proxy list - plus
+    the resolved thread count.
+
+    Precedence: an env var that is actually set wins on boot and is written
+    into the file; anything else keeps whatever the file already had. That way
+    .env describes the deployment, and the web UI describes the run.
+    """
+    boot = {
         "db_path": env("OASIS_DB", "/data/oasis.db"),
         "proxies": split_list(env("OASIS_PROXIES")),
-        "front_proxy": env("OASIS_FRONT_PROXY"),
-        "mail_proxy": env("OASIS_MAIL_PROXY"),
-        "google_proxy": env("OASIS_GOOGLE_PROXY"),
-        "hme_base": env("OASIS_HME_BASE", "http://127.0.0.1:8081"),
-        "hme_password": env("OASIS_HME_PASSWORD"),
-        "mode": mode,
-        "threads": threads,
-        "shows": split_list(env("OASIS_SHOWS")) or list(registrar.DEFAULT_ORDER),
-        "link_timeout": env_int("OASIS_LINK_TIMEOUT", 240),
-        "think_time": env_int("OASIS_THINK_TIME", 45),
-        "http_timeout": env_int("OASIS_HTTP_TIMEOUT", 60),
-        "verify_success": env("OASIS_VERIFY_SUCCESS", "1") == "1",
-        "success_timeout": env_int("OASIS_SUCCESS_TIMEOUT", 150),
     }
+    cfg_path = env("OASIS_CONFIG") or os.path.join(
+        os.path.dirname(boot["db_path"]) or ".", "oasis_config.json")
+    fresh = not os.path.exists(cfg_path)
+    conf = Config(cfg_path)
+
+    if fresh:
+        # First boot starts from the service's own defaults, not the desktop
+        # console's. The desktop defaults to hybrid because its window can pick
+        # a mode; an unattended server wants the full browser flow, and wants
+        # its thread count derived from the machine rather than a fixed 4.
+        conf.data["mode"] = "browser"
+        conf.data["threads"] = 0
+        conf.data["shows"] = list(registrar.DEFAULT_ORDER)
+
+    for var, key in ENV_KEYS.items():
+        raw = os.environ.get(var)
+        if raw is None or not raw.strip():
+            continue
+        if key == "shows":
+            conf.data[key] = split_list(raw)
+        elif key in _INT_KEYS:
+            conf.data[key] = env_int(var, conf.get(key))
+        elif key in _BOOL_KEYS:
+            conf.data[key] = raw.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            conf.data[key] = raw.strip()
+
+    if not conf.get("threads"):
+        n, note = sysinfo.recommend_threads(conf.get("mode", "browser"))
+        conf.data["threads"] = n
+        log("info", f"OASIS_THREADS unset -> {n} worker(s) ({note})")
+    # Reflect the real pool path, so the settings page shows what is in use
+    # rather than whatever the shared DEFAULTS happen to say.
+    conf.data["db_path"] = boot["db_path"]
+    conf.save()
+    boot["threads"] = int(conf.get("threads") or 1)
+    return conf, boot
 
 
 class Status:
@@ -123,23 +183,57 @@ STATUS = Status()
 
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith("/health"):
-            snap = STATUS.snapshot()
-            body = {"ok": not STOP.is_set(), "state": snap["state"]}
-        elif self.path.startswith("/stats"):
-            body = STATUS.snapshot()
-        else:
-            body = {"endpoints": ["/health", "/stats"]}
-        raw = json.dumps(body, ensure_ascii=False, indent=1).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json; charset=utf-8")
-        self.send_header("content-length", str(len(raw)))
+    """Everything goes through WebAdmin, including auth."""
+
+    def _serve(self, method):
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = None
+        if length:
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = None
+        status, headers, payload = ADMIN.handle(
+            self, method, parsed.path,
+            urllib.parse.parse_qs(parsed.query), body)
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("content-length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(raw)
+        if method != "HEAD":
+            self.wfile.write(payload)
+
+    def do_GET(self):
+        self._serve("GET")
+
+    def do_POST(self):
+        self._serve("POST")
 
     def log_message(self, *a):
         pass
+
+
+class Controller:
+    """What the web UI may do to the engine - start a round, stop it, ask."""
+
+    def __init__(self):
+        self.engine = None
+
+    def running(self):
+        return bool(self.engine and (self.engine.running or self.engine.busy))
+
+    def start(self, threads, mode):
+        WAKE.set()
+
+    def stop(self):
+        if self.engine:
+            self.engine.stop()
+
+
+ADMIN = None
 
 
 def on_event(kind, payload=None):
@@ -161,16 +255,16 @@ def on_event(kind, payload=None):
 
 
 def main():
-    cfg = build_config()
-    if not cfg["proxies"]:
+    conf, boot = build_config()
+    if not boot["proxies"]:
         log("error", "OASIS_PROXIES is empty - nothing to route through")
         return 2
-    if cfg["mode"] in ("hybrid", "browser") and not cfg["google_proxy"]:
+    if conf.get("mode") in ("hybrid", "browser") and not conf.get("google_proxy"):
         log("warn", "no OASIS_GOOGLE_PROXY: reCAPTCHA cannot load unless the "
                     "upstream itself reaches Google - browser mode will stall")
 
-    store = Store(cfg["db_path"])
-    log("info", f"db {cfg['db_path']}  stats={store.stats()}")
+    store = Store(boot["db_path"])
+    log("info", f"db {boot['db_path']}  stats={store.stats()}")
 
     imported = env("OASIS_IMPORT")
     if imported and os.path.exists(imported):
@@ -179,22 +273,34 @@ def main():
         added, dup = store.add_mailboxes(lines, "auto")
         log("info", f"imported {added} new account(s) from {imported} ({dup} dup)")
 
-    pool = ProxyPool(cfg["proxies"])
-    log("info", f"{len(pool)} proxy line(s); front={cfg['front_proxy'] or '-'} "
-                f"mode={cfg['mode']} threads={cfg['threads']} "
-                f"google={cfg['google_proxy'] or '-'} hme={cfg['hme_base']}")
+    pool = ProxyPool(boot["proxies"])
+    log("info", f"{len(pool)} proxy line(s); front={conf.get('front_proxy') or '-'} "
+                f"mode={conf.get('mode')} threads={conf.get('threads')} "
+                f"google={conf.get('google_proxy') or '-'} "
+                f"hme={conf.get('hme_base')}")
 
-    engine = Engine(store, pool, log, on_event, cfg)
+    engine = Engine(store, pool, log, on_event, conf)
+    controller = Controller()
+    controller.engine = engine
+
+    global ADMIN
+    ADMIN = WebAdmin(store, conf, STATUS, pool, LOGS, controller,
+                     password=env("OASIS_WEB_PASSWORD"), log=log)
 
     oneshot = env("OASIS_ONESHOT") == "1"
     idle = env_int("OASIS_IDLE", 30)
     port = env_int("OASIS_PORT", 8080)
     srv = None
+    if port and not env("OASIS_WEB_PASSWORD"):
+        log("error", "OASIS_WEB_PASSWORD is not set - the admin UI exposes the "
+                     "account pool and can start/stop the engine, so it will "
+                     "not be served without a password. Set it in .env.")
+        return 2
     if port:
         srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
         threading.Thread(target=srv.serve_forever, daemon=True,
                          name="status-http").start()
-        log("info", f"status endpoint on :{port}  (/health, /stats)")
+        log("info", f"admin UI on :{port}  (/, /health, /stats)")
 
     def shutdown(signum, _frame):
         log("info", f"signal {signum}: draining workers, then exiting")
@@ -203,7 +309,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    STATUS.set(state="idle", threads=cfg["threads"], stats=store.stats())
+    STATUS.set(state="idle", threads=conf.get("threads"), stats=store.stats())
     rounds = 0
     while not STOP.is_set():
         stats = store.stats()
@@ -213,16 +319,20 @@ def main():
             if oneshot:
                 log("info", "queue empty and OASIS_ONESHOT=1 - done")
                 break
-            STOP.wait(idle)
+            WAKE.wait(idle)
+            WAKE.clear()
             continue
 
         rounds += 1
         STATUS.set(state="running", rounds=rounds, stats=stats)
-        log("info", f"round {rounds}: {pending} pending, "
-                    f"{cfg['threads']} worker(s)")
+        # read per round, so a change made in the web UI applies from the
+        # next round without a restart
+        threads = int(conf.get("threads") or 1)
+        log("info", f"round {rounds}: {pending} pending, {threads} worker(s)")
         try:
-            engine.start(threads=cfg["threads"], order=cfg["shows"],
-                         link_timeout=cfg["link_timeout"], mode=cfg["mode"])
+            engine.start(threads=threads, order=conf.get("shows"),
+                         link_timeout=int(conf.get("link_timeout") or 240),
+                         mode=conf.get("mode"))
             while engine.busy and not STOP.is_set():
                 time.sleep(1)
             if STOP.is_set():
