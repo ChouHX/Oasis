@@ -14,6 +14,7 @@ import html
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -27,6 +28,21 @@ SESSION_COOKIE = "oasis_session"
 SESSION_TTL = 12 * 3600
 LOGIN_WINDOW = 15 * 60
 LOGIN_MAX = 6
+
+
+def split_lines(raw):
+    """Proxy/credential lines: newline or comma separated, # comments dropped."""
+    out = []
+    for chunk in str(raw).replace(",", "\n").splitlines():
+        line = chunk.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
+def mask_url(url):
+    """Hide user:pass inside a proxy URL before it reaches the page."""
+    return re.sub(r"//[^@/]+@", "//***:***@", str(url or ""))
 
 
 class LogRing:
@@ -149,7 +165,13 @@ class WebAdmin:
 
         if path == "/api/state":
             info = self.status.snapshot()
-            info["config"] = dict(self.config.data)
+            # The config carries the proxy list, credentials and all. The state
+            # endpoint only exists to render the dashboard, so it gets the
+            # count; the full (masked) list comes from /api/proxies.
+            cfg = dict(self.config.data)
+            if cfg.get("proxies"):
+                cfg["proxies"] = f"{len(cfg['proxies'])} 个（见代理池页）"
+            info["config"] = cfg
             info["running"] = self.controller.running()
             info["version"] = 1
             return self._json(200, info)
@@ -170,8 +192,42 @@ class WebAdmin:
             return self._json(200, {"rows": self.store.registrations()})
 
         if path == "/api/proxies":
+            if method == "POST":
+                lines = split_lines((body or {}).get("lines") or "")
+                # The page only ever saw masked urls, so a line that still
+                # reads //***:***@ means "leave this one alone" - restore the
+                # real credential from the current pool instead of overwriting
+                # the password with asterisks.
+                known = {mask_url(e["url"]): e["url"]
+                         for e in self.proxies.snapshot()}
+                resolved = [known.get(mask_url(ln), ln) for ln in lines]
+                # Persist first: the file is the source of truth, so a restart
+                # does not silently revert to whatever OASIS_PROXIES seeded.
+                self.config.data["proxies"] = resolved
+                self.config.save()
+                self.proxies.load(resolved)
+                self.log("info", f"web: proxy pool replaced with "
+                                 f"{len(resolved)} line(s)")
+                return self._json(200, {"ok": True, "total": len(resolved)})
             snap = self.proxies.snapshot()
-            return self._json(200, {"total": len(snap), "rows": snap[:500]})
+            return self._json(200, {
+                "total": len(snap),
+                # Masked here, not just in the page: the password would
+                # otherwise travel over the wire on every page load, and show
+                # up in any access log or proxy in between.
+                "rows": [dict(e, url=mask_url(e["url"])) for e in snap[:500]],
+                "lines": [mask_url(e["url"]) for e in snap],
+            })
+
+        if path == "/api/accounts/import" and method == "POST":
+            lines = split_lines((body or {}).get("lines") or "")
+            if not lines:
+                return self._json(400, {"error": "没有可导入的行"})
+            protocol = (body or {}).get("protocol") or "auto"
+            added, dup = self.store.add_mailboxes(lines, protocol)
+            self.log("info", f"web: imported {added} account(s), {dup} duplicate")
+            return self._json(200, {"added": added, "duplicate": dup,
+                                    "stats": self.store.stats()})
 
         if path == "/api/log":
             seq = int(query.get("since", ["0"])[0] or 0)
@@ -314,6 +370,11 @@ button.btn.danger{background:var(--bad)}
 button.btn:disabled{opacity:.45;cursor:default}
 input,select{background:#12161b;border:1px solid var(--line);color:var(--fg);border-radius:8px;
              padding:7px 10px;font-size:13px;font-family:inherit}
+textarea{width:100%;background:#0c0f12;border:1px solid var(--line);color:var(--fg);
+         border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+         resize:vertical}
+code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+     font-size:12px}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .dim{color:var(--dim);font-size:12px}
 #log{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#0c0f12;border:1px solid var(--line);
@@ -366,6 +427,24 @@ input,select{background:#12161b;border:1px solid var(--line);color:var(--fg);bor
   </section>
 
   <section id="t-mail">
+    <div class="panel"><h2>导入账号</h2>
+      <p class="dim">每行一个，支持三种格式；空行与 # 开头的行会忽略。
+        格式：<code>outlook@x.com----密码----client_id----refresh_token</code> ·
+        <code>gmail@x.com----密码----client_id----client_secret----refresh_token</code> ·
+        <code>别名@icloud.com----acc_xxxxxxxx----hme</code></p>
+      <textarea id="importbox" rows="6" placeholder="粘贴凭据行…"></textarea>
+      <div class="row" style="margin-top:8px">
+        <label>协议 <select id="importproto">
+          <option value="auto">自动</option>
+          <option value="graph">Microsoft Graph</option>
+          <option value="imap">IMAP</option>
+          <option value="hme">iCloud HME</option>
+        </select></label>
+        <button class="btn" onclick="doImport()">导入</button>
+        <span class="dim" id="importmsg"></span>
+      </div>
+    </div>
+
     <div class="panel"><h2>账号池</h2>
       <div class="row" style="margin-bottom:10px">
         <select id="fstatus" onchange="loadAccounts(1)">
@@ -393,7 +472,21 @@ input,select{background:#12161b;border:1px solid var(--line);color:var(--fg);bor
   </section>
 
   <section id="t-proxy">
-    <div class="panel"><h2>代理池</h2>
+    <div class="panel"><h2>代理池配置</h2>
+      <p class="dim">每行一个。支持 <code>http://user:pass@host:port</code>、
+        <code>socks5://user:pass@host:port</code>、<code>host:port</code>。
+        链路写法：<code>前置代理|上游</code>。保存后立即生效，并写进配置文件，
+        重启不会丢。</p>
+      <textarea id="proxybox" rows="10" placeholder="每行一个代理…"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" onclick="saveProxies()">保存并生效</button>
+        <span class="dim" id="proxymsg"></span>
+      </div>
+      <p class="dim" style="margin-top:8px">注意：保存时会用输入框里的内容**整体替换**。
+        凭据在加载时是遮罩显示的，如果不动就原样保存——要改动请整行重写。</p>
+    </div>
+
+    <div class="panel"><h2>代理健康度</h2>
       <p class="dim" id="proxysummary"></p>
       <div style="overflow:auto"><table id="ptable"><thead><tr>
         <th>代理</th><th>成功</th><th>失败</th><th>冷却中</th><th>最后错误</th>
@@ -541,12 +634,35 @@ function esc(s){ return String(s??'').replace(/[&<>"]/g,
 
 async function loadProxies(){
   const d = await api('/api/proxies');
-  $('#proxysummary').textContent = `共 ${d.total} 个（显示前 ${d.rows.length}）`;
+  $('#proxysummary').textContent = `共 ${d.total} 个（表格显示前 ${d.rows.length}）`;
   $('#ptable tbody').innerHTML = d.rows.map(r => `<tr>
     <td>${esc(mask(r.url))}</td><td>${r.ok ?? 0}</td><td>${r.fail ?? 0}</td>
     <td>${r.cooling ? '<span class="tag running">是</span>' : ''}</td>
     <td class="dim">${esc((r.last_error||'').slice(0,60))}</td></tr>`).join('')
     || '<tr><td colspan="5" class="dim">没有数据</td></tr>';
+  // only seed the editor on first open, so a reload does not wipe typing
+  if (!$('#proxybox').dataset.dirty) $('#proxybox').value = (d.lines || []).join('\n');
+}
+
+async function saveProxies(){
+  const lines = $('#proxybox').value;
+  const n = lines.split('\n').filter(x => x.trim() && !x.trim().startsWith('#')).length;
+  if (!n){ $('#proxymsg').textContent = '至少要有一行'; return; }
+  if (!confirm(`将用 ${n} 行整体替换当前代理池，继续？`)) return;
+  const d = await api('/api/proxies', {method:'POST', body: JSON.stringify({lines})});
+  $('#proxymsg').textContent = `已保存 ${d.total} 行，立即生效`;
+  $('#proxybox').dataset.dirty = '';
+  loadProxies(); tick();
+}
+
+async function doImport(){
+  const lines = $('#importbox').value;
+  if (!lines.trim()){ $('#importmsg').textContent = '先粘贴内容'; return; }
+  const d = await api('/api/accounts/import', {method:'POST', body: JSON.stringify({
+    lines, protocol: $('#importproto').value })});
+  $('#importmsg').textContent = `新增 ${d.added} 条，重复 ${d.duplicate} 条`;
+  $('#importbox').value = '';
+  loadAccounts(1); tick();
 }
 async function loadRegs(){
   const d = await api('/api/registrations');
@@ -629,5 +745,9 @@ function exportFile(what){ location.href = '/api/export?what=' + what; }
   } catch(e){ showLogin(); }
 })();
 $('#pw')?.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+// mark the proxy editor as touched, so a background reload does not clobber it
+document.addEventListener('input', e => {
+  if (e.target && e.target.id === 'proxybox') e.target.dataset.dirty = '1';
+});
 </script></body></html>
 """

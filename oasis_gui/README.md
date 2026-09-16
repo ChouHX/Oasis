@@ -573,7 +573,9 @@ ssh -L 8080:127.0.0.1:8080 user@服务器
 | `GET /api/state` | 统计 + 本机信息 + 配置 + 运行状态 |
 | `GET /api/accounts?status=&page=` | 账号列表（每页 50） |
 | `GET /api/registrations` | 预约记录 |
-| `GET /api/proxies` | 代理池健康度（地址里的 `user:pass` 已遮罩） |
+| `GET /api/proxies` | 代理池 + 健康度（`user:pass` **服务端遮罩**） |
+| `POST /api/proxies` | 整体替换代理池，落盘并立即生效 |
+| `POST /api/accounts/import` | 粘贴凭据行导入账号 |
 | `GET /api/log?since=` | 增量日志（环形缓冲 2000 行） |
 | `POST /api/start`、`/api/stop` | 启停 |
 | `POST /api/config` | 改配置并落盘 |
@@ -581,6 +583,36 @@ ssh -L 8080:127.0.0.1:8080 user@服务器
 | `POST /api/vacuum` | SQLite 压缩 |
 | `GET /api/export?what=creds\|accounts` | 导出 |
 | `GET /health`、`/stats` | 给监控用的极简探针 |
+
+### 代理池和邮箱都在网页上配
+
+不需要改 `.env` 重启。代理池存进 `oasis_config.json`（跟桌面端一样的地方），
+邮箱直接进数据库：
+
+- **代理池页**：一个多行输入框，粘贴后「保存并生效」——`pool.load()` 原地替换，
+  引擎持有的引用不用动，**下一轮就生效**
+- **邮箱池页**：粘贴凭据行导入，支持 Outlook / Gmail / iCloud 三种格式，
+  自动去重（重复的行计入 `duplicate`）
+
+`OASIS_PROXIES` 只在配置文件里还没有代理时做**种子**。一旦你在网页上改过，
+就以文件为准——否则每次重启都会把你改的覆盖回环境变量。
+
+### 代理凭据不会出现在网页上
+
+页面拿到的地址是 `socks5://***:***@host:port`，真实密码只在服务端。这里有个
+容易踩的坑：**如果用户不动输入框直接保存，密码会被 `***` 覆盖掉**。所以保存时
+服务端会把遮罩形式还原回原行：
+
+```python
+known = {mask_url(e["url"]): e["url"] for e in self.pool.snapshot()}
+resolved = [known.get(mask_url(ln), ln) for ln in lines]
+```
+
+实测：原样保存后配置文件里仍是 `socks5://realu:realp@10.0.0.1:1080`；改一行、
+加一行时，没动的那行凭据也保住了。
+
+遮罩是**服务端做**的，不是前端——否则密码会随每个页面加载走一遍网络，
+也会进访问日志。`/api/state` 里的 `config.proxies` 只返回数量，不返回内容。
 
 ## iCloud 隐藏邮箱（HME）接入
 

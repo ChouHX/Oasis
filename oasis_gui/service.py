@@ -151,8 +151,17 @@ def build_config():
     # Reflect the real pool path, so the settings page shows what is in use
     # rather than whatever the shared DEFAULTS happen to say.
     conf.data["db_path"] = boot["db_path"]
+
+    # The proxy list lives in the config file, the same way the desktop console
+    # keeps it, so it can be edited from the web UI. OASIS_PROXIES only seeds
+    # that file when it is still empty - otherwise every restart would undo
+    # whatever was set in the browser.
+    if boot["proxies"] and not conf.get("proxies"):
+        conf.data["proxies"] = list(boot["proxies"])
+        log("info", f"seeded {len(boot['proxies'])} proxy line(s) from "
+                    f"OASIS_PROXIES into {cfg_path}")
     conf.save()
-    boot["threads"] = int(conf.get("threads") or 1)
+    boot["proxies"] = list(conf.get("proxies") or [])
     return conf, boot
 
 
