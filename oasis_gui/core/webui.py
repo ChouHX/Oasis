@@ -473,7 +473,6 @@ code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1
     <button data-t="mail">邮箱池</button>
     <button data-t="proxy">代理池</button>
     <button data-t="reg">预约记录</button>
-    <button data-t="log">日志</button>
     <button data-t="set">设置</button>
   </nav>
   <span style="flex:1"></span>
@@ -492,8 +491,18 @@ code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1
         <label>线程 <input id="threads" type="number" min="1" max="64" style="width:80px"></label>
         <button class="btn" id="btnStart" onclick="startEngine()">启动</button>
         <button class="btn danger" onclick="stopEngine()">停止</button>
+        <span style="flex:1"></span>
+        <span class="dim" id="hosthint"></span>
       </div>
-      <p class="dim" id="hosthint" style="margin:10px 0 0"></p>
+    </div>
+    <div class="panel"><h2>实时日志</h2>
+      <div class="row" style="margin-bottom:8px">
+        <label><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+        <button class="btn ghost" onclick="clearLogView()">清屏</button>
+        <span style="flex:1"></span>
+        <span class="dim" id="logcount"></span>
+      </div>
+      <div id="log"></div>
     </div>
   </section>
 
@@ -587,16 +596,6 @@ code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1
     </div>
   </section>
 
-  <section id="t-log">
-    <div class="panel"><h2>实时日志</h2>
-      <div class="row" style="margin-bottom:8px">
-        <label><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
-        <button class="btn ghost" onclick="clearLogView()">清屏</button>
-      </div>
-      <div id="log"></div>
-    </div>
-  </section>
-
   <section id="t-set">
     <div class="panel"><h2>设置</h2>
       <div id="setform" class="row" style="flex-direction:column;align-items:stretch"></div>
@@ -622,7 +621,7 @@ code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1
 
 <script>
 const $ = s => document.querySelector(s);
-let curPage = 1, logSeq = 0, timer = null;
+let curPage = 1, logSeq = 0, logLines = 0;
 
 async function api(path, opts){
   const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
@@ -650,7 +649,8 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('section').forEach(x => x.classList.remove('on'));
   b.classList.add('on');
   $('#t-' + b.dataset.t).classList.add('on');
-  if (b.dataset.t === 'log') startLog(); else stopLog();
+  // the log lives on the dashboard now, so it polls continuously from boot
+  // rather than switching on with a tab
   if (b.dataset.t === 'mail') loadAccounts(1);
   if (b.dataset.t === 'proxy') loadProxies();
   if (b.dataset.t === 'reg') loadRegs();
@@ -798,11 +798,11 @@ async function loadRegs(){
     || '<tr><td colspan="5" class="dim">还没有记录</td></tr>';
 }
 
-function startLog(){ if (timer) return; pollLog(); timer = setInterval(pollLog, 2000); }
-function stopLog(){ if (timer){ clearInterval(timer); timer = null; } }
-function clearLogView(){ $('#log').textContent = ''; }
+function clearLogView(){ $('#log').textContent = ''; logLines = 0; $('#logcount').textContent = ''; }
 async function pollLog(){
-  const d = await api('/api/log?since=' + logSeq);
+  let d;
+  try { d = await api('/api/log?since=' + logSeq); } catch(e){ return; }
+  if (d.seq === undefined) return;
   logSeq = d.seq;
   const box = $('#log');
   for (const r of d.rows){
@@ -811,8 +811,15 @@ async function pollLog(){
     el.className = r.level;
     el.textContent = `[${t}] ${r.msg}`;
     box.appendChild(el);
+    logLines++;
   }
-  if (d.rows.length && $('#autoscroll').checked) box.scrollTop = box.scrollHeight;
+  if (d.rows.length){
+    // keep the DOM bounded: the ring holds 2000 lines, but leaving them all in
+    // the page makes scrolling sluggish after a long run
+    while (box.childElementCount > 1500) box.removeChild(box.firstChild);
+    if ($('#autoscroll').checked) box.scrollTop = box.scrollHeight;
+    $('#logcount').textContent = `${logLines} 行 · 共 ${d.seq} 条`;
+  }
 }
 
 const SET_KEYS = [['mode','模式'],['threads','线程数'],['shows','场次偏好（逗号分隔）'],
@@ -866,6 +873,7 @@ function exportFile(what){ location.href = '/api/export?what=' + what; }
     const r = await fetch('/api/state');
     if (r.status === 401){ showLogin(); return; }
     showApp(); tick(); setInterval(tick, 3000);
+    pollLog(); setInterval(pollLog, 2000);
   } catch(e){ showLogin(); }
 })();
 $('#pw')?.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
