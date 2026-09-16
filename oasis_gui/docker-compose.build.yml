@@ -1,0 +1,15 @@
+# 本地从源码构建的覆盖文件——只有显式指定才生效，避免误触发编译。
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 用途：改了代码还没推、或者要验证 Dockerfile 本身。日常部署用
+# `docker compose pull` 拉 CI 的产物就好。
+
+services:
+  oasis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 覆盖成同一个名字，这样构建出来的镜像和拉取的镜像可以互相顶替，
+    # 不会在本地留下两个内容不同却都叫 "oasis" 的东西。
+    image: ghcr.io/chouhx/oasis:latest

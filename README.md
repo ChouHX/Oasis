@@ -25,9 +25,17 @@ build_windows.bat                # Windows 下直接编译
 
 ```bash
 cd oasis_gui
-mkdir -p data && cp .env.example .env    # 填代理、Google 出口、iCloud 密码
-docker compose up -d --build
-curl localhost:8080/stats
+mkdir -p data && cp .env.example .env    # 填管理密码、代理、Google 出口、iCloud
+docker compose pull                      # 拉 CI 构建好的镜像，不在服务器上编译
+docker compose up -d
+```
+
+镜像由 GitHub Actions 发布到 `ghcr.io/chouhx/oasis:latest`（公开包，无需登录）。
+2 vCPU / 3GB 的机器编译 Playwright 基础镜像既慢又吃磁盘，所以 compose 默认是
+**拉取**而不是 `build`。要改代码后本地构建，用覆盖文件（只有显式指定才编译）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 ## 结构
@@ -35,7 +43,7 @@ curl localhost:8080/stats
 ```
 oasis_gui/
   app.py                  FluentUI 桌面端
-  service.py              无头服务端（/health、/stats，自动线程数）
+  service.py              无头服务端（Web 管理界面 + /health + /stats）
   tools_spa_drive.py      CDP 驱动官方 SPA 的对照工具
   core/
     registrar.py          curl_cffi 注册核心（三步流程、场次常量）
@@ -47,6 +55,7 @@ oasis_gui/
     proxy_pool.py         代理解析、健康计数、失败冷却
     identity.py           随机身份生成（美/德/法）
     sysinfo.py            内存与推荐线程数
+    webui.py              Web 管理界面（标准库实现，带密码认证）
     config.py             配置持久化
 ```
 

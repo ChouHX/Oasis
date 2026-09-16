@@ -1,41 +1,42 @@
-# Deployment for a small always-on box (2 vCPU / 3GB), iCloud-only.
+# 生产部署：拉取 CI 构建好的镜像，不在服务器上编译。
 #
-#   mkdir -p data && cp .env.example .env   # fill in proxies + iCloud password
-#   docker compose up -d --build
+#   mkdir -p data && cp .env.example .env    # 填密码、代理、Google 出口、iCloud
+#   docker compose pull
+#   docker compose up -d
 #   docker compose logs -f
-#   curl localhost:8080/stats
 #
-# The account pool lives in ./data/oasis.db, so the queue survives restarts and
-# rebuilds.
+# 镜像由 GitHub Actions 发布（见 .github/workflows/docker.yml）。想在本地从
+# 源码构建用另一个文件：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 services:
   oasis:
-    build: .
-    image: oasis-console:latest
+    # 拉取而非构建。2 vCPU / 3GB 的机器编译 Playwright 基础镜像（约 2GB 层）
+    # 既慢又吃磁盘，CI 已经编好了。
+    image: ghcr.io/chouhx/oasis:latest
     container_name: oasis
     restart: unless-stopped
     env_file: .env
-    # Lets the container reach services running on the Docker host (the iCloud
-    # HME service, a local proxy) as host.docker.internal. Inside a container
-    # 127.0.0.1 is the container itself, which is the usual "connection
-    # refused" on a fresh deployment.
+    # 让容器能用 host.docker.internal 访问宿主机上的服务（iCloud HME 服务、
+    # 本地代理）。容器里的 127.0.0.1 是容器自己，新部署常见的"连接被拒"就是
+    # 这个原因。
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # 8080 is only bound to the loopback: a registration console has no business
-    # being reachable from the internet. Reach it over an SSH tunnel, or put a
-    # reverse proxy with auth in front.
+    # 只绑回环：注册控制台没有理由暴露在公网。远程访问走 SSH 隧道，或在前
+    # 面挂一层带认证的反向代理。
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
+      # 账号池和运行时配置都落在这里，重启和重建镜像都不会丢。
       - ./data:/data
-    # Chromium leans on shared memory; Docker's default 64MB /dev/shm is the
-    # usual cause of tabs dying silently. 512MB is plenty for one worker and
-    # leaves the 3GB box room to breathe.
+    # Chromium 依赖共享内存；Docker 默认的 64MB /dev/shm 是标签页静默崩溃的
+    # 常见原因。512MB 对一个 worker 足够，也给 3GB 的机器留了余地。
     shm_size: "512mb"
-    # One shared chromium serves every worker, so the ceiling is low: ~250MB
-    # for the browser plus ~150MB per context, on top of the base image.
+    # 一个共享 chromium 服务所有 worker，所以上限不高：浏览器约 250MB，每个
+    # context 再加约 150MB，之外还有基础镜像本身。
     mem_limit: 2500m
-    memswap_limit: 2500m          # no swap: swapping a browser is worse than waiting
+    memswap_limit: 2500m          # 不换页：浏览器换页比等待更糟
     cpus: "2.0"
     stop_grace_period: 30s
     logging:
