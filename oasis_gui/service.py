@@ -266,8 +266,11 @@ def on_event(kind, payload=None):
 def main():
     conf, boot = build_config()
     if not boot["proxies"]:
-        log("error", "OASIS_PROXIES is empty - nothing to route through")
-        return 2
+        # Not fatal: the proxy pool is editable from the admin UI, so a fresh
+        # deployment can come up empty, get its accounts imported and its
+        # proxies pasted in without ever touching .env.
+        log("warn", "no proxies configured yet - set them in the admin UI "
+                    "(代理池页) or via OASIS_PROXIES; rounds will fail until then")
     if conf.get("mode") in ("hybrid", "browser") and not conf.get("google_proxy"):
         log("warn", "no OASIS_GOOGLE_PROXY: reCAPTCHA cannot load unless the "
                     "upstream itself reaches Google - browser mode will stall")
@@ -333,6 +336,16 @@ def main():
             continue
 
         rounds += 1
+        # Starting a round with an empty pool would mark every claimed account
+        # failed for a reason that has nothing to do with the account. Wait for
+        # the pool instead.
+        if not len(pool):
+            STATUS.set(state="idle", stats=stats)
+            log("warn", "queue has work but the proxy pool is empty - waiting; "
+                        "add proxies in the admin UI (代理池页)")
+            WAKE.wait(idle)
+            WAKE.clear()
+            continue
         STATUS.set(state="running", rounds=rounds, stats=stats)
         # read per round, so a change made in the web UI applies from the
         # next round without a restart

@@ -10,7 +10,6 @@ account pool, so without a password the server refuses to start rather than
 serving that to whoever reaches the port. A session cookie carries the login;
 the password is compared in constant time and logins are rate limited.
 """
-import html
 import hmac
 import json
 import os
@@ -20,6 +19,8 @@ import threading
 import time
 import urllib.parse
 from http.cookies import SimpleCookie
+from core import mailbox
+
 from http.server import BaseHTTPRequestHandler
 
 SESSION_COOKIE = "oasis_session"
@@ -176,6 +177,31 @@ class WebAdmin:
             info["version"] = 1
             return self._json(200, info)
 
+        if path == "/api/icloud/aliases":
+            return self._icloud_catalog()
+
+        if path == "/api/icloud/import" and method == "POST":
+            want = {e.strip().lower()
+                    for e in ((body or {}).get("emails") or []) if e}
+            if not want:
+                return self._json(400, {"error": "没有勾选任何别名"})
+            try:
+                cat = mailbox.hme_catalog(self.config.get("hme_base", ""),
+                                          self.config.get("hme_password", ""))
+            except mailbox.MailAuthError as e:
+                return self._json(502, {"error": str(e)})
+            # Rebuild the credential lines from the service's own answer rather
+            # than trusting the ids posted by the page.
+            lines = [f"{a['email']}----{a['account_id']}----hme"
+                     for a in cat if a["email"].lower() in want]
+            if not lines:
+                return self._json(400, {"error": "勾选的别名在服务上找不到了"})
+            added, dup = self.store.add_mailboxes(lines, "hme")
+            self.log("info", f"web: imported {added} iCloud alias(es), "
+                             f"{dup} already present")
+            return self._json(200, {"added": added, "duplicate": dup,
+                                    "stats": self.store.stats()})
+
         if path == "/api/accounts":
             status = query.get("status", [""])[0]
             page = max(1, int(query.get("page", ["1"])[0] or 1))
@@ -288,6 +314,24 @@ class WebAdmin:
         if not path.startswith("/api/"):
             return 302, [("Location", "/")], b""
         return self._json(404, {"error": "not found"})
+
+    def _icloud_catalog(self):
+        """Aliases on the iCloud service, flagged with what is already imported.
+
+        Importing the whole list blind wastes aliases that are already spent -
+        iCloud caps creation at roughly 10/hour - so the page gets enough to
+        let the operator choose.
+        """
+        try:
+            cat = mailbox.hme_catalog(self.config.get("hme_base", ""),
+                                      self.config.get("hme_password", ""))
+        except mailbox.MailAuthError as e:
+            return self._json(502, {"error": str(e)})
+        have = {a["email"].lower() for a in self.store.accounts()}
+        for a in cat:
+            a["imported"] = a["email"].lower() in have
+        self.log("info", f"web: listed {len(cat)} iCloud alias(es)")
+        return self._json(200, {"total": len(cat), "aliases": cat})
 
     def _cookie(self, handler):
         raw = handler.headers.get("Cookie") or ""
@@ -427,7 +471,21 @@ code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1
   </section>
 
   <section id="t-mail">
-    <div class="panel"><h2>导入账号</h2>
+    <div class="panel"><h2>iCloud 别名（勾选后导入）</h2>
+      <p class="dim">从本地 iCloud 隐藏邮箱服务拉取别名列表。iCloud 建别名有配额
+        （约每小时 10 个），所以没有全选——<b>只导入你真正要用的</b>。
+        已导入的会标出来。服务地址和密码在「设置」页里配。</p>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn" onclick="loadIcloud()">拉取别名列表</button>
+        <button class="btn ghost" onclick="icloudAll(false)">全不选</button>
+        <button class="btn ghost" onclick="toggleUnused()">只选未导入的</button>
+        <button class="btn" onclick="doIcloudImport()">导入勾选项</button>
+        <span class="dim" id="icloudmsg"></span>
+      </div>
+      <div id="icloudlist" class="dim">还没有拉取。</div>
+    </div>
+
+    <div class="panel"><h2>手动导入账号</h2>
       <p class="dim">每行一个，支持三种格式；空行与 # 开头的行会忽略。
         格式：<code>outlook@x.com----密码----client_id----refresh_token</code> ·
         <code>gmail@x.com----密码----client_id----client_secret----refresh_token</code> ·
@@ -653,6 +711,42 @@ async function saveProxies(){
   $('#proxymsg').textContent = `已保存 ${d.total} 行，立即生效`;
   $('#proxybox').dataset.dirty = '';
   loadProxies(); tick();
+}
+
+function icloudBoxes(){ return [...document.querySelectorAll('#icloudlist input[type=checkbox]')]; }
+function icloudAll(v){ icloudBoxes().forEach(b => { if (!b.disabled) b.checked = v; }); }
+function toggleUnused(){
+  icloudBoxes().forEach(b => { b.checked = !b.disabled && b.dataset.imported !== '1'; });
+}
+async function loadIcloud(){
+  $('#icloudmsg').textContent = '拉取中…';
+  $('#icloudlist').innerHTML = '';
+  let d;
+  try { d = await api('/api/icloud/aliases'); }
+  catch(e){ $('#icloudmsg').textContent = '请求失败'; return; }
+  if (d.error){ $('#icloudmsg').textContent = d.error; return; }
+  if (!d.total){ $('#icloudmsg').textContent = '服务上没有别名'; return; }
+  $('#icloudmsg').textContent = `共 ${d.total} 个，已导入 ${d.aliases.filter(a=>a.imported).length} 个`;
+  $('#icloudlist').innerHTML = d.aliases.map(a => `
+    <label class="row" style="gap:8px;padding:4px 0;border-bottom:1px solid var(--line)">
+      <input type="checkbox" data-email="${esc(a.email)}" data-imported="${a.imported?1:0}"
+             ${a.imported ? 'disabled' : ''} style="width:auto">
+      <span style="min-width:240px">${esc(a.email)}</span>
+      <span class="tag ${a.active ? 'registered' : 'failed'}">${a.active ? '启用' : '停用'}</span>
+      <span class="dim">${esc(a.account_name||'')}</span>
+      <span class="dim">${esc(a.label||'')}</span>
+      <span class="dim">${a.imported ? '（已在池中）' : ''}</span>
+    </label>`).join('');
+}
+async function doIcloudImport(){
+  const emails = icloudBoxes().filter(b => b.checked && !b.disabled)
+                             .map(b => b.dataset.email);
+  if (!emails.length){ $('#icloudmsg').textContent = '先勾选要导入的别名'; return; }
+  const d = await api('/api/icloud/import', {method:'POST',
+    body: JSON.stringify({emails})});
+  if (d.error){ $('#icloudmsg').textContent = d.error; return; }
+  $('#icloudmsg').textContent = `导入 ${d.added} 个，已在池中 ${d.duplicate} 个`;
+  loadIcloud(); loadAccounts(1); tick();
 }
 
 async function doImport(){

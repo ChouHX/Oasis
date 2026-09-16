@@ -862,6 +862,86 @@ class GmailMailbox(ImapMailbox):
             return self._access
 
 
+def hme_catalog(base="", password="", timeout=30):
+    """Every alias the iCloud Hide-My-Email service knows about.
+
+    Returns [{"email", "account_id", "account_name", "label", "active"}] so a
+    caller can let the operator pick which ones to import - iCloud caps alias
+    creation (roughly 10/hour), so importing the whole list blindly wastes the
+    ones that are already spent.
+
+    Raises MailAuthError when the service is unreachable or the password is
+    wrong, with a message that says which of the two it was.
+    """
+    base = (base or os.environ.get("ICLOUD_HME_BASE")
+            or HME_BASE_DEFAULT).rstrip("/")
+    password = password or os.environ.get("ICLOUD_HME_ADMIN_PASSWORD") or ""
+    if not password:
+        raise MailAuthError("iCloud 服务密码未配置（设置页的 iCloud 密码，"
+                            "或环境变量 ICLOUD_HME_ADMIN_PASSWORD）")
+
+    opener = urllib.request.build_opener(
+        # never dial the local service through ALL_PROXY - it answers 400
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+    def call(path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(base + path, data=data,
+                                     method="POST" if data else "GET")
+        req.add_header("accept", "application/json")
+        if data:
+            req.add_header("content-type", "application/json")
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            if e.code in (401, 403):
+                raise MailAuthError(f"iCloud 服务拒绝了密码（HTTP {e.code}）")
+            raise MailAuthError(f"iCloud 服务返回 HTTP {e.code}: {raw[:120]}")
+        except Exception as e:
+            raise MailAuthError(
+                f"连不上 iCloud 服务 {base}（{type(e).__name__}）——"
+                f"容器里要用 host.docker.internal，不是 127.0.0.1")
+
+    status, _ = _hme_raw(opener, base, "/api/auth/login",
+                         {"password": password}, timeout)
+    if status != 200:
+        raise MailAuthError(f"iCloud 服务登录失败（HTTP {status}）")
+
+    out = []
+    for acct in (call("/api/accounts").get("data") or []):
+        aid = acct.get("id") or ""
+        try:
+            aliases = call(f"/api/aliases?account_id={urllib.parse.quote(aid)}")
+        except MailAuthError:
+            continue
+        for a in ((aliases.get("data") or {}).get("aliases") or []):
+            out.append({"email": a.get("email") or "",
+                        "account_id": aid,
+                        "account_name": acct.get("name") or "",
+                        "label": a.get("label") or "",
+                        "active": bool(a.get("active"))})
+    return out
+
+
+def _hme_raw(opener, base, path, body, timeout):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(base + path, data=data, method="POST")
+    req.add_header("accept", "application/json")
+    req.add_header("content-type", "application/json")
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception as e:
+        raise MailAuthError(
+            f"连不上 iCloud 服务 {base}（{type(e).__name__}）——"
+            f"容器里要用 host.docker.internal，不是 127.0.0.1")
+
+
 def is_hme(email):
     return (email or "").rsplit("@", 1)[-1].lower() in HME_ICLOUD_DOMAINS
 
