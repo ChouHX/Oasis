@@ -1,0 +1,70 @@
+name: docker
+
+# Builds the headless service image and publishes it to GHCR, so a small box
+# can `docker pull` instead of compiling the ~2GB Playwright base itself.
+#
+# Runs on every push that touches the service, and on demand. Pull requests
+# build but do not push.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "oasis_gui/Dockerfile"
+      - "oasis_gui/docker-compose.yml"
+      - "oasis_gui/entrypoint.sh"
+      - "oasis_gui/requirements.txt"
+      - "oasis_gui/service.py"
+      - "oasis_gui/core/**"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths:
+      - "oasis_gui/**"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+env:
+  # ghcr requires a lowercase owner; the account is ChouHX.
+  IMAGE: ghcr.io/chouhx/oasis
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=ref,event=pr
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: oasis_gui
+          file: oasis_gui/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The Playwright base layer is the expensive part and never changes
+          # between builds, so keep it warm.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
