@@ -478,15 +478,11 @@ class BrowserRegistrationError(Exception):
 class BrowserRegistrar:
     """One browser session per registration."""
 
-    def __init__(self, relay_pool, headless=True, browser_timeout=90, log=None,
-                 strict_egress=False):
+    def __init__(self, relay_pool, headless=True, browser_timeout=90, log=None):
         self.relays = relay_pool
         self.headless = headless
         self.browser_timeout = browser_timeout
         self.log = log or (lambda m: None)
-        # when True, a captcha/submit egress mismatch fails the account instead
-        # of only being logged
-        self.strict_egress = strict_egress
         # Each thread gets its own warm context; the chromium process behind
         # them is shared per proxy (see _SharedBrowser), because contexts are
         # what isolate accounts and separate processes cost twice the memory
@@ -899,24 +895,6 @@ class BrowserRegistrar:
         # lands in the database with an empty poll_answer_ids.
         return {"venues": picked, "album": album}
 
-    @staticmethod
-    def _page_client_ip(page):
-        """The exit IP as Cloudflare sees it, asked from inside the page.
-
-        The SPA fills the confirm body's `ip` this way; sending null is a
-        structural difference from a real browser's request.
-        """
-        try:
-            txt = page.evaluate(
-                "async () => await (await fetch("
-                "'https://www.cloudflare.com/cdn-cgi/trace',"
-                "{credentials:'omit'})).text()")
-            for line in (txt or "").splitlines():
-                if line.startswith("ip="):
-                    return line[3:].strip()
-        except Exception:
-            pass
-        return None
 
 
     def register(self, mailbox, ident, order=None, proxy_url=None,

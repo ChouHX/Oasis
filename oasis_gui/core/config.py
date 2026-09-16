@@ -32,9 +32,7 @@ DEFAULTS = {
     # failure traced back to a bad account, which failed in http mode too.
     # Set True only after confirming on your own proxy that a mismatch bites -
     # otherwise it rejects accounts that would have gone through.
-    "strict_egress": False,
     "link_timeout": 300,
-    "http_timeout": 60,
     "delay_between": 0.0,
     # Randomised pause between reading the mail link and submitting, so the
     # confirm does not land milliseconds after the verification. 0 disables.

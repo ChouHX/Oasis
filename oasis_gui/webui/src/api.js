@@ -67,3 +67,19 @@ export const STATUS_FILTER = [
   { value: "submitted", label: "页面确认" },
   { value: "failed", label: "失败" },
 ];
+
+// Venue keys -> the same labels the desktop console shows. Kept here so the
+// dashboard dropdowns read identically to the GUI's.
+export const SHOW_LABEL = {
+  glasgow: "2027-05 Glasgow UK",
+  manchester: "2027-06 Manchester UK",
+  munich: "2027-07 Munich DE",
+  barcelona: "2027-07 Barcelona ES",
+  amsterdam: "2027-07 Amsterdam NL",
+  paris: "2027-07 Paris FR",
+  rome: "2027-07 Rome IT",
+  boston: "2027-08 Boston US",
+  lasvegas: "2027-08 Las Vegas US",
+  slane: "2027-09 Slane IE",
+  knebworth: "2027-09 Knebworth UK",
+};

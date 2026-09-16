@@ -11,21 +11,33 @@ survives a restart, and can be monitored. This entry point drives
 Configuration is environment-driven so one image serves any account pool; the
 SQLite file stays the single source of truth, so a restart simply resumes.
 
-    OASIS_DB            /data/oasis.db      account pool (mount a volume!)
-    OASIS_PROXIES       newline- or comma-separated proxy lines
-    OASIS_FRONT_PROXY   optional local proxy every upstream is dialled through
-    OASIS_MAIL_PROXY    optional proxy for mailbox fetches
-    OASIS_GOOGLE_PROXY  second egress for Google. REQUIRED by browser/hybrid
-                        mode - reCAPTCHA cannot load without it.
-    OASIS_HME_BASE      iCloud Hide-My-Email service (default 127.0.0.1:8081)
-    OASIS_HME_PASSWORD  that service's admin password
-    OASIS_MODE          browser only            (accepted for compatibility)
-    OASIS_THREADS       workers; unset = ask core.sysinfo for a safe number
-    OASIS_SHOWS         preference order, e.g. glasgow,manchester,paris
-    OASIS_LINK_TIMEOUT  seconds to wait for the mail   (default 240)
-    OASIS_IMPORT        optional file of credential lines to import at boot
-    OASIS_IDLE          seconds to sleep when the queue is empty (default 30)
-    OASIS_PORT          status HTTP port               (default 8080)
+    OASIS_DB            /data/oasis.db   账号池与配置的存放位置（必填）
+    OASIS_WEB_PASSWORD  管理界面密码（必填 —— 不设服务拒绝启动）
+
+    Everything else is configured in the admin UI and persisted to
+    <db dir>/oasis_config.json, so it survives a restart:
+    proxy pool, thread count, show preference, timeouts, Google split,
+    iCloud service address and password, debug logging.
+
+    The remaining OASIS_* variables below still work as first-boot seeds -
+    they are only written into the config file when it has no value yet, so
+    they never fight with what was set in the browser.
+
+    OASIS_PROXIES       seed the proxy pool
+    OASIS_THREADS       seed the worker count (unset = sized to the machine)
+    OASIS_SHOWS         seed the venue preference order
+    OASIS_MODE          accepted for compatibility; browser is the only flow
+    OASIS_LINK_TIMEOUT  seconds to wait for the verification mail
+    OASIS_SUCCESS_TIMEOUT  seconds to wait for the success mail when the page
+                        did not confirm (a page confirmation only waits 30s)
+    OASIS_DEBUG         "1" logs tracebacks on failure
+    OASIS_FRONT_PROXY / OASIS_MAIL_PROXY / OASIS_GOOGLE_PROXY / OASIS_HME_BASE
+    OASIS_HME_PASSWORD  seeds for the matching settings
+    OASIS_CONFIG        where the runtime settings live (default: next to the db)
+    OASIS_WEB_DIST      built frontend directory
+    OASIS_IMPORT        credential file imported at boot
+    OASIS_IDLE          seconds to sleep when the queue is empty
+    OASIS_PORT          status/admin HTTP port
     OASIS_ONESHOT       "1" = drain the queue then exit instead of looping
 """
 import json
@@ -92,7 +104,8 @@ ENV_KEYS = {
     "OASIS_SHOWS": "shows",
     "OASIS_THREADS": "threads",
     "OASIS_LINK_TIMEOUT": "link_timeout",
-    "OASIS_HTTP_TIMEOUT": "http_timeout",
+    "OASIS_DELAY_BETWEEN": "delay_between",
+    "OASIS_DEBUG": "debug",
     "OASIS_VERIFY_SUCCESS": "verify_success",
     "OASIS_SUCCESS_TIMEOUT": "success_timeout",
     "OASIS_FRONT_PROXY": "front_proxy",
@@ -100,11 +113,9 @@ ENV_KEYS = {
     "OASIS_GOOGLE_PROXY": "google_proxy",
     "OASIS_HME_BASE": "hme_base",
     "OASIS_HME_PASSWORD": "hme_password",
-    "OASIS_STRICT_EGRESS": "strict_egress",
 }
-_INT_KEYS = ("threads", "link_timeout", "http_timeout",
-             "success_timeout")
-_BOOL_KEYS = ("verify_success", "strict_egress")
+_INT_KEYS = ("threads", "link_timeout", "success_timeout", "delay_between")
+_BOOL_KEYS = ("verify_success", "debug")
 
 
 def build_config():
@@ -395,8 +406,11 @@ def main():
         threads = int(conf.get("threads") or 1)
         log("info", f"round {rounds}: {pending} pending, {threads} worker(s)")
         try:
+            # Everything here is read fresh each round, so a change made in the
+            # web UI applies from the next round without a restart.
             engine.start(threads=threads, order=conf.get("shows"),
                          link_timeout=int(conf.get("link_timeout") or 240),
+                         delay_between=float(conf.get("delay_between") or 0),
                          mode=conf.get("mode"))
             while engine.busy and not STOP.is_set():
                 time.sleep(1)

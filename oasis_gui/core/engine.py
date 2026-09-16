@@ -117,7 +117,7 @@ class Engine:
 
     # ------------------------------------------------------------------- control
     def start(self, threads=4, order=None, link_timeout=300,
-              delay_between=0.0, mode="hybrid"):
+              delay_between=0.0, mode="browser"):
         if self._running:
             self._log("warn", "engine already running")
             return
@@ -139,7 +139,6 @@ class Engine:
         self.relays.stop_all()
         self.relays.google_fallback = self.config.get("google_proxy", "") or ""
         self.relays.front = self.config.get("front_proxy", "") or ""
-        self.browser.strict_egress = bool(self.config.get("strict_egress", False))
         label = {"hybrid": "混合 (浏览器取 captcha + curl_cffi 提交)",
                  "browser": "浏览器 (Playwright 全流程)"}.get(mode, mode)
         gp = self.relays.google_fallback or "不分流（全部走上游）"

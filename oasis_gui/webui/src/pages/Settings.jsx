@@ -10,19 +10,28 @@ const { Text, Paragraph } = Typography;
 // Mirrors the settings page of the desktop console. Proxies and accounts are
 // deliberately absent - they have their own pages, and a proxy list does not
 // belong in a text field on a form.
+// Kept in the same order and with the same labels as the desktop console's
+// settings page, so the two never drift. Threads and the show preference live
+// on the dashboard in both, and proxies/accounts have their own pages.
 const FIELDS = [
-  { key: "mode", label: "模式", type: "select", options: ["browser", "hybrid"] },
-  { key: "threads", label: "线程数", type: "int" },
-  { key: "shows", label: "场次偏好（逗号分隔）", type: "list" },
+  // Same order and labels as the desktop console's settings page, minus
+  // log_file which only means something to the desktop (the service logs to
+  // stdout, where docker captures it).
   { key: "link_timeout", label: "等邮件超时（秒）", type: "int" },
-  { key: "success_timeout", label: "等成功邮件超时（秒）", type: "int" },
   { key: "verify_success", label: "成功后校验邮件", type: "bool" },
-  { key: "front_proxy", label: "前置代理（链路）", type: "text", wide: true },
-  { key: "google_proxy", label: "Google 分流代理", type: "text", wide: true },
+  { key: "success_timeout", label: "成功邮件超时（秒）", type: "int",
+    hint: "只在页面没确认注册时才等满这个时长。页面已确认时最多再看 30 秒 —— " +
+          "浏览器模式实测不发成功邮件。" },
+  { key: "delay_between", label: "账号间停顿（秒）", type: "float" },
   { key: "mail_proxy", label: "取件代理", type: "text", wide: true },
-  { key: "hme_base", label: "iCloud 服务地址", type: "text", wide: true },
+  { key: "hme_base", label: "iCloud 服务地址", type: "text", wide: true,
+    hint: "容器里要用 host.docker.internal，不是 127.0.0.1。" },
   { key: "hme_password", label: "iCloud 密码", type: "password", wide: true },
+  { key: "front_proxy", label: "前置代理（链路）", type: "text", wide: true },
+  { key: "google_proxy", label: "Google 分流代理", type: "text", wide: true,
+    hint: "浏览器模式必须能访问 Google（reCAPTCHA 在上面）。注册代理不通 Google 时填一个能通的。" },
   { key: "db_path", label: "数据库路径（只读）", type: "readonly", wide: true },
+  { key: "debug", label: "调试堆栈", type: "bool" },
 ];
 
 export default function Settings({ state, refresh }) {
@@ -36,7 +45,9 @@ export default function Settings({ state, refresh }) {
     const init = {};
     for (const f of FIELDS) {
       const v = c[f.key];
-      init[f.key] = Array.isArray(v) ? v.join(",") : (v ?? "");
+      if (Array.isArray(v)) init[f.key] = v.join(",");
+      else if (f.type === "bool") init[f.key] = v ? "true" : "false";
+      else init[f.key] = v ?? "";
     }
     form.setFieldsValue(init);
   }, [state?.config, form]);
@@ -50,6 +61,7 @@ export default function Settings({ state, refresh }) {
         if (f.type === "readonly") continue;
         let v = values[f.key];
         if (f.type === "int") v = parseInt(v, 10);
+        if (f.type === "float") v = parseFloat(v);
         if (f.type === "bool") v = String(v) === "true";
         if (f.type === "list") {
           v = String(v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
@@ -91,8 +103,10 @@ export default function Settings({ state, refresh }) {
         {FIELDS.map((f) => (
           <Form.Item key={f.key} name={f.key} label={f.label}
                      style={{ maxWidth: f.wide ? 720 : 320, marginBottom: 12 }}>
-            {f.type === "select" ? (
-              <Input />
+            {f.type === "bool" ? (
+              <Select
+                options={[{ value: "true", label: "开" }, { value: "false", label: "关" }]}
+              />
             ) : f.type === "password" ? (
               <Input.Password placeholder="启动时该服务的管理员密码" />
             ) : f.type === "readonly" ? (

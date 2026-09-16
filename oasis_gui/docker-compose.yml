@@ -1,44 +1,52 @@
 # 生产部署：拉取 CI 构建好的镜像，不在服务器上编译。
 #
-#   mkdir -p data && cp .env.example .env    # 填密码、代理、Google 出口、iCloud
+#   mkdir -p data && cp .env.example .env    # 只需填管理密码
 #   docker compose pull
 #   docker compose up -d
-#   docker compose logs -f
+#   # 然后浏览器打开 http://127.0.0.1:8080 配代理池、导入账号、开跑
 #
-# 镜像由 GitHub Actions 发布（见 .github/workflows/docker.yml）。想在本地从
-# 源码构建用另一个文件：
+# 镜像由 GitHub Actions 发布（见 .github/workflows/docker.yml）。想从源码构建：
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 绝大多数设置都在管理界面里，不在这个文件里 —— 改完写回 /data/oasis_config.json，
+# 重启不丢。这个文件只需要描述「怎么把容器跑起来」。
 
 services:
   oasis:
-    # 拉取而非构建。2 vCPU / 3GB 的机器编译 Playwright 基础镜像（约 2GB 层）
-    # 既慢又吃磁盘，CI 已经编好了。
     image: ghcr.io/chouhx/oasis:latest
     container_name: oasis
     restart: unless-stopped
     env_file: .env
+
     # 让容器能用 host.docker.internal 访问宿主机上的服务（iCloud HME 服务、
-    # 本地代理）。容器里的 127.0.0.1 是容器自己，新部署常见的"连接被拒"就是
-    # 这个原因。
+    # 本地代理）。容器里的 127.0.0.1 是容器自己，新部署最常见的「连接被拒」
+    # 就是这个。
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
     # 只绑回环：注册控制台没有理由暴露在公网。远程访问走 SSH 隧道，或在前
     # 面挂一层带认证的反向代理。
     ports:
       - "127.0.0.1:8080:8080"
+
     volumes:
-      # 账号池和运行时配置都落在这里，重启和重建镜像都不会丢。
+      # 账号池 + 运行时配置都在这里，重启和换镜像都不会丢。
       - ./data:/data
+
     # Chromium 依赖共享内存；Docker 默认的 64MB /dev/shm 是标签页静默崩溃的
-    # 常见原因。512MB 对一个 worker 足够，也给 3GB 的机器留了余地。
+    # 常见原因。一个共享浏览器进程 + 每线程一个 context，512MB 够用。
     shm_size: "512mb"
-    # 一个共享 chromium 服务所有 worker，所以上限不高：浏览器约 250MB，每个
-    # context 再加约 150MB，之外还有基础镜像本身。
+
+    # 一个共享 chromium 服务所有 worker，所以上限不高：浏览器约 250MB，
+    # 每个 context 再加约 150MB，之外还有基础镜像本身。
     mem_limit: 2500m
     memswap_limit: 2500m          # 不换页：浏览器换页比等待更糟
     cpus: "2.0"
-    stop_grace_period: 30s
+
+    # 单账号最长要 100 秒上下，停止时让它把手上的跑完，别硬杀。
+    stop_grace_period: 60s
+
     logging:
       driver: json-file
       options:

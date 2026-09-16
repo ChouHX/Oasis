@@ -4,7 +4,7 @@ import {
   Tag, App as AntApp, Checkbox,
 } from "antd";
 import { CaretRightOutlined, PauseOutlined, ClearOutlined } from "@ant-design/icons";
-import { api, STATUS } from "../api.js";
+import { api, STATUS, SHOW_LABEL } from "../api.js";
 
 const { Text } = Typography;
 
@@ -84,18 +84,38 @@ function LogPanel() {
   );
 }
 
+const SHOW_ORDER = ["glasgow", "manchester", "paris", "munich", "barcelona",
+                    "amsterdam", "rome", "boston", "lasvegas", "slane",
+                    "knebworth"];
+
 export default function Dashboard({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [threads, setThreads] = useState(2);
+  const [shows, setShows] = useState(["glasgow", "manchester", "paris"]);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!state?.config) return;
     if (state.config.threads) setThreads(state.config.threads);
-  }, [state?.config?.threads]);
+    if (Array.isArray(state.config.shows) && state.config.shows.length) {
+      setShows(state.config.shows);
+    }
+  }, [state?.config?.threads, state?.config?.shows]);
 
   const stats = state?.stats || {};
   const host = state?.host || {};
+
+  const saveShows = async () => {
+    if (new Set(shows).size !== shows.length) {
+      message.warning("三个偏好不能重复");
+      return;
+    }
+    try {
+      await api.saveConfig({ shows });
+      message.success("偏好已保存");
+      refresh();
+    } catch (e) { message.error(String(e.message || e)); }
+  };
 
   const run = async (fn, ok) => {
     setBusy(true);
@@ -127,6 +147,34 @@ export default function Dashboard({ state, refresh }) {
           </Col>
         ))}
       </Row>
+
+      <Card title="场次偏好" size="small" style={{ marginBottom: 12 }}
+            extra={<Button size="small" onClick={saveShows}>保存偏好</Button>}>
+        <Space wrap size={12}>
+          {["第一", "第二", "第三"].map((tag, i) => (
+            <Space key={tag} size={6}>
+              <Text type="secondary">{tag}</Text>
+              <Select
+                value={shows[i]}
+                style={{ width: 150 }}
+                onChange={(v) => {
+                  const next = [...shows];
+                  next[i] = v;
+                  setShows(next);
+                }}
+                options={SHOW_ORDER
+                  .filter((k) => k === shows[i] || !shows.includes(k))
+                  .map((k) => ({ value: k, label: SHOW_LABEL[k] || k }))}
+              />
+            </Space>
+          ))}
+        </Space>
+        <div style={{ marginTop: 8 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            三个不能重复；提交时按这个顺序作为城市偏好。
+          </Text>
+        </div>
+      </Card>
 
       <Card title="运行控制" size="small" style={{ marginBottom: 12 }}>
         <Space wrap size={12}>

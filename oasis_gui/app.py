@@ -816,10 +816,6 @@ class SettingsPage(ScrollArea):
         self.link_timeout.setRange(30, 3600)
         self.link_timeout.setValue(int(win.cfg.get("link_timeout", 300)))
         self.link_timeout.setFixedWidth(110)
-        self.http_timeout = CompactSpinBox()
-        self.http_timeout.setRange(10, 300)
-        self.http_timeout.setValue(int(win.cfg.get("http_timeout", 60)))
-        self.http_timeout.setFixedWidth(110)
         self.db_path = LineEdit()
         self.db_path.setText(str(win.cfg.get("db_path", "oasis.db")))
         self.log_file = LineEdit()
@@ -847,6 +843,19 @@ class SettingsPage(ScrollArea):
             "留空 = 直连上游。短效住宅代理在国内常无法直连时填，例如 socks5://127.0.0.1:10808。"
             "填了之后所有上游都经它拨号（自动链式），HTTP 模式也会改走本地 relay")
         self.front_proxy.setText(str(win.cfg.get("front_proxy", "")))
+        self.success_timeout = CompactSpinBox()
+        self.success_timeout.setRange(0, 900)
+        self.success_timeout.setValue(int(win.cfg.get("success_timeout", 180)))
+        self.success_timeout.setFixedWidth(110)
+        self.success_timeout.setToolTip(
+            "只在页面没确认注册时才等满这个时长（那时邮件是唯一证据）。\n"
+            "页面已经确认的情况下最多再看 30 秒——浏览器模式实测不发成功邮件。")
+        self.delay_between = CompactDoubleSpinBox()
+        self.delay_between.setRange(0.0, 30.0)
+        self.delay_between.setSingleStep(0.5)
+        self.delay_between.setValue(float(win.cfg.get("delay_between", 0.0)))
+        self.delay_between.setFixedWidth(110)
+        self.delay_between.setToolTip("每个账号跑完后的停顿，0 = 不停顿。")
         self.verify_success = SwitchButton()
         self.verify_success.setChecked(bool(win.cfg.get("verify_success", False)))
         self.verify_success.setToolTip(
@@ -855,16 +864,11 @@ class SettingsPage(ScrollArea):
             "代价是每个账号多等最多 180 秒。")
         self.debug = SwitchButton()
         self.debug.setChecked(bool(win.cfg.get("debug", False)))
-        self.strict_egress = SwitchButton()
-        self.strict_egress.setChecked(bool(win.cfg.get("strict_egress", False)))
-        self.strict_egress.setToolTip(
-            "默认关闭（仅告警）。出口不一致是否真的导致服务端静默丢弃，目前证据不足——\n"
-            "唯一一次混合模式失败追查下来是账号本身有问题（同一账号跑 http 也失败）。\n"
-            "开启后只要 captcha 与提交出口不同就判该账号失败；确认过你的代理确实有影响再开。")
 
         rows = [                ("等邮件超时(秒)", self.link_timeout),
                 ("成功后校验邮件", self.verify_success),
-                ("HTTP 超时(秒)", self.http_timeout),
+                ("成功邮件超时(秒)", self.success_timeout),
+                ("账号间停顿(秒)", self.delay_between),
                 ("取件代理", self.mail_proxy),
                 ("iCloud 服务", self.hme_base),
                 ("iCloud 密码", self.hme_password),
@@ -872,8 +876,7 @@ class SettingsPage(ScrollArea):
                 ("Google 分流代理", self.google_proxy),
                 ("数据库路径", self.db_path),
                 ("日志文件", self.log_file),
-                ("调试堆栈", self.debug),
-                ("严格出口一致", self.strict_egress)]
+                ("调试堆栈", self.debug)]
         for i, (label, w) in enumerate(rows):
             grid.addWidget(BodyLabel(label), i, 0)
             grid.addWidget(w, i, 1)
@@ -905,13 +908,13 @@ class SettingsPage(ScrollArea):
         self.win.cfg.update({
             "link_timeout": self.link_timeout.value(),
             "verify_success": self.verify_success.isChecked(),
-            "http_timeout": self.http_timeout.value(),
+            "success_timeout": self.success_timeout.value(),
+            "delay_between": self.delay_between.value(),
             "mail_proxy": self.mail_proxy.text().strip(),
             "hme_base": self.hme_base.text().strip(),
             "hme_password": self.hme_password.text().strip(),
             "google_proxy": self.google_proxy.text().strip(),
             "front_proxy": self.front_proxy.text().strip(),
-            "strict_egress": self.strict_egress.isChecked(),
             "db_path": self.db_path.text().strip() or "oasis.db",
             "log_file": self.log_file.text().strip() or "oasis_run.log",
             "debug": self.debug.isChecked()})
