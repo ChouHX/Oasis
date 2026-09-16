@@ -13,9 +13,19 @@ import traceback
 
 from . import identity as ident_mod
 from . import registrar
-from .browser_registrar import BrowserRegistrar
+from .browser_registrar import BrowserRegistrar, TransientError
 from .mailbox import make_mailbox
 from .relay import RelayPool
+
+
+# Retries for failures that never reached the site (dead proxy, dropped
+# connection). Failures the site itself decided are not retried.
+TRANSIENT_RETRIES = 1
+# A requeued account goes straight back to 'pending', so the same worker claims
+# it again immediately - with a dead proxy that is an endless loop inside one
+# round. Stop the round once this many transport failures pile up and let the
+# caller back off.
+TRANSIENT_PER_ROUND = 4
 
 
 class Engine:
@@ -121,6 +131,7 @@ class Engine:
             return
 
         self._stop.clear()
+        self._transient_left = max(TRANSIENT_PER_ROUND, threads)
         self._running = True
         self._done = 0
         # Relays are per-upstream and cached; drop them so a changed
@@ -225,37 +236,32 @@ class Engine:
                 "hme_password": self.config.get("hme_password", "") or "",
                 "hme_account": acct.get("client_id") or ""}, protocol, mail_proxy)
 
-            session = None
             t0 = time.time()
-            think = float(self.config.get("think_time", 45) or 0)
             vok = bool(self.config.get("verify_success", False))
             vto = int(self.config.get("success_timeout", 180) or 180)
-            scap = bool(self.config.get("send_captcha", False))
             try:
-                if mode == "browser":
-                    self._log("info", f"{tag}: {acct['email']} | mode=browser | "
-                                      f"mail={protocol} | proxy={proxy.split('@')[-1]}")
-                    result = self.browser.register(
-                        mailbox, ident, order, proxy_url=proxy,
-                        link_timeout=link_timeout,
-                        verify_success=vok, success_timeout=vto,
-                        send_captcha=scap,
-                        log=lambda m: self._log("info", f"{tag} {m.strip()}"))
-                elif mode == "hybrid":
-                    session = registrar.make_session(
-                        dial, timeout=self.config.get("http_timeout", 60))
-                    self._log("info", f"{tag}: {acct['email']} | mode=hybrid | "
-                                      f"mail={protocol} | proxy={proxy.split('@')[-1]}")
-                    result = self.browser.register_hybrid(
-                        session, mailbox, ident, order, proxy_url=proxy,
-                        link_timeout=link_timeout, think_time=think,
-                        verify_success=vok, success_timeout=vto,
-                        send_captcha=scap,
-                        log=lambda m: self._log("info", f"{tag} {m.strip()}"))
-                else:
-                    raise RegistrationError(
-                        f"unknown mode {mode!r}: only hybrid and browser carry a "
-                        f"captcha token")
+                self._log("info", f"{tag}: {acct['email']} | mode=browser | "
+                                  f"mail={protocol} | proxy={proxy.split('@')[-1]}")
+                # Transport failures say nothing about the account, so a retry
+                # here is cheap insurance against one dead connection costing a
+                # queue pass. Anything the site itself decides is not retried.
+                for attempt in range(TRANSIENT_RETRIES + 1):
+                    try:
+                        result = self.browser.register(
+                            mailbox, ident, order, proxy_url=proxy,
+                            link_timeout=link_timeout,
+                            verify_success=vok, success_timeout=vto,
+                            log=lambda m: self._log("info", f"{tag} {m.strip()}"))
+                        break
+                    except TransientError as e:
+                        self.pool.report(proxy, False, str(e))
+                        if attempt < TRANSIENT_RETRIES:
+                            self._log("warn", f"{tag}: {acct['email']} transport "
+                                              f"failure ({str(e)[:80]}), attempt "
+                                              f"{attempt + 2}/{TRANSIENT_RETRIES + 1}")
+                            time.sleep(2)
+                            continue
+                        raise
 
                 self.store.record_registration(
                     account_id, registrar.ARTIST_ID, registrar.PAGE_ID,
@@ -288,6 +294,24 @@ class Engine:
                     "mode": mode,
                     "evidence": (result or {}).get("evidence") or "mail",
                     "elapsed": result["elapsed"]})
+            except TransientError as e:
+                # Never reached the site, so do not write the account off. Mark
+                # the exit unhealthy and hand the account back to the queue; an
+                # iCloud quota makes burning an address expensive.
+                err = str(e)[:300]
+                self.pool.report(proxy, False, err)
+                self.store.release(account_id,
+                                   f"传输失败，未提交，已退回队列：{err}")
+                self._log("warn", f"{tag}: 退回队列 {acct['email']} - "
+                                  f"传输失败，账号未消耗：{err}")
+                self._emit("requeued", {"email": acct["email"], "error": err})
+                with self._lock:
+                    self._transient_left -= 1
+                    left = self._transient_left
+                if left <= 0:
+                    self._log("error", "本轮传输失败过多（代理池可能整体不可用），"
+                                       "提前结束本轮，交由外层退避")
+                    self.stop()
             except Exception as e:
                 err = str(e)[:300]
                 self.store.fail(account_id, err)
@@ -297,11 +321,6 @@ class Engine:
                 if self.config.get("debug"):
                     self._log("debug", traceback.format_exc()[-600:])
             finally:
-                if session is not None:
-                    try:
-                        session.close()
-                    except Exception:
-                        pass
                 self._emit("stats", self.store.stats())
                 if delay_between:
                     time.sleep(delay_between)

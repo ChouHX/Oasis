@@ -19,7 +19,7 @@ SQLite file stays the single source of truth, so a restart simply resumes.
                         mode - reCAPTCHA cannot load without it.
     OASIS_HME_BASE      iCloud Hide-My-Email service (default 127.0.0.1:8081)
     OASIS_HME_PASSWORD  that service's admin password
-    OASIS_MODE          hybrid | browser           (default browser)
+    OASIS_MODE          browser only            (accepted for compatibility)
     OASIS_THREADS       workers; unset = ask core.sysinfo for a safe number
     OASIS_SHOWS         preference order, e.g. glasgow,manchester,paris
     OASIS_LINK_TIMEOUT  seconds to wait for the mail   (default 240)
@@ -53,6 +53,8 @@ WAKE = threading.Event()      # "start a round now", set by the web UI
 # one, because the queue is still non-empty. Cleared by the Start button.
 PAUSED = threading.Event()
 LOGS = LogRing()
+# Counts transport-level failures, which never show up in the account stats.
+REQUESTS = 0
 # Pause after a round that registered nothing but did fail accounts.
 BACKOFF = 60
 
@@ -90,10 +92,8 @@ ENV_KEYS = {
     "OASIS_SHOWS": "shows",
     "OASIS_THREADS": "threads",
     "OASIS_LINK_TIMEOUT": "link_timeout",
-    "OASIS_THINK_TIME": "think_time",
     "OASIS_HTTP_TIMEOUT": "http_timeout",
     "OASIS_VERIFY_SUCCESS": "verify_success",
-    "OASIS_SEND_CAPTCHA": "send_captcha",
     "OASIS_SUCCESS_TIMEOUT": "success_timeout",
     "OASIS_FRONT_PROXY": "front_proxy",
     "OASIS_MAIL_PROXY": "mail_proxy",
@@ -102,9 +102,9 @@ ENV_KEYS = {
     "OASIS_HME_PASSWORD": "hme_password",
     "OASIS_STRICT_EGRESS": "strict_egress",
 }
-_INT_KEYS = ("threads", "link_timeout", "think_time", "http_timeout",
+_INT_KEYS = ("threads", "link_timeout", "http_timeout",
              "success_timeout")
-_BOOL_KEYS = ("verify_success", "send_captcha", "strict_egress")
+_BOOL_KEYS = ("verify_success", "strict_egress")
 
 
 def build_config():
@@ -257,7 +257,10 @@ ADMIN = None
 
 
 def on_event(kind, payload=None):
+    global REQUESTS
     payload = payload or {}
+    if kind == "requeued":
+        REQUESTS += 1
     if kind == "registered":
         evidence = payload.get("evidence") or "mail"
         label = "SUBMITTED" if evidence == "page" else "REGISTERED"
@@ -269,6 +272,13 @@ def on_event(kind, payload=None):
         log("error", f"FAILED {payload.get('email', '?')} - "
                      f"{str(payload.get('error', ''))[:160]}")
         STATUS.bump("failed")
+    elif kind == "requeued":
+        # Transport failure: the account is back in the queue untouched. Counted
+        # separately from failures so the back-off below can see it - a dead
+        # proxy produces zero failures and would otherwise spin forever.
+        log("warn", f"REQUEUED {payload.get('email', '?')} - "
+                    f"{str(payload.get('error', ''))[:140]}")
+        STATUS.bump("requeued")
     elif kind == "stopped":
         STATUS.set(state="idle", stats=payload.get("stats", {}))
     STATUS.set(last_event={"kind": kind, "at": time.time(), "payload": payload})
@@ -378,6 +388,7 @@ def main():
         # above does not inflate it.
         rounds += 1
         before = stats                      # for the back-off decision below
+        requests_before = REQUESTS
         STATUS.set(state="running", rounds=rounds, stats=stats)
         # read per round, so a change made in the web UI applies from the
         # next round without a restart
@@ -411,10 +422,15 @@ def main():
         gained = (done.get("registered", 0) + done.get("submitted", 0)
                   - before.get("registered", 0) - before.get("submitted", 0))
         lost = done.get("failed", 0) - before.get("failed", 0)
-        if gained <= 0 and lost > 0 and not PAUSED.is_set():
-            log("warn", f"round {rounds}: {lost} failure(s) and nothing "
-                        f"registered - backing off {BACKOFF}s before the next "
-                        f"round (check the proxy pool)")
+        stuck = REQUESTS - requests_before      # transport failures this round
+        if gained <= 0 and (lost > 0 or stuck > 0) and not PAUSED.is_set():
+            why = []
+            if lost:
+                why.append(f"{lost} 个被拒")
+            if stuck:
+                why.append(f"{stuck} 次传输失败（账号已退回队列）")
+            log("warn", f"round {rounds}: 零成功，" + "、".join(why) +
+                        f" —— 退避 {BACKOFF}s 再试（检查代理池）")
             WAKE.wait(BACKOFF)
             WAKE.clear()
 

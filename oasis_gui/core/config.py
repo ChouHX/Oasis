@@ -5,7 +5,10 @@ import os
 
 # Modes the engine accepts. A config saved before the captcha-less path was
 # removed still says "http"; coerce it rather than letting the engine abort.
-VALID_MODES = ("hybrid", "browser")
+# Only the browser flow is carried now. A plain curl_cffi submission is
+# measured to be caught by the site's risk control, so hybrid was removed
+# rather than left as a footgun in the UI.
+VALID_MODES = ("browser",)
 
 DEFAULTS = {
     "db_path": "oasis.db",
@@ -14,7 +17,7 @@ DEFAULTS = {
     "shows": ["knebworth", "slane", "glasgow"],
     # hybrid or browser. The captcha-less HTTP mode was removed from the UI; the
     # flow it used (curl_cffi calls) is what hybrid still runs underneath.
-    "mode": "hybrid",
+    "mode": "browser",
     "mail_proxy": "",
     "google_proxy": "",
     # Optional local proxy that every upstream is dialled through. Needed when
@@ -35,7 +38,6 @@ DEFAULTS = {
     "delay_between": 0.0,
     # Randomised pause between reading the mail link and submitting, so the
     # confirm does not land milliseconds after the verification. 0 disables.
-    "think_time": 45,
     # confirm answers {"status":"OK"} even for an address it refuses, so the
     # only trustworthy receipt is the "Registration Complete" mail. Turning
     # this on makes the run wait for it (and fail the account without it), at
@@ -45,7 +47,6 @@ DEFAULTS = {
     # OFF on purpose: measured 2026-09-16, a real captcha token makes confirm
     # fail silently (empty token completes, a valid 2382-char token does not),
     # most likely because the token is bound to the client that minted it.
-    "send_captcha": False,
     "verify_success": False,
     "success_timeout": 180,
     "log_file": "oasis_run.log",
@@ -70,7 +71,7 @@ class Config:
         # A config saved before the captcha-less path was removed still says
         # "http"; coerce it rather than let the engine abort on an unknown mode.
         if self.data.get("mode") not in VALID_MODES:
-            self.data["mode"] = "hybrid"
+            self.data["mode"] = "browser"
         return self.data
 
     def save(self):

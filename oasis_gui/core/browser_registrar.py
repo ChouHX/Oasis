@@ -39,6 +39,12 @@ import urllib.request
 
 from . import registrar
 
+# Once the page has confirmed the registration, the success mail is a bonus, not
+# a gate - browser mode is measured not to send it. Looking for it for the full
+# success_timeout costs a minute per account for something that usually never
+# arrives, so cap that second look hard.
+MAIL_GRACE_AFTER_PAGE = 30
+
 VIEWPORTS = [
     {"width": 1280, "height": 720},
     {"width": 1366, "height": 768},
@@ -385,6 +391,15 @@ class _SharedBrowser:
             "--disable-dev-shm-usage", "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
+            # Playwright's connect_over_cdp asserts on targets it does not
+            # recognise, and a component extension's service worker is exactly
+            # that - the whole browser connection dies with "Assertion error".
+            # Nothing here needs extensions, so keep them out entirely.
+            "--disable-extensions",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--no-service-autorun",
         ]
         if self.proxy_url:
             args.append(f"--proxy-server={self.proxy_url}")
@@ -426,6 +441,36 @@ def _free_port():
         return s.getsockname()[1]
 
 
+class TransientError(Exception):
+    """A failure that says nothing about the account.
+
+    Dead proxy, dropped connection, relay out of upstreams - the account is
+    untouched and should go back in the queue rather than be written off. Kept
+    separate from BrowserRegistrationError so the engine can tell "this account
+    was refused" from "this attempt never reached the site".
+    """
+
+
+# Substrings Chromium and the relay use for transport failures. Matched against
+# the exception text because Playwright wraps everything in its own types.
+_TRANSIENT_MARKERS = (
+    "ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_REFUSED",
+    "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_TIMED_OUT", "ERR_NAME_NOT_RESOLVED", "ERR_ADDRESS_UNREACHABLE",
+    "ERR_SOCKS_CONNECTION_FAILED", "ERR_EMPTY_RESPONSE",
+    "upstream unavailable", "connection closed while reading",
+    "ConnectionResetError", "ConnectionRefusedError",
+    "Target page, context or browser has been closed",
+    "net::ERR_",
+)
+
+
+def is_transient(exc):
+    """True when the failure looks like transport rather than a refusal."""
+    text = f"{type(exc).__name__}: {exc}"
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
 class BrowserRegistrationError(Exception):
     pass
 
@@ -446,7 +491,6 @@ class BrowserRegistrar:
         # them is shared per proxy (see _SharedBrowser), because contexts are
         # what isolate accounts and separate processes cost twice the memory
         # for an identical fingerprint.
-        self._local = threading.local()
         self._shared = {}
         self._shared_lock = threading.Lock()
 
@@ -459,79 +503,6 @@ class BrowserRegistrar:
         });
     })"""
 
-    def _warm_entry(self, relay_url, ident):
-        """A loaded page on the site's origin, kept alive between accounts.
-
-        The captcha does not depend on the registration token: reCAPTCHA only
-        needs the page's origin plus the site key. So the browser loads the
-        origin once and mints every subsequent token in ~0.3s, instead of
-        paying a full page load per account.
-
-        One chromium process serves every worker (see _SharedBrowser); the
-        context below is this thread's private slice of it.
-        """
-        from playwright.sync_api import sync_playwright
-
-        cache = getattr(self._local, "warm", None)
-        if cache is None:
-            cache = self._local.warm = {}
-        entry = cache.get(relay_url)
-        if entry and entry.get("alive"):
-            return entry
-        if entry:                                   # drop a dead connection
-            try:
-                entry["pw"].stop()
-            except Exception:
-                pass
-
-        shared = self._shared_browser(relay_url)
-        endpoint = shared.endpoint()
-        pw = sync_playwright().start()
-        try:
-            browser = pw.chromium.connect_over_cdp(endpoint)
-            ctx = browser.new_context(
-                viewport=random.choice(VIEWPORTS),
-                user_agent=self._user_agent(random.Random()),
-                locale="en-US",
-                timezone_id=random.choice(
-                    TIMEZONES.get((ident.get("location") or {}).get("countryCode"),
-                                  TIMEZONES["US"])),
-                device_scale_factor=1,
-            )
-            ctx.add_init_script(self._stealth_js(random.Random()))
-            ctx.set_default_timeout(self.browser_timeout * 1000)
-            page = ctx.new_page()
-            for attempt in range(3):
-                try:
-                    page.goto(registrar.RETURN_URL, wait_until="domcontentloaded",
-                              timeout=self.browser_timeout * 1000)
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    self.log(f"    warm nav retry {attempt + 1}: {type(e).__name__}")
-            page.wait_for_timeout(800)
-            if not page.evaluate("() => !!(window.grecaptcha && "
-                                 "window.grecaptcha.enterprise)"):
-                page.add_script_tag(
-                    url=f"https://www.google.com/recaptcha/enterprise.js"
-                        f"?render={registrar.SITEKEY}")
-                for _ in range(30):
-                    if page.evaluate("() => !!(window.grecaptcha && "
-                                     "window.grecaptcha.enterprise)"):
-                        break
-                    page.wait_for_timeout(1000)
-        except Exception:
-            try:
-                pw.stop()
-            except Exception:
-                pass
-            raise
-        entry = {"pw": pw, "browser": browser, "ctx": ctx, "page": page,
-                 "alive": True}
-        cache[relay_url] = entry
-        self.log(f"    warm context ready on {endpoint}")
-        return entry
 
     def _shared_browser(self, relay_url):
         """The single browser process for this proxy, guaranteed started.
@@ -552,38 +523,13 @@ class BrowserRegistrar:
             shared.endpoint()           # idempotent; starts if needed
             return shared
 
-    def mint_captcha(self, proxy_url, ident, retries=3):
-        """A genuine reCAPTCHA token, minted from the warm page."""
-        relay = self.relays.get(proxy_url)
-        last = None
-        for attempt in range(retries):
-            entry = self._warm_entry(relay.url, ident)
-            try:
-                tok = entry["page"].evaluate(self._EXEC_JS, registrar.SITEKEY)
-                if tok:
-                    return tok, self._browser_egress(entry["page"])
-            except Exception as e:
-                last = e
-                entry["alive"] = False
-                try:
-                    entry["browser"].close()
-                    entry["pw"].stop()
-                except Exception:
-                    pass
-                self._local.warm.pop(relay.url, None)
-            self.log(f"    captcha retry {attempt + 1}: {type(last).__name__}")
-        raise BrowserRegistrationError(f"could not mint a captcha: {last}")
 
     def close_warm(self):
-        """Tear down this thread's contexts, then any shared browser."""
-        cache = getattr(self._local, "warm", None) or {}
-        for entry in list(cache.values()):
-            try:
-                entry["ctx"].close()
-                entry["pw"].stop()
-            except Exception:
-                pass
-        cache.clear()
+        """Shut down every shared browser process.
+
+        Named for the warm-browser scheme it started as; what it closes now is
+        the shared chromium that browser mode runs every account in.
+        """
         with self._shared_lock:
             for shared in self._shared.values():
                 shared.stop()
@@ -605,33 +551,61 @@ class BrowserRegistrar:
                                                 "renderer": gpu[1]}))
                 .replace("__CORES__", str(cores)))
 
-    def _launch(self, playwright, proxy_url, rnd, ident):
+    def _connect_shared(self, relay_url, attempts=2):
+        """(playwright, browser) on the shared chromium, with one self-heal.
+
+        A shared process is one point of failure for every worker, and a driver
+        crash ("Assertion error" from an unexpected target) kills the whole
+        playwright session, not just the call. So on failure: throw the shared
+        browser away, build a new one, and try once more from a clean
+        playwright - losing one account's worth of work beats wedging the run.
+        """
+        from playwright.sync_api import sync_playwright
+
+        last = None
+        for attempt in range(attempts):
+            shared = self._shared_browser(relay_url)
+            pw = sync_playwright().start()
+            try:
+                return pw, pw.chromium.connect_over_cdp(shared.endpoint())
+            except Exception as e:
+                last = e
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
+                self.log(f"    shared browser connect failed "
+                         f"({type(e).__name__}), rebuilding")
+                with self._shared_lock:
+                    dead = self._shared.pop(relay_url, None)
+                if dead:
+                    try:
+                        dead.stop()
+                    except Exception:
+                        pass
+        raise BrowserRegistrationError(f"could not attach to a browser: {last}")
+
+    def _new_context(self, browser, rnd, ident):
+        """An isolated context for one account on a shared browser.
+
+        The viewport, user agent, timezone and stealth patch are all drawn per
+        account, so two accounts on the same chromium still look like two
+        different machines to the site. Cookies, storage and cache are isolated
+        by the context, which is the part that actually matters.
+        """
         country = (ident.get("location") or {}).get("countryCode", "US")
-        viewport = rnd.choice(VIEWPORTS)
-        timezone = rnd.choice(TIMEZONES.get(country, TIMEZONES["US"]))
-        channel = resolve_channel(self.log)
-        kw = {"headless": self.headless, "proxy": {"server": proxy_url},
-              "args": ["--disable-blink-features=AutomationControlled",
-                       "--disable-dev-shm-usage", "--no-first-run",
-                       "--no-default-browser-check",
-                       "--disable-features=IsolateOrigins,site-per-process"]}
-        if channel:
-            kw["channel"] = channel
-        browser = playwright.chromium.launch(**kw)
         ctx = browser.new_context(
-            viewport=viewport,
+            viewport=rnd.choice(VIEWPORTS),
             user_agent=self._user_agent(rnd),
             locale="en-US",
-            timezone_id=timezone,
+            timezone_id=rnd.choice(TIMEZONES.get(country, TIMEZONES["US"])),
             device_scale_factor=1,
         )
         # patch the signals Chromium leaks in headless before any page script runs
         ctx.add_init_script(self._stealth_js(rnd))
         ctx.set_default_timeout(self.browser_timeout * 1000)
-        page = ctx.new_page()
-        self.log(f"    browser: {viewport['width']}x{viewport['height']} "
-                 f"{timezone} via {proxy_url}")
-        return browser, ctx, page
+        return ctx
+
 
     @staticmethod
     def _fetch(page, url, method="GET", body=None):
@@ -649,24 +623,6 @@ class BrowserRegistrar:
         """
         return page.evaluate(script, [url, method, body])
 
-    def _captcha(self, page):
-        """Real reCAPTCHA Enterprise token for the page's verification action."""
-        page.wait_for_function(
-            "() => !!(window.grecaptcha && window.grecaptcha.enterprise)",
-            timeout=self.browser_timeout * 1000)
-        token = page.evaluate("""
-        async (key) => await new Promise((resolve, reject) => {
-            window.grecaptcha.enterprise.ready(async () => {
-                try {
-                    resolve(await window.grecaptcha.enterprise.execute(
-                        key, {action: %s}));
-                } catch (e) { reject(String(e)); }
-            });
-        })
-        """ % json.dumps(registrar.CAPTCHA_ACTION), registrar.SITEKEY)
-        if not token:
-            raise BrowserRegistrationError("grecaptcha returned an empty token")
-        return token
 
     # ---------------------------------------------------------------------- flow
     # The SPA's own end-of-flow page. Nothing else in the DOM says "done".
@@ -682,14 +638,41 @@ class BrowserRegistrar:
 
 
     # ---------------------------------------------------------- SPA form driving
+    @staticmethod
+    def _settle(page, condition, timeout_ms=3000):
+        """Wait for a condition, but only as long as it actually takes.
+
+        Every fixed wait_for_timeout in this file was a guess at how long the
+        SPA needs; measured, its DOM is ready in about a second. Waiting on the
+        element the next step needs returns as soon as it appears, so a fast
+        machine stops paying for a slow one's timings.
+        """
+        try:
+            page.wait_for_function(condition, timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _await_options(page, timeout_ms=4000):
+        """Wait for a dropdown's options to render. True when some appeared."""
+        try:
+            page.wait_for_selector("[role=option]", timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
     def _fill_details(self, page, ident, log):
         """Step 1. Typing, not fill(): these are custom components and fill()
         does not raise the input events they listen for (the phone field then
         reports "Please enter a valid phone number")."""
-        page.fill("#soundcheckConfirmFirstName", ident["first_name"])
-        page.wait_for_timeout(350)
-        page.fill("#soundcheckConfirmLastName", ident["last_name"])
-        page.wait_for_timeout(350)
+        for sel, val in (("#soundcheckConfirmFirstName", ident["first_name"]),
+                         ("#soundcheckConfirmLastName", ident["last_name"])):
+            page.fill(sel, val)
+            # fill() dispatches the input event React listens for; confirming
+            # the value landed beats sleeping on a guess.
+            self._settle(page, f"() => document.querySelector({sel!r}).value"
+                               f" === {val!r}", 1200)
         for attempt in range(4):
             field = page.query_selector("input#soundcheckConfirmPhoneNumber")
             field.click()
@@ -698,17 +681,18 @@ class BrowserRegistrar:
             page.keyboard.press("Control+a")
             page.keyboard.press("Delete")
             page.wait_for_timeout(300)
-            page.type("input#soundcheckConfirmPhoneNumber", ident["phone"], delay=130)
-            page.wait_for_timeout(800)
+            page.type("input#soundcheckConfirmPhoneNumber", ident["phone"], delay=110)
             typed = page.input_value("#soundcheckConfirmPhoneNumber")
             page.keyboard.press("Tab")
-            page.wait_for_timeout(1200)
-            bad = "Please enter a valid phone number" in page.inner_text("body")
+            # Either the error shows up (fast) or it never does; either way we
+            # are done in ~0.7s instead of always paying 1.2s.
+            bad = self._settle(
+                page, "() => document.body.innerText"
+                      ".includes('Please enter a valid phone number')", 700)
             if not bad:
                 break
             log(f"    phone attempt {attempt + 1} rejected "
                 f"(field holds {typed!r}), retrying")
-            page.wait_for_timeout(500)
         # The date picker is custom: a text input that ignores typing, plus two
         # select-style triggers and a day grid. Reopening it is the only reliable
         # retry, and the field has to be non-empty or Continue silently stalls.
@@ -716,17 +700,17 @@ class BrowserRegistrar:
             if page.input_value("#birthDate"):
                 break
             page.click("#birthDate")
-            page.wait_for_timeout(1800)
+            self._await_options(page, 3000)          # the calendar has rendered
             for tid, val in (("#year", str(ident["dob_year"])),
                              ("#month", ident["dob_month"])):
                 try:
                     page.click(tid, force=True, timeout=6000)
-                    page.wait_for_timeout(1300)
-                    page.click(f'[role=option]:has-text("{val}")', timeout=6000)
-                    page.wait_for_timeout(1300)
+                    self._await_options(page, 2500)
+                    page.click(f'[role=option]:has-text("{val}")', timeout=4000)
+                    page.wait_for_timeout(250)
                 except Exception:
                     page.keyboard.press("Escape")
-                    page.wait_for_timeout(400)
+                    page.wait_for_timeout(200)
             cal = page.query_selector("[data-testid=calendar]")
             if cal:
                 for cell in cal.query_selector_all("button, [role=gridcell], td"):
@@ -736,21 +720,21 @@ class BrowserRegistrar:
                             break
                         except Exception:
                             pass
-            page.wait_for_timeout(1000)
+            self._settle(page, "() => !!document.querySelector('#birthDate').value",
+                         1200)
             if not page.input_value("#birthDate"):
                 log(f"    birthdate attempt {attempt + 1} did not take, reopening")
-        page.wait_for_timeout(600)
         for attempt in range(3):
             page.click("input#soundcheckConfirmLocation")
             page.fill("input#soundcheckConfirmLocation", "")
             page.wait_for_timeout(250)
             page.type("input#soundcheckConfirmLocation", ident["location_query"],
-                      delay=100)
-            page.wait_for_timeout(4200)
-            opts = page.query_selector_all("[role=option]")
-            if opts:
-                opts[0].click()
-                page.wait_for_timeout(1000)
+                      delay=90)
+            # radar.io's autocomplete answers in well under a second; the old
+            # 4.2s blind wait was the single biggest waste in the flow.
+            if self._await_options(page, 6000):
+                page.query_selector_all("[role=option]")[0].click()
+                page.wait_for_timeout(400)
                 break
         log(f"    details: name={page.input_value('#soundcheckConfirmFirstName')!r} "
             f"phone={page.input_value('#soundcheckConfirmPhoneNumber')!r} "
@@ -800,12 +784,12 @@ class BrowserRegistrar:
         if not btn:
             return False
         btn.click()
-        page.wait_for_timeout(1400)
+        self._await_options(page, 3000)
         for opt in page.query_selector_all("[role=option]"):
             if want and want in (opt.inner_text() or "").lower():
                 try:
                     opt.click()
-                    page.wait_for_timeout(900)
+                    page.wait_for_timeout(350)
                     return True
                 except Exception:
                     return False
@@ -844,11 +828,11 @@ class BrowserRegistrar:
         for cb in page.query_selector_all("[role=combobox]"):
             if "Select an option" in (cb.inner_text() or ""):
                 cb.click()
-                page.wait_for_timeout(1300)
+                self._await_options(page, 3000)
                 opts = page.query_selector_all("[role=option]")
                 if opts:
                     opts[-1].click()            # travel: No
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(350)
                 break
         self._click_continue(page, until="question", timeout=60)
         log(f"    {len(picked)} venue(s) selected: {', '.join(picked)}")
@@ -865,14 +849,14 @@ class BrowserRegistrar:
                 for cb in page.query_selector_all("[role=combobox]"):
                     if "Select" in (cb.inner_text() or ""):
                         cb.click()
-                        page.wait_for_timeout(1400)
+                        self._await_options(page, 3000)
                         opts = page.query_selector_all("[role=option]")
                         log(f"      album options: {len(opts)}")
                         if opts:
                             album = (opts[0].inner_text() or "").strip()
                             log(f"      picking {album[:26]!r}")
                             opts[0].click()
-                            page.wait_for_timeout(1200)
+                            page.wait_for_timeout(350)
                         break
             self._click_continue(page, until="terms", timeout=60)
 
@@ -883,7 +867,25 @@ class BrowserRegistrar:
         scroll = page.query_selector("button:has-text('Scroll to bottom')")
         if scroll:
             scroll.click()
-            page.wait_for_timeout(2500)
+            # Submit is *not* disabled before the scroll - measured, both buttons
+            # read disabled=False from the start, and the site just ignores the
+            # click until its own scroll position reaches the end. So waiting on
+            # the button (which is what this used to do) returns immediately and
+            # the submit silently does nothing. Watch the scroll instead: the
+            # terms live in the tallest scrollable element on the page.
+            done = self._settle(page, """() => {
+                const els = [...document.querySelectorAll('*')].filter(e => {
+                  const s = getComputedStyle(e);
+                  return e.scrollHeight > e.clientHeight + 40
+                         && /auto|scroll/.test(s.overflowY);
+                }).sort((a, b) => b.scrollHeight - a.scrollHeight);
+                const e = els[0];
+                return !e || e.scrollTop + e.clientHeight >= e.scrollHeight - 24;
+            }""", 6000)
+            if not done:
+                # condition missed (different markup, or nothing scrollable):
+                # fall back to the delay that is known to work
+                page.wait_for_timeout(2500)
         submit = page.query_selector("button:has-text('Submit')")
         if not submit:
             raise BrowserRegistrationError("no submit button on the T&C page")
@@ -916,131 +918,10 @@ class BrowserRegistrar:
             pass
         return None
 
-    @staticmethod
-    def _browser_egress(page):
-        """Public IP the browser page goes out from."""
-        try:
-            return page.evaluate(
-                "async () => (await (await fetch("
-                "'https://api.ipify.org?format=json')).json()).ip")
-        except Exception:
-            return None
-
-    def register_hybrid(self, session, mailbox, ident, order=None, proxy_url=None,
-                        link_timeout=300, log=print, think_time=45,
-                        verify_success=False, success_timeout=180,
-                        send_captcha=False):
-        """curl_cffi does the talking; a warm browser only mints the captcha.
-
-        Measured: the warm page mints a genuine token in 0.21-0.29s, against
-        roughly 40s when each account loads the mail link in its own browser.
-        The captcha does not depend on the registration token, so the page load
-        was pure overhead.
-        """
-        order = order or registrar.DEFAULT_ORDER
-        t0 = time.time()
-        rnd = random.Random()
-        if not proxy_url:
-            raise BrowserRegistrationError("hybrid mode needs a proxy")
-        relay = self.relays.get(proxy_url)
-
-        registrar.request_verification(session, mailbox.email, log)
-        t_verify = time.time() - t0
-
-        link, received = mailbox.find_verification_link(
-            timeout=link_timeout, not_before=t0, log=log)
-        if not link:
-            raise BrowserRegistrationError("verification mail never arrived")
-        t_mail = time.time() - t0 - t_verify
-        log(f"  [{mailbox.email}] mail {received}")
-
-        # The mail link already carries a usable token, so refresh it through
-        # the API rather than loading the whole page: the browser is only
-        # needed for the captcha, and that comes from the warm page in ~0.3s.
-        token = link.split("token=", 1)[1]
-        claims = {}
-        try:
-            token, claims = registrar.check_verification(session, token, log)
-        except Exception as e:
-            log(f"  [{mailbox.email}] check-verification: {type(e).__name__} "
-                f"{str(e)[:80]}")
-
-        t_browser0 = time.time()
-        if send_captcha:
-            captcha, browser_ip = self.mint_captcha(proxy_url, ident)
-            log(f"  [{mailbox.email}] captcha {len(captcha)} chars "
-                f"(warm browser, {time.time() - t_browser0:.2f}s)")
-        else:
-            captcha, browser_ip = "", None
-            log(f"  [{mailbox.email}] captcha omitted on purpose "
-                f"(send_captcha is off; a real token makes confirm fail)")
-        t_browser = time.time() - t_browser0
-
-        # A real visitor reads the mail, opens the link and fills the form. Do
-        # not let the confirm land milliseconds after the verification - that
-        # gap is the cheapest thing a backend can measure.
-        if think_time > 0:
-            gap = rnd.uniform(think_time * 0.6, think_time * 1.4)
-            log(f"  [{mailbox.email}] think-time {gap:.0f}s")
-            time.sleep(gap)
-
-        # The browser and curl_cffi share one proxy *url*, but a rotating
-        # residential upstream hands out an exit per connection - so the
-        # captcha can be minted from one IP and the submit sent from another.
-        # Measure both and say so, because that mismatch is exactly what a
-        # scorer would notice.
-        session_ip = registrar.egress_ip(session)
-        if browser_ip and session_ip:
-            if browser_ip == session_ip:
-                log(f"  [{mailbox.email}] egress ok: captcha and submit both via "
-                    f"{session_ip}")
-            else:
-                log(f"  [{mailbox.email}] EGRESS MISMATCH: captcha via {browser_ip}, "
-                    f"submit via {session_ip} - this proxy rotates per connection; "
-                    f"use a sticky-session proxy or switch to browser mode")
-                if self.strict_egress:
-                    raise BrowserRegistrationError(
-                        f"egress mismatch: captcha {browser_ip} != submit {session_ip}")
-        elif browser_ip or session_ip:
-            log(f"  [{mailbox.email}] egress: browser={browser_ip} submit={session_ip}")
-
-        url = f"{registrar.RETURN_URL}?token={token}"
-        # NOTE: the real SPA fills `ip` from Cloudflare's trace. We deliberately
-        # leave it null - measured 2026-09-16, sending the (correct, sticky)
-        # exit IP made even the previously-working empty-captcha path fail.
-        body = registrar.build_confirm(ident, token, url, order, captcha)
-        t_confirm0 = time.time()
-        data, text = registrar.confirm(session, body, log)
-        t_confirm = time.time() - t_confirm0
-        total = time.time() - t0
-        log(f"  [{mailbox.email}] confirm -> {text[:60]}")
-        if verify_success:
-            found, when = mailbox.find_success(
-                timeout=success_timeout, not_before=t0, log=log)
-            if not found:
-                raise BrowserRegistrationError(
-                    "confirm returned OK but no Registration Complete mail "
-                    "arrived - the address was refused")
-            log(f"  [{mailbox.email}] success mail confirmed")
-        log(f"  [{mailbox.email}] timing: verify {t_verify:.1f}s | "
-            f"mail {t_mail:.1f}s | browser+captcha {t_browser:.1f}s | "
-            f"confirm {t_confirm:.1f}s | total {total:.1f}s")
-        return {
-            "email": mailbox.email,
-            "session_id": claims.get("sessionId"),
-            "token": token,
-            "poll_answer_ids": body["pollAnswerIds"],
-            "journey": body["journeyPollAnswers"],
-            "response": text,
-            "elapsed": round(total, 2),
-            "refresh_token": mailbox.refresh_token,
-            "captcha_len": len(captcha),
-            "mode": "hybrid",
-        }
 
     def register(self, mailbox, ident, order=None, proxy_url=None,
                  link_timeout=300, log=print, verify_success=False,
-                 success_timeout=180, send_captcha=True):
+                 success_timeout=180):
         from playwright.sync_api import sync_playwright
 
         order = order or registrar.DEFAULT_ORDER
@@ -1052,111 +933,146 @@ class BrowserRegistrar:
         relay = self.relays.get(proxy_url)
         log(f"  [{mailbox.email}] relay {relay.url} -> {proxy_url.split('@')[-1]}")
 
-        with sync_playwright() as pw:
-            browser, ctx, page = self._launch(pw, relay.url, rnd, ident)
-            try:
-                # 1. load the SPA so the page (and its origin) exists
-                page.goto(registrar.RETURN_URL, wait_until="domcontentloaded",
-                          timeout=self.browser_timeout * 1000)
+        # One chromium serves every worker (see _SharedBrowser). Doing this per
+        # account instead - launching a fresh browser each time - costs 2-4s of
+        # startup plus a ~220MB process, and buys no fingerprint diversity:
+        # measured across three separate browsers, the canvas hash and WebGL
+        # string came out identical, because the fingerprint comes from the
+        # Chromium build and the machine, not the process.
+        pw, browser = self._connect_shared(relay.url)
+        ctx = None
+        try:
+            ctx = self._new_context(browser, rnd, ident)
+            page = ctx.new_page()
+            self.log(f"    context on shared browser via {relay.url}")
+            # 1. load the SPA so the page (and its origin) exists
+            page.goto(registrar.RETURN_URL, wait_until="domcontentloaded",
+                      timeout=self.browser_timeout * 1000)
 
-                # 2. ask for the verification mail, from the page
-                res = self._fetch(page, f"{registrar.API}/fan2/verify/verify",
-                                  "POST", registrar.build_verify(mailbox.email))
-                if res["status"] != 200:
-                    raise BrowserRegistrationError(
-                        f"verify/verify HTTP {res['status']}: {res['text'][:160]}")
-                log(f"  [{mailbox.email}] verify/verify -> {res['text'][:60]}")
+            # 2. ask for the verification mail, from the page
+            res = self._fetch(page, f"{registrar.API}/fan2/verify/verify",
+                              "POST", registrar.build_verify(mailbox.email))
+            if res["status"] != 200:
+                raise BrowserRegistrationError(
+                    f"verify/verify HTTP {res['status']}: {res['text'][:160]}")
+            log(f"  [{mailbox.email}] verify/verify -> {res['text'][:60]}")
 
-                # 3. wait for the link, then open it: this renders the form and
-                #    is what makes reCAPTCHA initialise
-                url, received = mailbox.find_verification_link(
-                    timeout=link_timeout, not_before=t0, log=log)
-                if not url:
-                    raise BrowserRegistrationError("verification mail never arrived")
-                log(f"  [{mailbox.email}] mail {received}")
-                page.goto(url, wait_until="domcontentloaded",
-                          timeout=self.browser_timeout * 1000)
-                page.wait_for_timeout(1500)
+            # 3. wait for the link, then open it: this renders the form and
+            #    is what makes reCAPTCHA initialise
+            url, received = mailbox.find_verification_link(
+                timeout=link_timeout, not_before=t0, log=log)
+            if not url:
+                raise BrowserRegistrationError("verification mail never arrived")
+            log(f"  [{mailbox.email}] mail {received}")
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=self.browser_timeout * 1000)
+            page.wait_for_timeout(1500)
 
-                # 4. the mail-link step, re-issuing a token with emailValid=true
-                token = url.split("token=", 1)[1]
-                res = self._fetch(
-                    page,
-                    f"{registrar.API}/fan2/verify/check-verification"
-                    f"?token={token}&artistId={registrar.ARTIST_ID}"
-                    f"&pageId={registrar.PAGE_ID}")
-                if res["status"] != 200:
-                    raise BrowserRegistrationError(
-                        f"check-verification HTTP {res['status']}: {res['text'][:160]}")
-                data = json.loads(res["text"])
-                claims = data.get("claims") or {}
-                if not claims.get("emailValid"):
-                    raise BrowserRegistrationError(f"emailValid false: {claims}")
-                token = data.get("token") or token
-                url = f"{registrar.RETURN_URL}?token={token}"
-                log(f"  [{mailbox.email}] emailValid=true "
-                    f"session={claims.get('sessionId')}")
+            # 4. the mail-link step, re-issuing a token with emailValid=true
+            token = url.split("token=", 1)[1]
+            res = self._fetch(
+                page,
+                f"{registrar.API}/fan2/verify/check-verification"
+                f"?token={token}&artistId={registrar.ARTIST_ID}"
+                f"&pageId={registrar.PAGE_ID}")
+            if res["status"] != 200:
+                raise BrowserRegistrationError(
+                    f"check-verification HTTP {res['status']}: {res['text'][:160]}")
+            data = json.loads(res["text"])
+            claims = data.get("claims") or {}
+            if not claims.get("emailValid"):
+                raise BrowserRegistrationError(f"emailValid false: {claims}")
+            token = data.get("token") or token
+            url = f"{registrar.RETURN_URL}?token={token}"
+            log(f"  [{mailbox.email}] emailValid=true "
+                f"session={claims.get('sessionId')}")
 
-                # 5+6. fill the form and let the SPA submit itself.
-                #
-                # Posting a body we build is not equivalent: the SPA fills in
-                # fields we would have to guess (location.county from radar.io,
-                # ip from Cloudflare's trace) and its own client signs the
-                # captcha. Driving the form is what a real visitor does, and it
-                # is the only path that ends on a page we can read back.
-                driven = self._drive_form(page, ident, order, log)
-                if not self._page_says_registered(page):
-                    raise BrowserRegistrationError(
-                        "form submitted but the page never confirmed "
-                        "the registration")
+            # 5+6. fill the form and let the SPA submit itself.
+            #
+            # Posting a body we build is not equivalent: the SPA fills in
+            # fields we would have to guess (location.county from radar.io,
+            # ip from Cloudflare's trace) and its own client signs the
+            # captcha. Driving the form is what a real visitor does, and it
+            # is the only path that ends on a page we can read back.
+            driven = self._drive_form(page, ident, order, log)
+            if not self._page_says_registered(page):
+                raise BrowserRegistrationError(
+                    "form submitted but the page never confirmed "
+                    "the registration")
+            log(f"  [{mailbox.email}] page confirms the registration")
+            # The SPA submits its own body, so record what we chose here -
+            # otherwise the row lands in the database with nothing but the
+            # account and a fixed artist id.
+            venues = (driven or {}).get("venues") or []
+            body = {"pollAnswerIds": [registrar.SHOWS[v][0]
+                                      for v in venues if v in registrar.SHOWS],
+                    "journeyPollAnswers": [{"venue": v} for v in venues]}
+            res = {"status": 200, "text": '{"status":"OK"}'}
+            captcha = "spa"
+
+            # Judge the page first, because we are standing on it. Browser mode
+            # is measured not to send the success mail, so waiting the full mail
+            # budget before looking at the page spends a minute per account on
+            # something that usually never arrives.
+            page_ok = self._page_says_registered(page)
+            if page_ok:
                 log(f"  [{mailbox.email}] page confirms the registration")
-                # The SPA submits its own body, so record what we chose here -
-                # otherwise the row lands in the database with nothing but the
-                # account and a fixed artist id.
-                venues = (driven or {}).get("venues") or []
-                body = {"pollAnswerIds": [registrar.SHOWS[v][0]
-                                          for v in venues if v in registrar.SHOWS],
-                        "journeyPollAnswers": [{"venue": v} for v in venues]}
-                res = {"status": 200, "text": '{"status":"OK"}'}
-                captcha = "spa"
-
-                # Browser mode is measured not to send the success mail, so
-                # the page's own confirmation is what we go on. It is recorded
-                # as `submitted` rather than `registered` so the two kinds of
-                # evidence stay distinguishable in the database.
-                evidence = "mail" if not verify_success else ""
+                evidence = "page"
+                # The mail is an upgrade from here, not a gate: look briefly and
+                # take it if it shows up, otherwise move on.
                 if verify_success:
                     found, _when = mailbox.find_success(
-                        timeout=success_timeout, not_before=t0, log=log)
+                        timeout=min(success_timeout, MAIL_GRACE_AFTER_PAGE),
+                        not_before=t0, log=log)
                     if found:
                         evidence = "mail"
-                        log(f"  [{mailbox.email}] success mail confirmed")
-                    elif self._page_says_registered(page):
-                        evidence = "page"
-                        log(f"  [{mailbox.email}] page confirms the registration "
-                            f"(no success mail - expected in browser mode)")
-                    else:
-                        raise BrowserRegistrationError(
-                            "confirm returned OK but neither the success mail "
-                            "nor the page confirmed the registration")
-                log(f"  [{mailbox.email}] confirm -> {res['text'][:60]} "
-                    f"({time.time() - t0:.1f}s)")
-                return {
-                    "email": mailbox.email,
-                    "session_id": claims.get("sessionId"),
-                    "token": token,
-                    "poll_answer_ids": body["pollAnswerIds"],
-                    "journey": body["journeyPollAnswers"],
-                    "response": res["text"],
-                    "elapsed": round(time.time() - t0, 2),
-                    "refresh_token": mailbox.refresh_token,
-                    "captcha_len": len(captcha),
-                    "mode": "browser",
-                    "evidence": evidence,
-                }
-            finally:
-                try:
+                        log(f"  [{mailbox.email}] success mail also arrived")
+            else:
+                # No page confirmation, so the mail is the only evidence left and
+                # it is worth the whole budget before calling this a failure.
+                found, _when = mailbox.find_success(
+                    timeout=success_timeout, not_before=t0, log=log) \
+                    if verify_success else (False, None)
+                if found:
+                    evidence = "mail"
+                    log(f"  [{mailbox.email}] success mail confirmed")
+                else:
+                    raise BrowserRegistrationError(
+                        "confirm returned OK but neither the success mail "
+                        "nor the page confirmed the registration")
+            log(f"  [{mailbox.email}] confirm -> {res['text'][:60]} "
+                f"({time.time() - t0:.1f}s)")
+            return {
+                "email": mailbox.email,
+                "session_id": claims.get("sessionId"),
+                "token": token,
+                "poll_answer_ids": body["pollAnswerIds"],
+                "journey": body["journeyPollAnswers"],
+                "response": res["text"],
+                "elapsed": round(time.time() - t0, 2),
+                "refresh_token": mailbox.refresh_token,
+                "captcha_len": len(captcha),
+                "mode": "browser",
+                "evidence": evidence,
+            }
+        except (TransientError, BrowserRegistrationError):
+            raise
+        except Exception as e:
+            # Playwright wraps everything, so decide by content: if it smells
+            # like transport, the account is untouched and goes back in the
+            # queue instead of being written off as failed.
+            if is_transient(e):
+                raise TransientError(str(e)[:200]) from e
+            raise
+        finally:
+            # Only this worker's context. The shared browser outlives the
+            # account on purpose - that is what makes it warm.
+            try:
+                if ctx:
                     ctx.close()
-                    browser.close()
-                except Exception:
-                    pass
+            except Exception:
+                pass
+            try:
+                pw.stop()
+            except Exception:
+                pass

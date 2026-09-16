@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Card, Row, Col, Statistic, Button, Select, InputNumber, Space, Typography,
+  Card, Row, Col, Statistic, Button, InputNumber, Space, Typography,
   Tag, App as AntApp, Checkbox,
 } from "antd";
 import { CaretRightOutlined, PauseOutlined, ClearOutlined } from "@ant-design/icons";
@@ -86,15 +86,13 @@ function LogPanel() {
 
 export default function Dashboard({ state, refresh }) {
   const { message } = AntApp.useApp();
-  const [mode, setMode] = useState("browser");
   const [threads, setThreads] = useState(2);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!state?.config) return;
-    if (state.config.mode) setMode(state.config.mode);
     if (state.config.threads) setThreads(state.config.threads);
-  }, [state?.config?.mode, state?.config?.threads]);
+  }, [state?.config?.threads]);
 
   const stats = state?.stats || {};
   const host = state?.host || {};
@@ -133,19 +131,6 @@ export default function Dashboard({ state, refresh }) {
       <Card title="运行控制" size="small" style={{ marginBottom: 12 }}>
         <Space wrap size={12}>
           <Space size={6}>
-            <Text type="secondary">模式</Text>
-            <Select
-              value={mode}
-              onChange={setMode}
-              style={{ width: 260 }}
-              disabled={state?.running}
-              options={[
-                { value: "browser", label: "浏览器（Playwright 全流程）" },
-                { value: "hybrid", label: "混合（共享浏览器取 captcha）" },
-              ]}
-            />
-          </Space>
-          <Space size={6}>
             <Text type="secondary">线程</Text>
             <InputNumber min={1} max={64} value={threads} onChange={setThreads}
                          disabled={state?.running} />
@@ -155,7 +140,7 @@ export default function Dashboard({ state, refresh }) {
             icon={<CaretRightOutlined />}
             loading={busy}
             disabled={state?.running}
-            onClick={() => run(() => api.start(threads, mode), "已启动")}
+            onClick={() => run(() => api.start(threads, "browser"), "已启动")}
           >
             开始注册
           </Button>

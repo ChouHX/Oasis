@@ -155,13 +155,11 @@ BADGE = ["①", "②", "③"]
 # Registration transports. There is deliberately no captcha-less path: the
 # server answers {"status":"OK"} without a token, but that is the request most
 # likely to get an account flagged later, and a token now costs ~0.6s.
-#   hybrid  - warm browser mints a real captcha, curl_cffi submits
-#   browser - the whole flow runs inside a real Chromium page
-MODES = ("hybrid", "browser")
-MODE_LABEL = {
-    "hybrid": "混合 (浏览器取真 captcha + curl_cffi 提交)",
-    "browser": "浏览器 (Playwright 全流程)",
-}
+#   browser - the whole flow runs inside a real Chromium page, driving the
+#             official form. hybrid (curl_cffi submission) was removed: measured
+#             to be caught by the site's risk control.
+MODES = ("browser",)
+MODE_LABEL = {"browser": "浏览器 (驱动官方 SPA 全流程)"}
 
 
 class Bridge(QObject):
@@ -347,14 +345,16 @@ class DashboardPage(ScrollArea):
         self.delay.setFixedWidth(92)
         cl.addWidget(self.delay)
         cl.addWidget(BodyLabel("方式"))
-        self.mode = Combo()
-        for m in MODES:
-            self.mode.addItem(MODE_LABEL[m])
-        want = win.cfg.get("mode", "hybrid")
-        self.mode.setCurrentIndex(MODES.index(want) if want in MODES else 0)
-        self.mode.setFixedWidth(196)
-        self.mode.currentIndexChanged.connect(self.on_mode_changed)
-        cl.addWidget(self.mode)
+        # Only one flow is carried: driving the real SPA form. A plain curl
+        # submission is caught by the site's risk control, so the picker is a
+        # label now rather than a choice that would quietly lose accounts.
+        self.mode_label = BodyLabel("浏览器（驱动官方 SPA 全流程）")
+        self.mode_label.setToolTip(
+            "填官方表单、逐页点 Continue、由页面自己提交。\n"
+            "captcha 由页面签发、location.county / ip 由 SPA 自己填，"
+            "三者自洽；这是我们能复现真人行为的最接近方式。")
+        self.mode_label.setFixedWidth(196)
+        cl.addWidget(self.mode_label)
         self.btn_start = PrimaryPushButton(FIF.PLAY, "开始注册")
         self.btn_start.clicked.connect(self.on_start)
         cl.addWidget(self.btn_start)
@@ -451,11 +451,11 @@ class DashboardPage(ScrollArea):
                                   " > ".join(registrar.SHOW_LABEL[k] for k in order))
 
     def idle_hint(self):
+        mode = "browser"
         """Readiness line: says what is still missing rather than 'ready'."""
         s = self.win.store.stats()
         pending = s.get("pending", 0)
         proxies = len(self.win.pool)
-        mode = MODES[self.mode.currentIndex()]
         if not pending and not proxies:
             return "先做两步：到「邮箱池」导入账号，到「代理池」填代理（每行一个）。"
         if not pending:
@@ -468,9 +468,9 @@ class DashboardPage(ScrollArea):
                 f"方式 {MODE_LABEL[mode]} · 线程 {self.threads.value()}")
 
     def refresh_host(self):
+        mode = "browser"
         """内存 + 推荐线程数。浏览器模式每线程约 250MB，超了会一起变慢。"""
         from core import sysinfo
-        mode = MODES[self.mode.currentIndex()]
         info = sysinfo.summary(mode)
         if info["total_mb"] is None:
             self.host_label.setText("本机内存：读不到")
@@ -495,23 +495,10 @@ class DashboardPage(ScrollArea):
         self.threads.setValue(int(n))
         self.win.notify("success", f"线程数已设为 {n}")
 
-    def on_mode_changed(self):
-        mode = MODES[self.mode.currentIndex()]
-        self.win.cfg.set("mode", mode)
-        self.win.cfg.save()
-        if hasattr(self, "refresh_host"):
-            self.refresh_host()
-        hints = {
-            "hybrid": "混合（推荐）：常驻共享浏览器取真 captcha token（约 0.6 秒），"
-                      "提交走 curl_cffi。单账号约 20~30 秒 + 提交前停顿。",
-            "browser": "浏览器：真实 Chromium 全流程，页面内 fetch 提交，"
-                       "指纹/captcha/请求三者自洽。单账号约 60~120 秒。",
-        }
-        self.run_hint.setText(hints.get(mode, ""))
 
     def on_start(self):
         self.win.start_engine(self.threads.value(), self.delay.value(),
-                              MODES[self.mode.currentIndex()])
+                              "browser")
 
     def on_stop(self):
         self.win.stop_engine()
@@ -828,12 +815,6 @@ class SettingsPage(ScrollArea):
         self.link_timeout = CompactSpinBox()
         self.link_timeout.setRange(30, 3600)
         self.link_timeout.setValue(int(win.cfg.get("link_timeout", 300)))
-        self.think_time = CompactSpinBox()
-        self.think_time.setRange(0, 900)
-        self.think_time.setValue(int(win.cfg.get("think_time", 45)))
-        self.think_time.setToolTip(
-            "收到验证邮件后、提交注册前的随机停顿（在 0.6~1.4 倍之间随机）。\n"
-            "真人需要时间打开邮件填表，提交紧跟验证是后端最容易测的自动化特征。0 = 关闭")
         self.link_timeout.setFixedWidth(110)
         self.http_timeout = CompactSpinBox()
         self.http_timeout.setRange(10, 300)
@@ -866,14 +847,6 @@ class SettingsPage(ScrollArea):
             "留空 = 直连上游。短效住宅代理在国内常无法直连时填，例如 socks5://127.0.0.1:10808。"
             "填了之后所有上游都经它拨号（自动链式），HTTP 模式也会改走本地 relay")
         self.front_proxy.setText(str(win.cfg.get("front_proxy", "")))
-        self.send_captcha = SwitchButton()
-        self.send_captcha.setChecked(bool(win.cfg.get("send_captcha", False)))
-        self.send_captcha.setToolTip(
-            "默认关闭，因为实测「带真 captcha 反而注册失败」：\n"
-            "  同一代理、同一信箱、同一分钟，只改 captcha ——\n"
-            "  空 captcha → 收到 Registration Complete；真 token(2382字符) → confirm 返回 OK 但永远收不到。\n"
-            "推测是 token 绑定签发它的客户端，浏览器签的 token 用 curl_cffi 回放会被判无效。\n"
-            "只有当你确认站点开始强制校验 captcha 时才打开。")
         self.verify_success = SwitchButton()
         self.verify_success.setChecked(bool(win.cfg.get("verify_success", False)))
         self.verify_success.setToolTip(
@@ -890,9 +863,7 @@ class SettingsPage(ScrollArea):
             "开启后只要 captcha 与提交出口不同就判该账号失败；确认过你的代理确实有影响再开。")
 
         rows = [                ("等邮件超时(秒)", self.link_timeout),
-                ("提交前停顿(秒)", self.think_time),
                 ("成功后校验邮件", self.verify_success),
-                ("发送 captcha(默认关)", self.send_captcha),
                 ("HTTP 超时(秒)", self.http_timeout),
                 ("取件代理", self.mail_proxy),
                 ("iCloud 服务", self.hme_base),
@@ -933,9 +904,7 @@ class SettingsPage(ScrollArea):
     def on_save(self):
         self.win.cfg.update({
             "link_timeout": self.link_timeout.value(),
-            "think_time": self.think_time.value(),
             "verify_success": self.verify_success.isChecked(),
-            "send_captcha": self.send_captcha.isChecked(),
             "http_timeout": self.http_timeout.value(),
             "mail_proxy": self.mail_proxy.text().strip(),
             "hme_base": self.hme_base.text().strip(),
@@ -1118,10 +1087,8 @@ class MainWindow(FluentWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(2000)
         self._refresh_all()
-        self.log("info", "控制台就绪。" + (
-            "混合模式：常驻浏览器按需签 captcha，提交走 curl_cffi。"
-            if MODES[-1] == "browser" and self.cfg.get("send_captcha")
-            else "混合模式：提交走 curl_cffi；captcha 按设置决定是否携带。"))
+        self.log("info", "控制台就绪。浏览器模式：驱动官方 SPA 表单，"
+                         "captcha 由页面自己签，提交也由 SPA 发出。")
 
     # ---------------------------------------------------------------- plumbing
     def _engine_log(self, level, msg):
