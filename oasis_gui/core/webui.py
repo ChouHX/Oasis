@@ -136,6 +136,17 @@ class WebAdmin:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
 
     def _authed(self, method, path, query, body):
+        # The page itself. Without this the post-login reload of "/" fell
+        # through to the 404 below, so a correct password still showed
+        # {"error": "not found"}.
+        if path in ("/", "/index.html"):
+            return self._page()
+
+        # Browsers ask for this unprompted; answer quietly instead of logging
+        # a 404 on every page load.
+        if path == "/favicon.ico":
+            return 204, [], b""
+
         if path == "/api/state":
             info = self.status.snapshot()
             info["config"] = dict(self.config.data)
@@ -216,6 +227,10 @@ class WebAdmin:
                            f'attachment; filename="oasis_{what}.txt"')],
                     data.encode("utf-8"))
 
+        # Unknown non-API path: send the browser to the app rather than showing
+        # it a JSON 404 (a typo in the address bar should not look like a bug).
+        if not path.startswith("/api/"):
+            return 302, [("Location", "/")], b""
         return self._json(404, {"error": "not found"})
 
     def _cookie(self, handler):
