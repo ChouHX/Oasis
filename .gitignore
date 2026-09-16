@@ -1,0 +1,28 @@
+# ---- never commit: these hold live credentials ----
+# The account pool carries mailbox passwords and OAuth refresh tokens; the
+# exports and backups are the same data in other shapes. Pushing any of them
+# publishes working credentials.
+*.db
+*.db-shm
+*.db-wal
+*.db.bak-*
+creds/
+exports/
+oasis_cred.txt
+redeem_extract_fields_*.txt
+
+# Runtime settings carry proxy user:pass and the iCloud password.
+oasis_gui/oasis_config.json
+
+# ---- runtime noise ----
+*.log
+__pycache__/
+*.py[cod]
+
+# ---- build output ----
+dist/
+build/
+*.exe
+
+# ---- scratch ----
+explore/

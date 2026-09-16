@@ -1,0 +1,45 @@
+# Deployment for a small always-on box (2 vCPU / 3GB), iCloud-only.
+#
+#   mkdir -p data && cp .env.example .env   # fill in proxies + iCloud password
+#   docker compose up -d --build
+#   docker compose logs -f
+#   curl localhost:8080/stats
+#
+# The account pool lives in ./data/oasis.db, so the queue survives restarts and
+# rebuilds.
+
+services:
+  oasis:
+    build: .
+    image: oasis-console:latest
+    container_name: oasis
+    restart: unless-stopped
+    env_file: .env
+    # Lets the container reach services running on the Docker host (the iCloud
+    # HME service, a local proxy) as host.docker.internal. Inside a container
+    # 127.0.0.1 is the container itself, which is the usual "connection
+    # refused" on a fresh deployment.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 8080 is only bound to the loopback: a registration console has no business
+    # being reachable from the internet. Reach it over an SSH tunnel, or put a
+    # reverse proxy with auth in front.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+    # Chromium leans on shared memory; Docker's default 64MB /dev/shm is the
+    # usual cause of tabs dying silently. 512MB is plenty for one worker and
+    # leaves the 3GB box room to breathe.
+    shm_size: "512mb"
+    # One shared chromium serves every worker, so the ceiling is low: ~250MB
+    # for the browser plus ~150MB per context, on top of the base image.
+    mem_limit: 2500m
+    memswap_limit: 2500m          # no swap: swapping a browser is worse than waiting
+    cpus: "2.0"
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

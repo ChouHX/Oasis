@@ -1,0 +1,8 @@
+# Keep the build context to just what the image needs.
+*
+!service.py
+!entrypoint.sh
+!core/
+!core/*.py
+!requirements.txt
+!Dockerfile
