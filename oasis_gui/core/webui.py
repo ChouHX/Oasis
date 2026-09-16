@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.parse
 from http.cookies import SimpleCookie
-from core import mailbox
+from core import mailbox, registrar
 
 from http.server import BaseHTTPRequestHandler
 
@@ -29,6 +29,30 @@ SESSION_COOKIE = "oasis_session"
 SESSION_TTL = 12 * 3600
 LOGIN_WINDOW = 15 * 60
 LOGIN_MAX = 6
+
+
+def _shows_label(raw):
+    """Turn the stored poll-answer uuids into the venue names they stand for.
+
+    `registrations.poll_answer_ids` holds the show *poll* ids, which mean
+    nothing to a human. The page previously showed "undefined" here because it
+    read fields the query never selected; translating server-side keeps the
+    page from having to hard-code uuids that would drift from registrar.SHOWS.
+    """
+    if raw in (None, "", "[]"):
+        return ""
+    try:
+        ids = json.loads(raw) if isinstance(raw, str) else list(raw)
+    except Exception:
+        return str(raw)[:60]
+    by_poll = {poll: venue for venue, (poll, _answers)
+               in registrar.SHOWS.items()}
+    out = []
+    for pid in ids:
+        venue = by_poll.get(str(pid))
+        out.append(registrar.SHOW_LABEL.get(venue, str(pid)[:8]) if venue
+                   else str(pid)[:8])
+    return " > ".join(out)
 
 
 def split_lines(raw):
@@ -215,7 +239,10 @@ class WebAdmin:
                 "rows": rows[(page - 1) * per: page * per]})
 
         if path == "/api/registrations":
-            return self._json(200, {"rows": self.store.registrations()})
+            rows = self.store.registrations()
+            for r in rows:
+                r["shows"] = _shows_label(r.get("poll_answer_ids"))
+            return self._json(200, {"rows": rows})
 
         if path == "/api/proxies":
             if method == "POST":
@@ -555,7 +582,7 @@ code{background:#12161b;border:1px solid var(--line);border-radius:4px;padding:1
   <section id="t-reg">
     <div class="panel"><h2>预约记录</h2>
       <div style="overflow:auto"><table id="rtable"><thead><tr>
-        <th>账号</th><th>Session</th><th>场次</th><th>模式</th><th>响应</th><th>时间</th>
+        <th>账号</th><th>场次（按偏好顺序）</th><th>模式</th><th>状态</th><th>时间</th>
       </tr></thead><tbody></tbody></table></div>
     </div>
   </section>
@@ -760,12 +787,15 @@ async function doImport(){
 }
 async function loadRegs(){
   const d = await api('/api/registrations');
+  // Field names mirror Store.registrations(); the server also adds `shows`,
+  // already translated from the poll-answer uuids.
   $('#rtable tbody').innerHTML = d.rows.map(r => `<tr>
-    <td>${r.account_id}</td><td class="dim">${esc((r.session_id||'').slice(0,12))}</td>
-    <td class="dim">${esc((r.journey_json||'').slice(0,40))}</td>
-    <td>${r.mode||''}</td><td class="dim">${esc((r.response||'').slice(0,30))}</td>
-    <td class="dim">${r.created_at||''}</td></tr>`).join('')
-    || '<tr><td colspan="6" class="dim">没有数据</td></tr>';
+    <td>${esc(r.email || '')}</td>
+    <td>${esc(r.shows || '—')}</td>
+    <td>${esc(r.mode || '')}</td>
+    <td><span class="tag ${esc(r.status||'')}">${LABEL[r.status] || esc(r.status||'')}</span></td>
+    <td class="dim">${esc(r.created_at || '')}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="dim">还没有记录</td></tr>';
 }
 
 function startLog(){ if (timer) return; pollLog(); timer = setInterval(pollLog, 2000); }

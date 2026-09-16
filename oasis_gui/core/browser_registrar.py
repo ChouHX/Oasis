@@ -835,11 +835,11 @@ class BrowserRegistrar:
                 raise BrowserRegistrationError(
                     f"details step did not advance; page says {shown or 'nothing'}")
 
-        picked = 0
+        picked = []
         for venue in list(order)[:3]:
             if self._pick_show(page, venue, log):
-                picked += 1
-        if picked == 0:
+                picked.append(venue)
+        if not picked:
             raise BrowserRegistrationError("no venue could be selected")
         for cb in page.query_selector_all("[role=combobox]"):
             if "Select an option" in (cb.inner_text() or ""):
@@ -851,8 +851,9 @@ class BrowserRegistrar:
                     page.wait_for_timeout(1000)
                 break
         self._click_continue(page, until="question", timeout=60)
-        log(f"    {picked} venue(s) selected")
+        log(f"    {len(picked)} venue(s) selected: {', '.join(picked)}")
 
+        album = ""
         for step in range(5):
             body = page.inner_text("body")
             log(f"    step {step + 1}: {body[:110].strip()}")
@@ -868,7 +869,8 @@ class BrowserRegistrar:
                         opts = page.query_selector_all("[role=option]")
                         log(f"      album options: {len(opts)}")
                         if opts:
-                            log(f"      picking {(opts[0].inner_text() or '')[:26]!r}")
+                            album = (opts[0].inner_text() or "").strip()
+                            log(f"      picking {album[:26]!r}")
                             opts[0].click()
                             page.wait_for_timeout(1200)
                         break
@@ -890,6 +892,10 @@ class BrowserRegistrar:
             "() => document.body.innerText.toLowerCase()"
             ".includes('thanks for registering')", timeout=90000)
         page.wait_for_timeout(1500)
+        # Hand back what was actually chosen. The SPA builds its own request
+        # body, so this is the only record of the answers; without it the row
+        # lands in the database with an empty poll_answer_ids.
+        return {"venues": picked, "album": album}
 
     @staticmethod
     def _page_client_ip(page):
@@ -1098,13 +1104,19 @@ class BrowserRegistrar:
                 # ip from Cloudflare's trace) and its own client signs the
                 # captcha. Driving the form is what a real visitor does, and it
                 # is the only path that ends on a page we can read back.
-                self._drive_form(page, ident, order, log)
+                driven = self._drive_form(page, ident, order, log)
                 if not self._page_says_registered(page):
                     raise BrowserRegistrationError(
                         "form submitted but the page never confirmed "
                         "the registration")
                 log(f"  [{mailbox.email}] page confirms the registration")
-                body = {"pollAnswerIds": [], "journeyPollAnswers": []}
+                # The SPA submits its own body, so record what we chose here -
+                # otherwise the row lands in the database with nothing but the
+                # account and a fixed artist id.
+                venues = (driven or {}).get("venues") or []
+                body = {"pollAnswerIds": [registrar.SHOWS[v][0]
+                                          for v in venues if v in registrar.SHOWS],
+                        "journeyPollAnswers": [{"venue": v} for v in venues]}
                 res = {"status": 200, "text": '{"status":"OK"}'}
                 captcha = "spa"
 

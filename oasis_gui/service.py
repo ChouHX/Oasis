@@ -48,7 +48,13 @@ from core.store import Store                       # noqa: E402
 
 STOP = threading.Event()      # shutdown
 WAKE = threading.Event()      # "start a round now", set by the web UI
+# Set while the operator has asked the run to stop. Engine.stop() only ends the
+# current round - without this the outer loop would immediately start another
+# one, because the queue is still non-empty. Cleared by the Start button.
+PAUSED = threading.Event()
 LOGS = LogRing()
+# Pause after a round that registered nothing but did fail accounts.
+BACKOFF = 60
 
 
 def env(name, default=""):
@@ -232,12 +238,17 @@ class Controller:
         self.engine = None
 
     def running(self):
+        # A paused run is not running, even though the queue is not empty.
+        if PAUSED.is_set():
+            return False
         return bool(self.engine and (self.engine.running or self.engine.busy))
 
     def start(self, threads, mode):
+        PAUSED.clear()
         WAKE.set()
 
     def stop(self):
+        PAUSED.set()
         if self.engine:
             self.engine.stop()
 
@@ -335,7 +346,14 @@ def main():
             WAKE.clear()
             continue
 
-        rounds += 1
+        # A stop request means "stop", not "finish this round and begin the
+        # next one": the queue is still full, so without this the loop would
+        # relaunch immediately after the workers drained.
+        if PAUSED.is_set():
+            STATUS.set(state="paused", stats=stats)
+            WAKE.wait(idle)
+            WAKE.clear()
+            continue
         # Starting a round with an empty pool would mark every claimed account
         # failed for a reason that has nothing to do with the account. Wait for
         # the pool instead.
@@ -346,6 +364,11 @@ def main():
             WAKE.wait(idle)
             WAKE.clear()
             continue
+
+        # Counted only once we are actually about to run, so the pause loop
+        # above does not inflate it.
+        rounds += 1
+        before = stats                      # for the back-off decision below
         STATUS.set(state="running", rounds=rounds, stats=stats)
         # read per round, so a change made in the web UI applies from the
         # next round without a restart
@@ -365,6 +388,26 @@ def main():
             log("error", f"round {rounds} crashed: {type(e).__name__}: {e}")
             time.sleep(5)
         STATUS.set(stats=store.stats())
+
+        # A round that registered nothing and failed something is almost always
+        # a transport problem (dead proxies, no egress, site blocking). Without
+        # a pause the loop spins: with fast failures it can burn through the
+        # whole queue in seconds and mark every account failed for a reason
+        # that is not about the accounts.
+        #
+        # Skipped when the operator asked to stop - the loop's own pause check
+        # handles that, and blocking here would leave the UI showing "idle"
+        # instead of "paused" for a whole minute.
+        done = store.stats()
+        gained = (done.get("registered", 0) + done.get("submitted", 0)
+                  - before.get("registered", 0) - before.get("submitted", 0))
+        lost = done.get("failed", 0) - before.get("failed", 0)
+        if gained <= 0 and lost > 0 and not PAUSED.is_set():
+            log("warn", f"round {rounds}: {lost} failure(s) and nothing "
+                        f"registered - backing off {BACKOFF}s before the next "
+                        f"round (check the proxy pool)")
+            WAKE.wait(BACKOFF)
+            WAKE.clear()
 
     STATUS.set(state="stopping")
     try:
