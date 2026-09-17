@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Card, Row, Col, Statistic, Button, InputNumber, Space, Typography,
+  Card, Row, Col, Statistic, Button, InputNumber, Select, Space, Typography,
   Tag, App as AntApp, Checkbox,
 } from "antd";
 import { CaretRightOutlined, PauseOutlined, ClearOutlined } from "@ant-design/icons";
