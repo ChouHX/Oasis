@@ -803,7 +803,8 @@ class BrowserRegistrar:
         page.keyboard.press("Escape")
         return False
 
-    def _drive_form(self, page, ident, order, log, before_submit=None):
+    def _drive_form(self, page, ident, order, log, before_submit=None,
+                    mail_url=None):
         """Walk the whole SPA form and let the SPA submit itself.
 
         The API calls are the site's own, so the body carries everything a real
@@ -813,6 +814,16 @@ class BrowserRegistrar:
         """
         page.wait_for_selector("#soundcheckConfirmFirstName", timeout=90000)
         for attempt in range(2):
+            if attempt and mail_url:
+                # Start the step over on a freshly loaded page. Measured: the
+                # phone field accepts anything (8 of 8 numbers, including
+                # 0005551234), and a controlled probe never reproduced the
+                # error - the difference is that the probe reloaded between
+                # tries. On the same page the validation message appears to
+                # stick, which is why 12 retries in place never got past it.
+                page.goto(mail_url, wait_until="domcontentloaded",
+                          timeout=self.browser_timeout * 1000)
+                page.wait_for_selector("#soundcheckConfirmFirstName", timeout=60000)
             self._fill_details(page, ident, log)
             if self._click_continue(page, until="cities", timeout=60):
                 break
@@ -821,9 +832,15 @@ class BrowserRegistrar:
                                  "Location is required", "Phone number is required",
                                  "Name is required", "Date of birth is required")
                      if m in body]
-            log(f"    details rejected ({shown or 'no message'}), retry {attempt + 1}")
+            log(f"    details rejected ({shown or 'no message'}), "
+                f"retry {attempt + 1} on a fresh page")
             if attempt == 1:
-                raise BrowserRegistrationError(
+                # The field accepts anything - measured, 8 of 8 numbers went
+                # through including 0005551234 - and the same identity succeeds
+                # on a later run, so this is the site refusing intermittently
+                # rather than anything about this account. Report it as
+                # transport so the engine requeues instead of burning it.
+                raise TransientError(
                     f"details step did not advance; page says {shown or 'nothing'}")
 
         picked = []
@@ -1010,7 +1027,7 @@ class BrowserRegistrar:
             # ip from Cloudflare's trace) and its own client signs the
             # captcha. Driving the form is what a real visitor does, and it
             # is the only path that ends on a page we can read back.
-            driven = self._drive_form(page, ident, order, log)
+            driven = self._drive_form(page, ident, order, log, mail_url=url)
             if not self._page_says_registered(page):
                 raise BrowserRegistrationError(
                     "form submitted but the page never confirmed "
