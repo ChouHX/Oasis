@@ -415,6 +415,24 @@ class _SharedBrowser:
             "--disable-background-networking",
             "--disable-default-apps",
             "--no-service-autorun",
+            # The crash reporter is what actually killed it: chromium spawns
+            # chrome_crashpad_handler, which dies with "--database is required"
+            # and takes the browser down with SIGTRAP ("code -5"). Playwright's
+            # own launch() passes --disable-breakpad for exactly this reason -
+            # launching the process by hand means remembering these.
+            "--disable-breakpad",
+            "--disable-crash-reporter",
+            "--disable-features=Crashpad",
+            # A few more of Playwright's defaults that keep a headless browser
+            # from being throttled or waiting on things nobody is watching.
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-hang-monitor",
+            "--disable-prompt-on-repost",
+            "--metrics-recording-only",
+            "--password-store=basic",
+            "--use-mock-keychain",
             # In a container chromium runs as an unprivileged user without the
             # namespaces its sandbox needs, so it dies during startup with
             # SIGTRAP ("exited immediately (code -5)"). Playwright's own
