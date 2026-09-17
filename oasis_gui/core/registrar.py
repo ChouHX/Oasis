@@ -412,6 +412,12 @@ def build_confirm(ident, token, url, order=None, captcha="", ip=None):
     """
     order = order or DEFAULT_ORDER
     primary, *rest = order
+    # Both of these were caught by diffing our body against the one the SPA
+    # actually posts: consentMessaging was missing outright, and the site sends
+    # dateOfBirth as a full ISO instant rather than a bare date.
+    dob = ident["date_of_birth"]
+    if len(dob) == 10:
+        dob = f"{dob}T00:00:00.000Z"
     journey = []
     # Slots 2 and 3 of the city poll carry the preference polls, in order.
     for slot, venue in enumerate(rest[:2]):
@@ -425,11 +431,14 @@ def build_confirm(ident, token, url, order=None, captcha="", ip=None):
         "location": ident["location"],
         "captcha": captcha,
         "consentEmail": True,
+        # The SPA posts this alongside consentEmail; omit it and the request
+        # differs from every real submission.
+        "consentMessaging": True,
         "countryCallingCode": ident.get("country_calling_code", "1"),
         "nationalPhoneNumber": ident["phone"],
         "firstName": ident["first_name"],
         "lastName": ident["last_name"],
-        "dateOfBirth": ident["date_of_birth"],
+        "dateOfBirth": dob,
         "journeyPollAnswers": journey,
         "pollAnswerIds": [SHOWS[primary][0]],
         "artistId": ARTIST_ID,
