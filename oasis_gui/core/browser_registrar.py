@@ -1216,6 +1216,29 @@ class BrowserRegistrar:
                 page.query_selector_all("[role=option]")[0].click()
                 page.wait_for_timeout(400)
                 break
+        # The messaging consent. The page marks it required with an asterisk and
+        # it is a <button role="checkbox" aria-checked="false">, NOT an
+        # <input type=checkbox> - so a query for checkboxes finds nothing, and
+        # the form then refuses to advance without ever saying why. This is the
+        # "details step did not advance; page says nothing" that survived every
+        # other explanation: by the time it was found, the token was healthy,
+        # reCAPTCHA was ready, every field held the right value in both the DOM
+        # and Vue's model, the button was enabled and unobstructed, and the
+        # click verifiably reached the element.
+        try:
+            box = page.query_selector("[role=checkbox]")
+            if box and box.get_attribute("aria-checked") != "true":
+                box.click()
+                self._settle(
+                    page, "() => {const c = document.querySelector"
+                          "('[role=checkbox]');"
+                          "return !!c && c.getAttribute('aria-checked') === 'true';}",
+                    2000)
+                log(f"    consent ticked: "
+                    f"{box.get_attribute('aria-checked')}")
+        except Exception as e:
+            log(f"    consent box: {type(e).__name__}")
+
         log(f"    details: name={page.input_value('#soundcheckConfirmFirstName')!r} "
             f"phone={page.input_value('#soundcheckConfirmPhoneNumber')!r} "
             f"dob={page.input_value('#birthDate')!r} "
