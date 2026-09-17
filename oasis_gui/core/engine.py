@@ -51,6 +51,9 @@ class Engine:
         # Per-round cap on how many accounts to touch; 0 means no cap.
         self._limit = 0
         self._claimed = 0
+        # How many verification mails this round may still ask for, when the
+        # round is capped. None means "no cap, keep the queue warm".
+        self._prefetch_budget = None
         # browser mode needs the relay's Google split routing
         self.relays = RelayPool(log=lambda m: self._log("debug", m))
         self.browser = BrowserRegistrar(
@@ -97,6 +100,17 @@ class Engine:
 
     def _prefetch_once(self, depth):
         now = time.time()
+        # A round with a cap only has that many accounts to fetch mail for, so
+        # the prefetcher gets the same cap. Without this it keeps working down
+        # the queue: "上限 1" still fired verification requests at the next
+        # fifty addresses, which is useless (they are not going to be touched)
+        # and is exactly the pattern that gets an address rate-limited.
+        with self._lock:
+            if self._prefetch_budget is not None:
+                room = self._prefetch_budget
+                if room <= 0:
+                    return
+                depth = min(depth, room)
         # one request per pending account that is not already covered
         wanted = []
         fresh = {e: t for e, t in self._mail_since.items()
@@ -125,6 +139,10 @@ class Engine:
                 # verify - and its later mail_since then filters out the mail
                 # the prefetch already triggered, making the account slower.
                 with self._lock:
+                    if self._prefetch_budget is not None:
+                        if self._prefetch_budget <= 0:
+                            return
+                        self._prefetch_budget -= 1
                     self._mail_since[email] = time.time()
                 try:
                     registrar.request_verification(
@@ -135,6 +153,8 @@ class Engine:
                     # give the slot back so a worker will retry it
                     with self._lock:
                         self._mail_since.pop(email, None)
+                        if self._prefetch_budget is not None:
+                            self._prefetch_budget += 1
                     self._log("debug", f"prefetch {email} failed: "
                                        f"{type(e).__name__}")
                 self._prefetch_stop.wait(PREFETCH_GAP)
@@ -246,14 +266,16 @@ class Engine:
         self._stop.clear()
         self._limit = max(0, int(limit or 0))
         self._claimed = 0
+        # One mail request per account this round will actually touch.
+        self._prefetch_budget = self._limit if self._limit else None
         self._transient_left = max(TRANSIENT_PER_ROUND, threads)
         with self._lock:
             self._mail_since.clear()
         if self._limit:
             self._log("info", f"本轮最多处理 {self._limit} 个账号"
                               f"（队列里有 {pending} 个）")
-        self._start_prefetcher(threads if not self._limit
-                               else min(threads, self._limit))
+        self._start_prefetcher(min(threads, self._limit) if self._limit
+                               else threads)
         self._running = True
         self._done = 0
         # Relays are per-upstream and cached; drop them so a changed
