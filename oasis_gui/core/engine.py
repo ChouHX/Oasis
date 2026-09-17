@@ -142,12 +142,23 @@ class Engine:
                 pass
 
     def _take_mail_since(self, email):
-        """The epoch this account's mail was requested at, if still fresh."""
+        """The epoch this account's mail was requested at, if still fresh.
+
+        Deliberately does NOT consume the entry. An account that is requeued and
+        tried again is the same account with the same mail already sitting in its
+        inbox, so asking the site for a second verification mail would be two
+        requests for one registration - which is the pattern an anti-abuse system
+        looks for, and it is what the deployed log showed: a stuck round fired
+        verification mails at fifteen different accounts while the workers got
+        nowhere. The entry ages out on its own, and after that a re-request is
+        the honest thing to do.
+        """
         with self._lock:
-            sent = self._mail_since.pop(email, None)
-        if sent and time.time() - sent < PREFETCH_MAX_AGE:
-            return sent
-        return None
+            sent = self._mail_since.get(email)
+            if sent is not None and time.time() - sent >= PREFETCH_MAX_AGE:
+                self._mail_since.pop(email, None)
+                return None
+        return sent
 
     # ------------------------------------------------------------------ helpers
     def _proxy_country(self, proxy, dial=None):
@@ -174,94 +185,6 @@ class Engine:
                               f"{proxy.split('@')[-1]}; assuming US")
         return cc
 
-    # -------------------------------------------------------------- prefetching
-    def _start_prefetcher(self, threads):
-        """Request the verification mail for upcoming accounts ahead of time.
-
-        The mail takes ~10s to arrive, and that was dead time inside the worker:
-        it had nothing to do but poll. Asking for the next few accounts' mails
-        up front, from curl, moves that wait off the critical path entirely -
-        the worker opens the mail link that is already sitting in the inbox
-        instead of waiting for it to show up.
-
-        Depth is kept small on purpose. Requests are cheap but not free, and a
-        verification link goes stale, so asking for twenty accounts at once
-        would mostly produce expired links.
-        """
-        self._prefetch_stop.clear()
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            return
-        self._prefetch_thread = threading.Thread(
-            target=self._prefetch_loop, args=(max(1, threads),),
-            daemon=True, name="mail-prefetch")
-        self._prefetch_thread.start()
-
-    def _prefetch_loop(self, depth):
-        while not self._prefetch_stop.is_set() and not self._stop.is_set():
-            try:
-                self._prefetch_once(depth)
-            except Exception as e:
-                self._log("debug", f"prefetch: {type(e).__name__}: {e}")
-            self._prefetch_stop.wait(2)
-
-    def _prefetch_once(self, depth):
-        now = time.time()
-        # one request per pending account that is not already covered
-        wanted = []
-        fresh = {e: t for e, t in self._mail_since.items()
-                 if now - t < PREFETCH_MAX_AGE}
-        with self._lock:
-            self._mail_since.clear()
-            self._mail_since.update(fresh)
-        for email in self.store.pending_emails(max(depth * 3, 6)):
-            if len(wanted) >= depth:
-                break
-            if email in fresh:
-                continue
-            wanted.append(email)
-        if not wanted:
-            return
-        proxy = self.pool.acquire()
-        relay = self.relays.get(proxy)
-        session = registrar.make_session(relay.url, timeout=45)
-        try:
-            for email in wanted:
-                if self._stop.is_set():
-                    return
-                # Claim the slot before the request, not after. Recording it
-                # afterwards leaves a window where a worker has already claimed
-                # the account but cannot see the prefetch, so it sends its own
-                # verify - and its later mail_since then filters out the mail
-                # the prefetch already triggered, making the account slower.
-                with self._lock:
-                    self._mail_since[email] = time.time()
-                try:
-                    registrar.request_verification(
-                        session, email,
-                        lambda m: self._log("debug", f"prefetch{m}"))
-                    self._log("info", f"prefetch: 已为 {email} 触发验证邮件")
-                except Exception as e:
-                    # give the slot back so a worker will retry it
-                    with self._lock:
-                        self._mail_since.pop(email, None)
-                    self._log("debug", f"prefetch {email} failed: "
-                                       f"{type(e).__name__}")
-                self._prefetch_stop.wait(PREFETCH_GAP)
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
-
-    def _take_mail_since(self, email):
-        """The epoch this account's mail was requested at, if still fresh."""
-        with self._lock:
-            sent = self._mail_since.pop(email, None)
-        if sent and time.time() - sent < PREFETCH_MAX_AGE:
-            return sent
-        return None
-
-    # ------------------------------------------------------------------ helpers
     def _log(self, level, msg):
         try:
             self.log_cb(level, msg)

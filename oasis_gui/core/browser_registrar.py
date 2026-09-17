@@ -577,8 +577,16 @@ class _SharedBrowser:
             "--disable-setuid-sandbox",
             # One --disable-features only: chromium keeps the last one it sees,
             # so a second occurrence silently discards the first.
+            #
+            # OptimizationHints is deliberately NOT in this list. Disabling it
+            # segfaults the full chromium during startup - isolated by bisection
+            # against the shipped image: that name alone gives "exited
+            # immediately (code -11)", every other name in this list is
+            # harmless on its own, and the crash disappears the moment it is
+            # removed. Nothing here wants optimisation hints switched off
+            # anyway; the browser opens one page and is driven by CDP.
             "--disable-features=Translate,BackForwardCache,AcceptCHFrame,"
-            "MediaRouter,OptimizationHints,IsolateOrigins,site-per-process",
+            "MediaRouter,IsolateOrigins,site-per-process",
         ]
         if self.proxy_url:
             args.append(f"--proxy-server={self.proxy_url}")
@@ -612,6 +620,21 @@ class _SharedBrowser:
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{self.port}/json/version", timeout=2):
+                    pass
+            except Exception:
+                time.sleep(0.25)
+                continue
+            # The port answers before the browser websocket accepts clients.
+            # Measured: attaching in that window fails with
+            # "connect_over_cdp: read ECONNRESET" four times out of four, and
+            # the worker that lost that race then tore down a browser the other
+            # workers were standing on. A second probe, after a pause, is what
+            # separates "the HTTP endpoint is up" from "this browser can be
+            # driven" - and it costs a fraction of a second once per process.
+            time.sleep(self._PROBE_GAP)
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{self.port}/json/version", timeout=2):
                     self.log(f"    shared browser on :{self.port} "
                              f"(pid {self.proc.pid}, {label}, "
                              f"proxy={self.proxy_url})")
@@ -622,6 +645,10 @@ class _SharedBrowser:
         raise TransientError(
             f"{label} never opened its debug port "
             f"cmd={self._cmd()[:160]} :: {self._tail_err()}")
+
+    # How long to wait between the two readiness probes. Long enough for the
+    # browser websocket to start accepting, short enough not to matter.
+    _PROBE_GAP = 0.4
 
     def alive(self):
         return bool(self.proc and self.proc.poll() is None)
@@ -760,6 +787,9 @@ class BrowserRegistrar:
         # for an identical fingerprint.
         self._shared = {}
         self._shared_lock = threading.Lock()
+        # How many workers are standing on each shared browser. A worker that
+        # failed to attach must not tear one down while someone is using it.
+        self._shared_users = {}
         # Set once the shared scheme has failed often enough to be called
         # broken on this host; every worker then launches its own browser.
         self._solo = False
@@ -801,6 +831,7 @@ class BrowserRegistrar:
             for shared in self._shared.values():
                 shared.stop()
             self._shared.clear()
+            self._shared_users.clear()
 
     # ------------------------------------------------------------------ plumbing
     @staticmethod
@@ -845,31 +876,46 @@ class BrowserRegistrar:
                 # Chromium itself would not start. Rebuilding cannot fix a host
                 # that refuses to run it, so stop burning attempts.
                 last = e
-                break
+                self._shared_failures += 1
+                if self._shared_failures >= SOLO_AFTER:
+                    self.log("    shared browser 在本机起不来（连续 "
+                             f"{self._shared_failures} 次）——改为每个 worker "
+                             "自己开一个浏览器")
+                    self._solo = True
+                    return self._launch_solo(relay_url)
+                raise
             try:
-                return pw, pw.chromium.connect_over_cdp(shared.endpoint()), False
+                browser = pw.chromium.connect_over_cdp(shared.endpoint())
             except Exception as e:
                 last = e
                 try:
                     pw.stop()
                 except Exception:
                     pass
-                self.log(f"    shared browser connect failed "
-                         f"({type(e).__name__}), rebuilding")
-                with self._shared_lock:
-                    dead = self._shared.pop(relay_url, None)
-                if dead:
-                    try:
-                        dead.stop()
-                    except Exception:
-                        pass
+                # One worker failing to attach says nothing about whether the
+                # browser is usable - and it is shared. Tearing it down here is
+                # what turned a single bad attach into "every worker's page
+                # disappeared at once": measured on the deployed run, two
+                # workers each rebuilt the browser twice in twelve seconds and
+                # the third died with "Target page, context or browser has been
+                # closed" every time. So the browser is only discarded when it
+                # is actually dead or has nobody on it, and the attach itself is
+                # simply retried.
+                self._retire_if_idle(relay_url)
+                if attempt < attempts - 1:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+                break
+            with self._shared_lock:
+                self._shared_users[relay_url] = \
+                    self._shared_users.get(relay_url, 0) + 1
+            return pw, browser, False
 
-        # The shared scheme is not working on this host. Two rounds is enough to
-        # tell a fluke from a fact, and every further round is another account
-        # pushed back into the queue for a reason that is not about it.
+        # Every attempt to attach failed against a browser that is alive. That
+        # is the shared scheme failing, not this account.
         self._shared_failures += 1
         if self._shared_failures >= SOLO_AFTER:
-            self.log("    shared browser 在本机用不了（连续 "
+            self.log("    shared browser 接不上（连续 "
                      f"{self._shared_failures} 次）——改为每个 worker 自己开一个"
                      "浏览器：慢一些、更吃内存，但能跑完")
             self._solo = True
@@ -877,6 +923,34 @@ class BrowserRegistrar:
         if isinstance(last, TransientError):
             raise last
         raise BrowserRegistrationError(f"could not attach to a browser: {last}")
+
+    def _retire_if_idle(self, relay_url):
+        """Throw away the shared browser for this relay, but only if nobody is
+        on it.
+
+        A worker that failed to attach has no claim on the browser every other
+        worker is using, so this is deliberately conservative: a browser that is
+        still running with a live user is left alone, and the caller retries
+        instead.
+        """
+        with self._shared_lock:
+            if self._shared_users.get(relay_url, 0) > 0:
+                return
+            shared = self._shared.pop(relay_url, None)
+        if shared is not None:
+            try:
+                shared.stop()
+            except Exception:
+                pass
+
+    def _release_shared(self, relay_url):
+        """This worker is done with the shared browser for this relay."""
+        with self._shared_lock:
+            n = self._shared_users.get(relay_url, 0)
+            if n <= 1:
+                self._shared_users.pop(relay_url, None)
+            else:
+                self._shared_users[relay_url] = n - 1
 
     def _launch_solo(self, relay_url):
         """One browser for this worker, started by Playwright itself.
@@ -1446,6 +1520,11 @@ class BrowserRegistrar:
                     browser.close()
                 except Exception:
                     pass
+            else:
+                # Hand the shared browser back before tearing down the session,
+                # so another worker's failed attach does not decide this one is
+                # idle and throw it away underneath them.
+                self._release_shared(relay.url)
             try:
                 pw.stop()
             except Exception:
