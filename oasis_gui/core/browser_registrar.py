@@ -26,6 +26,7 @@ upstream refuses the Google estate outright and reCAPTCHA cannot load without
 it. The relay splits Google to a second egress; the registration traffic itself
 still leaves from the residential IP.
 """
+import hashlib
 import json
 import os
 import random
@@ -310,6 +311,84 @@ def _system_chrome():
     return None
 
 
+def _headless_shell_on_disk():
+    """Playwright's chrome-headless-shell, when it is installed.
+
+    Newer Playwright releases ship this as the browser that headless=true
+    actually uses: the same engine with the parts headless never needs stripped
+    out. It starts with a fraction of the machinery of the full build - notably
+    a smaller process tree at startup - which is why it is worth trying when the
+    full chromium dies before it ever opens its debug port.
+    """
+    root = _browsers_root()
+    if not os.path.isdir(root):
+        return None
+    if sys.platform == "darwin":
+        return None
+    if sys.platform == "win32":
+        rel = ("chrome-headless-shell-win64", "chrome-headless-shell.exe")
+    else:
+        rel = ("chrome-headless-shell-linux64", "chrome-headless-shell")
+    for name in sorted(os.listdir(root), reverse=True):
+        if not name.startswith("chromium_headless_shell-"):
+            continue
+        path = os.path.join(root, name, *rel)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _shared_candidates():
+    """Every browser worth hand-launching here, best first.
+
+    The full chromium leads because that is what browser mode has always run
+    on, so the fingerprint stays the one the site has been seeing. The headless
+    shell is the second opinion for hosts where the full build dies during
+    startup: same engine and version, much less to go wrong.
+    """
+    out = []
+    full = _chromium_on_disk() or _system_chrome()
+    if full:
+        out.append(("chromium", full, ["--headless=new"]))
+    shell = _headless_shell_on_disk()
+    if shell:
+        out.append(("chrome-headless-shell", shell, []))
+    return out
+
+
+def _build_stamp():
+    """Which build of this file is running, and on what.
+
+    A failure report is only actionable if it says which code produced it - a
+    stale image and a genuinely broken host need opposite fixes, and the log
+    lines around a crash look identical either way. So the digest of this file,
+    the browser binaries present, and the few environment facts that decide
+    whether chromium can start at all all travel with the error.
+    """
+    try:
+        path = os.path.abspath(__file__)
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()[:12]
+        when = time.strftime("%m-%d %H:%M",
+                             time.localtime(os.path.getmtime(path)))
+    except Exception:
+        digest, when = "?", "?"
+    shm = "?"
+    try:
+        st = os.statvfs("/dev/shm")
+        shm = f"{st.f_bsize * st.f_blocks // (1024 * 1024)}MB"
+    except Exception:
+        pass
+    home = os.path.expanduser("~")
+    engines = ",".join(f"{label}:{exe}" for label, exe, _ in _shared_candidates())
+    # getuid is Unix-only, and the desktop console runs this same code on Windows.
+    uid = getattr(os, "getuid", lambda: -1)()
+    return (f"构建={digest}@{when} uid={uid} HOME={home}"
+            f"[{'rw' if os.access(home, os.W_OK) else 'ro'}]"
+            f" tmp[{'rw' if os.access(tempfile.gettempdir(), os.W_OK) else 'ro'}]"
+            f" /dev/shm={shm} 可用内核={engines or '无'}")
+
+
 def resolve_channel(log):
     """Pick a usable browser: bundled chromium, then system Chrome, then install.
 
@@ -360,13 +439,17 @@ class _SharedBrowser:
     still isolate cookies, storage and cache, which is what actually matters.
     """
 
-    def __init__(self, exe, proxy_url, log=None):
-        self.exe = exe
+    def __init__(self, proxy_url, log=None):
         self.proxy_url = proxy_url
         self.log = log or (lambda m: None)
         self.proc = None
         self.port = None
         self._errlog = None
+        self._argv = []
+        # Which candidate engine last worked here, so a host that refuses one of
+        # them does not pay for the refusal on every account.
+        self._preferred = None
+        self._home_noted = False
         # RLock: endpoint() holds this while starting, and callers may already
         # hold it (see BrowserRegistrar._shared_browser) to close the race where
         # two workers both see "not started yet" and each launch a browser.
@@ -380,7 +463,7 @@ class _SharedBrowser:
             self._start()
             return f"http://127.0.0.1:{self.port}"
 
-    def _tail_err(self, lines=6):
+    def _tail_err(self, lines=10):
         """Last few lines chromium wrote before dying."""
         if self._errlog is None:
             return "（进程没起来，没有输出）"
@@ -388,41 +471,93 @@ class _SharedBrowser:
             self._errlog.flush()
             with open(self._errlog.name, encoding="utf-8", errors="replace") as fh:
                 tail = fh.read().strip().split("\n")[-lines:]
-            return " | ".join(x.strip()[:160] for x in tail if x.strip()) \
+            return " | ".join(x.strip()[:200] for x in tail if x.strip()) \
                    or "（没有输出）"
         except Exception as e:
             return f"（读不到：{type(e).__name__}）"
 
+    def _cmd(self):
+        return " ".join(self._argv)
+
+    # One retry per candidate: a browser that dies during startup dies in well
+    # under a second, so a second attempt costs a moment, and it rules out the
+    # transient port/tmp collision before the candidate is written off.
+    _START_ATTEMPTS = 2
+
     def _start(self):
+        """Bring up whichever chromium this host will actually run.
+
+        _shared_candidates() is ordered best-first; a candidate that has already
+        worked here is tried first. Every failure is collected rather than
+        raised immediately, because a host can refuse one build and accept the
+        next - and if they all fail, the caller needs the whole list plus the
+        environment it happened in, not just the last message.
+        """
         if self.proc and self.proc.poll() is None:
             return
+        candidates = _shared_candidates()
+        if not candidates:
+            raise TransientError(
+                f"这台机器上没有可用的 chromium | {_build_stamp()}")
+        if self._preferred:
+            candidates.sort(key=lambda c: c[0] != self._preferred)
+        failures = []
+        for label, exe, extra in candidates:
+            for attempt in range(self._START_ATTEMPTS):
+                try:
+                    self._launch(exe, extra, label)
+                except TransientError as e:
+                    failures.append(str(e)[:240])
+                    self.log(f"    {label} 起不来（第 {attempt + 1} 次）："
+                             f"{str(e)[:200]}")
+                    self.stop()          # leave nothing behind for the retry
+                    continue
+                if label != self._preferred:
+                    self.log(f"    browser engine: {label} ({exe})")
+                self._preferred = label
+                return
+        raise TransientError(
+            "shared chromium 在本机起不来："
+            + " | ".join(failures) + f" || {_build_stamp()}")
+
+    def _launch(self, exe, extra, label):
+        """Start one chromium and wait for its debug port.
+
+        Raises TransientError rather than returning a flag: whatever this build
+        of chromium is unhappy about says nothing about the account that
+        happened to be first in the queue.
+        """
         self.port = _free_port()
         profile = tempfile.mkdtemp(prefix="oasis-browser-")
-        args = [
-            self.exe, "--headless=new",
+        args = [exe] + extra + [
             f"--remote-debugging-port={self.port}",
             f"--user-data-dir={profile}",
             "--no-first-run", "--no-default-browser-check",
             "--disable-dev-shm-usage", "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
             # Playwright's connect_over_cdp asserts on targets it does not
             # recognise, and a component extension's service worker is exactly
             # that - the whole browser connection dies with "Assertion error".
             # Nothing here needs extensions, so keep them out entirely.
             "--disable-extensions",
             "--disable-component-extensions-with-background-pages",
+            "--disable-component-update",
             "--disable-background-networking",
             "--disable-default-apps",
+            "--disable-sync",
+            "--disable-client-side-phishing-detection",
+            "--disable-popup-blocking",
+            "--disable-ipc-flooding-protection",
             "--no-service-autorun",
-            # The crash reporter is what actually killed it: chromium spawns
-            # chrome_crashpad_handler, which dies with "--database is required"
-            # and takes the browser down with SIGTRAP ("code -5"). Playwright's
-            # own launch() passes --disable-breakpad for exactly this reason -
-            # launching the process by hand means remembering these.
+            "--force-color-profile=srgb",
+            # The crash handler is what took the browser down on the box this
+            # was first deployed to: chromium spawns chrome_crashpad_handler,
+            # which died with "--database is required" and took the browser with
+            # it as SIGTRAP ("code -5"). These are the switches Playwright's own
+            # launch() passes for that reason - launching the process by hand
+            # means remembering them.
             "--disable-breakpad",
             "--disable-crash-reporter",
-            "--disable-features=Crashpad",
             # A few more of Playwright's defaults that keep a headless browser
             # from being throttled or waiting on things nobody is watching.
             "--disable-background-timer-throttling",
@@ -437,47 +572,56 @@ class _SharedBrowser:
             # namespaces its sandbox needs, so it dies during startup with
             # SIGTRAP ("exited immediately (code -5)"). Playwright's own
             # launch() adds these; launching the process by hand means adding
-            # them here. This is the standard trade-off for containerised
-            # browsers - the browser only ever opens one site.
+            # them here. The browser only ever opens one site.
             "--no-sandbox",
             "--disable-setuid-sandbox",
+            # One --disable-features only: chromium keeps the last one it sees,
+            # so a second occurrence silently discards the first.
+            "--disable-features=Translate,BackForwardCache,AcceptCHFrame,"
+            "MediaRouter,OptimizationHints,IsolateOrigins,site-per-process",
         ]
         if self.proxy_url:
             args.append(f"--proxy-server={self.proxy_url}")
+        self._argv = [f"--user-data-dir={os.path.basename(profile)}"
+                      if a.startswith("--user-data-dir") else a for a in args]
         # Keep chromium's own stderr instead of discarding it: when it dies at
         # startup, that text is the only thing that says why.
         self._errlog = tempfile.NamedTemporaryFile(
             prefix="oasis-chromium-", suffix=".log", delete=False)
+        # A read-only $HOME kills the full build before it opens its port, so
+        # give the browser one it can write to rather than failing on a host
+        # where nothing else is wrong.
+        env = _browser_env()
+        if env is not None and not self._home_noted:
+            self._home_noted = True
+            self.log(f"    $HOME={os.environ.get('HOME') or '(未设)'} 不可写"
+                     f" —— 浏览器改用 {env['HOME']}")
         try:
             self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                         stderr=self._errlog)
+                                         stderr=self._errlog, env=env)
         except Exception as e:
-            # Same class of problem as dying at startup - the browser is
-            # unusable for reasons that have nothing to do with any account.
             raise TransientError(
-                f"cannot start chromium ({self.exe}): "
+                f"cannot start {label} ({exe}): "
                 f"{type(e).__name__}: {str(e)[:120]}") from e
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                # Transient on purpose: if chromium cannot start at all, every
-                # account in the queue would fail for a reason that has nothing
-                # to do with any of them. Requeue and let the round budget stop
-                # the loop instead of marking the pool failed.
                 raise TransientError(
-                    f"shared chromium exited immediately "
-                    f"(code {self.proc.returncode}) - "
-                    f"{self._tail_err()}")
+                    f"{label} exited immediately (code {self.proc.returncode}) "
+                    f"cmd={self._cmd()[:200]} :: {self._tail_err()}")
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{self.port}/json/version", timeout=2):
                     self.log(f"    shared browser on :{self.port} "
-                             f"(pid {self.proc.pid}, proxy={self.proxy_url})")
+                             f"(pid {self.proc.pid}, {label}, "
+                             f"proxy={self.proxy_url})")
                     return
             except Exception:
                 time.sleep(0.25)
         self.stop()
-        raise BrowserRegistrationError("shared chromium never opened its debug port")
+        raise TransientError(
+            f"{label} never opened its debug port "
+            f"cmd={self._cmd()[:160]} :: {self._tail_err()}")
 
     def alive(self):
         return bool(self.proc and self.proc.poll() is None)
@@ -497,6 +641,75 @@ def _free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _proxy_arg(url):
+    """Playwright's proxy dict, from a relay URL.
+
+    Chromium takes the proxy as one --proxy-server string, which is why the
+    shared path can pass the URL straight through. launch() wants it split into
+    server/username/password, and the relay URL can carry credentials quoted for
+    a URL, so they are unquoted here.
+    """
+    if not url:
+        return None
+    from urllib.parse import unquote, urlsplit
+
+    parts = urlsplit(url)
+    if not parts.hostname:
+        return {"server": url}
+    server = f"{parts.scheme}://{parts.hostname}"
+    if parts.port:
+        server += f":{parts.port}"
+    proxy = {"server": server}
+    if parts.username:
+        proxy["username"] = unquote(parts.username)
+        proxy["password"] = unquote(parts.password or "")
+    return proxy
+
+
+def _needs_home_fix():
+    """True when $HOME is missing or not writable by this process.
+
+    Chromium keeps its profile, its crash database and its first-run state
+    under $HOME, and with a read-only $HOME the full build dies during startup
+    with SIGTRAP - "exited immediately (code -5)" - before it ever opens its
+    debug port. Docker leaves HOME=/root in place after the entrypoint drops to
+    uid 10001, and /root is not writable by that user, which is exactly that
+    case. Reproduced by running the shared browser with HOME=/root as uid 10001:
+    the full chromium exits -5, the same code reported from the server.
+    """
+    if sys.platform == "win32":
+        # Windows chromium reads USERPROFILE/LOCALAPPDATA, and HOME is normally
+        # absent there - treating that as "unwritable" would rewrite the
+        # environment of every browser on the desktop build for no reason.
+        return False
+    home = os.environ.get("HOME") or ""
+    return not (home and os.access(home, os.W_OK))
+
+
+_HOME_FIX = None
+
+
+def _browser_env():
+    """Environment for a hand-launched chromium, or None to inherit as-is.
+
+    The substitute HOME is made once and shared: it is a scratch directory the
+    browser only uses for its profile and first-run state, and making a fresh
+    one per worker would leave a trail of them behind on a long run.
+    """
+    global _HOME_FIX
+    if not _needs_home_fix():
+        return None
+    if _HOME_FIX is None:
+        _HOME_FIX = tempfile.mkdtemp(prefix="oasis-home-")
+    return dict(os.environ, HOME=_HOME_FIX)
+
+
+# How many times the shared browser may fail before browser mode gives up on it
+# and lets every worker launch its own. Two, because one failure is a fluke
+# worth rebuilding for and two in a row is the host telling us something.
+SOLO_AFTER = 2
 
 
 class TransientError(Exception):
@@ -547,6 +760,10 @@ class BrowserRegistrar:
         # for an identical fingerprint.
         self._shared = {}
         self._shared_lock = threading.Lock()
+        # Set once the shared scheme has failed often enough to be called
+        # broken on this host; every worker then launches its own browser.
+        self._solo = False
+        self._shared_failures = 0
 
     # ------------------------------------------------------- warm captcha minting
     _EXEC_JS = """async (k) => await new Promise((res, rej) => {
@@ -568,11 +785,7 @@ class BrowserRegistrar:
         with self._shared_lock:
             shared = self._shared.get(relay_url)
             if shared is None or not shared.alive():
-                exe = _chromium_on_disk() or _system_chrome()
-                if not exe:
-                    raise BrowserRegistrationError(
-                        "no chromium available for the shared browser")
-                shared = _SharedBrowser(exe, relay_url, self.log)
+                shared = _SharedBrowser(relay_url, self.log)
                 self._shared[relay_url] = shared
             shared.endpoint()           # idempotent; starts if needed
             return shared
@@ -606,22 +819,35 @@ class BrowserRegistrar:
                 .replace("__CORES__", str(cores)))
 
     def _connect_shared(self, relay_url, attempts=2):
-        """(playwright, browser) on the shared chromium, with one self-heal.
+        """(playwright, browser, owns_browser) for this worker.
 
         A shared process is one point of failure for every worker, and a driver
         crash ("Assertion error" from an unexpected target) kills the whole
         playwright session, not just the call. So on failure: throw the shared
         browser away, build a new one, and try once more from a clean
         playwright - losing one account's worth of work beats wedging the run.
+
+        `owns_browser` says whether this worker has to close the browser when it
+        is done. On the shared path it must not: the whole point is that the
+        browser outlives the account.
         """
+        if self._solo:
+            return self._launch_solo(relay_url)
+
         from playwright.sync_api import sync_playwright
 
         last = None
         for attempt in range(attempts):
-            shared = self._shared_browser(relay_url)
-            pw = sync_playwright().start()
             try:
-                return pw, pw.chromium.connect_over_cdp(shared.endpoint())
+                shared = self._shared_browser(relay_url)
+                pw = sync_playwright().start()
+            except TransientError as e:
+                # Chromium itself would not start. Rebuilding cannot fix a host
+                # that refuses to run it, so stop burning attempts.
+                last = e
+                break
+            try:
+                return pw, pw.chromium.connect_over_cdp(shared.endpoint()), False
             except Exception as e:
                 last = e
                 try:
@@ -637,7 +863,57 @@ class BrowserRegistrar:
                         dead.stop()
                     except Exception:
                         pass
+
+        # The shared scheme is not working on this host. Two rounds is enough to
+        # tell a fluke from a fact, and every further round is another account
+        # pushed back into the queue for a reason that is not about it.
+        self._shared_failures += 1
+        if self._shared_failures >= SOLO_AFTER:
+            self.log("    shared browser 在本机用不了（连续 "
+                     f"{self._shared_failures} 次）——改为每个 worker 自己开一个"
+                     "浏览器：慢一些、更吃内存，但能跑完")
+            self._solo = True
+            return self._launch_solo(relay_url)
+        if isinstance(last, TransientError):
+            raise last
         raise BrowserRegistrationError(f"could not attach to a browser: {last}")
+
+    def _launch_solo(self, relay_url):
+        """One browser for this worker, started by Playwright itself.
+
+        The fallback for hosts where the hand-launched shared chromium dies
+        before opening its debug port. launch() carries its own argument list
+        and its own crash-handler handling, so it comes up in places our own
+        list does not - in a container too, which is the case that matters.
+        What it costs is a browser process per worker instead of one per proxy,
+        so it is the fallback and not the default.
+        """
+        from playwright.sync_api import sync_playwright
+
+        pw = sync_playwright().start()
+        kwargs = {}
+        fixed = _browser_env()
+        if fixed is not None:
+            # Same reason as the shared path: a read-only $HOME kills chromium
+            # during startup, whichever way it was started.
+            kwargs["env"] = {"HOME": fixed["HOME"]}
+        try:
+            browser = pw.chromium.launch(
+                headless=True,
+                proxy=_proxy_arg(relay_url),
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage"],
+                **kwargs,
+            )
+        except Exception as e:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise TransientError(
+                f"playwright launch() 也起不来浏览器：{type(e).__name__}: "
+                f"{str(e)[:200]} || {_build_stamp()}") from e
+        return pw, browser, True
 
     def _new_context(self, browser, rnd, ident):
         """An isolated context for one account on a shared browser.
@@ -1014,12 +1290,14 @@ class BrowserRegistrar:
         # measured across three separate browsers, the canvas hash and WebGL
         # string came out identical, because the fingerprint comes from the
         # Chromium build and the machine, not the process.
-        pw, browser = self._connect_shared(relay.url)
+        pw, browser, owns_browser = self._connect_shared(relay.url)
         ctx = None
         try:
             ctx = self._new_context(browser, rnd, ident)
             page = ctx.new_page()
-            self.log(f"    context on shared browser via {relay.url}")
+            self.log(f"    context on "
+                     f"{'this worker' if owns_browser else 'shared'} "
+                     f"browser via {relay.url}")
             # 1. ask for the verification mail over curl.
             #
             #    The submit is what must come from the browser: measured, a real
@@ -1156,12 +1434,18 @@ class BrowserRegistrar:
             raise
         finally:
             # Only this worker's context. The shared browser outlives the
-            # account on purpose - that is what makes it warm.
+            # account on purpose - that is what makes it warm. A solo browser
+            # belongs to this worker alone, so it goes too.
             try:
                 if ctx:
                     ctx.close()
             except Exception:
                 pass
+            if owns_browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             try:
                 pw.stop()
             except Exception:

@@ -52,6 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core import registrar, sysinfo                # noqa: E402
+from core.browser_registrar import _build_stamp     # noqa: E402
 from core.webui import LogRing, WebAdmin            # noqa: E402
 from core.engine import Engine                     # noqa: E402
 from core.config import Config                      # noqa: E402
@@ -308,6 +309,11 @@ def main():
 
     store = Store(boot["db_path"])
     log("info", f"db {boot['db_path']}  stats={store.stats()}")
+    # Printed once at boot so a bug report carries the build and the host facts
+    # that decide whether a browser can start at all - "which image is this and
+    # can it run chromium" is otherwise guesswork from a log that looks the same
+    # on a stale image as on a broken host.
+    log("info", f"build {_build_stamp()}")
 
     imported = env("OASIS_IMPORT")
     if imported and os.path.exists(imported):
