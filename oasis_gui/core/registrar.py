@@ -68,6 +68,12 @@ ALBUM_1995 = "c107232e-b35c-4f40-bf45-ba74018a43fe"
 # and puts the value in the confirm body.
 CF_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
+# The address lookup the SPA itself uses when a city is picked. Captured off the
+# live page: the request and this key are what fill location.county and the exact
+# coordinates, which a hand-built body otherwise cannot produce.
+RADAR_URL = "https://api.radar.io/v1/search/autocomplete"
+RADAR_KEY = "prj_live_pk_dce1d474fb4f6e7f376086ee829c060b3af5b42b"
+
 # venue -> (own pollAnswerId, [answer for the 2nd slot, answer for the 3rd slot])
 # All eleven cities from the registration form, in the order the page lists them.
 SHOWS = {
@@ -386,6 +392,35 @@ def check_verification(session, token, log=print):
     return data.get("token") or token, claims
 
 
+def lookup_location(session, query, log=print):
+    """Resolve a city the way the page does, so the body can carry county.
+
+    Captured from the SPA: GET api.radar.io/v1/search/autocomplete with
+    layers=locality, authorised by a publishable key that ships in the page
+    bundle. The answer holds county, the precise coordinates and the `source`
+    tag the SPA puts in location - none of which can be guessed from a city
+    name, and all of which a real submission carries.
+    """
+    if not query:
+        return None
+    r = _retry(lambda: session.get(
+        RADAR_URL,
+        params={"query": query, "layers": "locality"},
+        headers={"accept": "*/*", "authorization": RADAR_KEY,
+                 "origin": "https://oasis.hq.fan",
+                 "referer": "https://oasis.hq.fan/"}),
+        "radar autocomplete", log)
+    if r.status_code != 200:
+        raise RegistrationError(f"radar HTTP {r.status_code}")
+    addrs = (r.json() or {}).get("addresses") or []
+    if not addrs:
+        return None
+    a = addrs[0]
+    return {k: a.get(k) for k in ("latitude", "longitude", "city", "county",
+                                  "country", "countryCode", "state")} | \
+        {"source": "autocomplete-radar"}
+
+
 def client_ip(session):
     """Public IP as Cloudflare sees it, or None.
 
@@ -511,6 +546,17 @@ def register_over_http(session, mailbox, ident, order=None, *,
     token, claims = check_verification(session, url.split("token=", 1)[1], log)
     url = f"{RETURN_URL}?token={token}"
     log(f"  [{mailbox.email}] emailValid=true session={claims.get('sessionId')}")
+
+    # Resolve the city through the same lookup the page uses, so location is the
+    # full record (county, exact coordinates, source) rather than a bare city.
+    try:
+        loc = lookup_location(session, ident.get("location_query"), log)
+        if loc:
+            ident = dict(ident, location=loc)
+            log(f"  [{mailbox.email}] location {loc.get('city')}, "
+                f"{loc.get('county')}")
+    except Exception as e:
+        log(f"  [{mailbox.email}] radar lookup skipped: {type(e).__name__}")
 
     body = build_confirm(ident, token, url, order, captcha=captcha,
                          ip=client_ip(session))
