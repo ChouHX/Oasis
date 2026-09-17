@@ -73,6 +73,11 @@ PROTOCOL_LABEL = {
     "auto": "自动（Graph 失败回退 IMAP）",
 }
 
+# iCloud Hide-My-Email aliases read through the Gmail account that owns the
+# Apple ID. Stored in the accounts.protocol column, so a row says how to read
+# it without needing a new column.
+ALIAS_PROTOCOL = "alias-imap"
+
 
 def is_gmail(email):
     return (email or "").rsplit("@", 1)[-1].lower() in GMAIL_DOMAINS
@@ -90,6 +95,11 @@ def parse_cred(line):
     later with a confusing 401: Google will not mint a token without the secret.
     """
     parts = [p.strip() for p in line.strip().split("----")]
+    # iCloud Hide-My-Email read through Gmail:
+    #   alias@icloud.com----<the gmail that owns the Apple ID>----<app password>----gmail-imap
+    if len(parts) >= 3 and parts[-1].lower() in ("gmail-imap", "alias-imap"):
+        return {"email": parts[0], "client_id": parts[1], "password": parts[2],
+                "refresh_token": "", "provider": "alias"}
     # iCloud Hide-My-Email:  alias@icloud.com----acc_xxxxxxxx----hme
     if len(parts) >= 2 and parts[-1].lower() == "hme":
         return {"email": parts[0], "hme_account": parts[1] if len(parts) > 2 else "",
@@ -267,6 +277,15 @@ class BaseMailbox:
         """Current credential line, including any rotated refresh token."""
         return (f"{self.email}----{self.password}----{self.client_id}----"
                 f"{self.refresh_token}")
+
+    def close(self):
+        """Release any transport held open between calls.
+
+        A no-op for readers that reconnect on every fetch. The Gmail alias
+        reader keeps an IMAP session alive across polls, so whoever owns it has
+        to say when it is done.
+        """
+        return None
 
     def find_verification_link(self, timeout=300, interval=6, not_before=None,
                                log=None):
@@ -484,8 +503,14 @@ class ImapMailbox(BaseMailbox):
                 time.sleep(2.0 * (i + 1))
         raise last
 
-    def messages(self, limit=12):
-        """Newest-first (body, received datetime) pairs, INBOX + Junk."""
+    def messages(self, limit=12, not_before=None):
+        """Newest-first (body, received datetime) pairs, INBOX + Junk.
+
+        `not_before` is accepted and ignored here: this reader always pulls the
+        newest N regardless, which is right for a mailbox that only holds the
+        few accounts pointed at it. Subclasses with a busier inbox use it to
+        narrow the search on the server instead of filtering at the end.
+        """
         M = self.connect()
         try:
             out = []
@@ -519,7 +544,7 @@ class ImapMailbox(BaseMailbox):
     def _candidates(self, not_before=None):
         """(body, stamp) pairs. IMAP already returns that shape; Graph wraps
         its payload in a dict, so both backends expose this instead."""
-        return list(self.messages())
+        return list(self.messages(not_before=not_before))
 
     @staticmethod
     def _recent(stamp, not_before):
@@ -539,7 +564,7 @@ class ImapMailbox(BaseMailbox):
         while time.time() < deadline:
             polls += 1
             try:
-                cands = self.messages()
+                cands = self._candidates(not_before)
             except MailAuthError:
                 raise
             except Exception as e:
@@ -862,6 +887,184 @@ class GmailMailbox(ImapMailbox):
             return self._access
 
 
+class GmailAliasMailbox(ImapMailbox):
+    """An iCloud Hide-My-Email alias, read through the Gmail account behind it.
+
+    An alias is not a mailbox. iCloud forwards it to whatever address the Apple
+    ID really is, so the mail lands in a shared Gmail inbox - measured on the
+    account this class was written against: 68k messages, 20k of them addressed
+    to one iCloud alias or another.
+
+    That single fact dictates the design. "Take the newest N in INBOX and grep
+    the body" - what the Outlook reader can afford - would hand this alias
+    somebody else's mail, because the newest N usually belong to a different
+    alias. Every read is scoped on the server with `SEARCH TO <this alias>`,
+    which Gmail answers from its index in milliseconds, and narrowed with SINCE
+    once a `not_before` is known so polling only ever sees mail that is new.
+
+    Auth is an app password over plain LOGIN, not XOAUTH2: this is a person's
+    Gmail behind 2FA, and an app password is what Google issues for IMAP. The
+    credential line carries it, so nothing here needs a Google OAuth client.
+
+    Both of those were verified against the live inbox during development -
+    `SEARCH TO <alias>` returned 36/22/39/23 messages for the four aliases in
+    the pool, each addressed `To: Hide My Email <alias@icloud.com>`.
+    """
+
+    protocol = ALIAS_PROTOCOL
+
+    # Gmail drops an idle session somewhere around half an hour. Ten minutes is
+    # far inside that and still saves a login across every poll of the wait.
+    _SESSION_TTL = 600
+    _JUNK_EVERY = 15.0
+
+    def __init__(self, cred, proxy_url="", timeout=30):
+        BaseMailbox.__init__(self, cred, proxy_url)
+        self.inbox = cred.get("client_id") or cred.get("inbox") or ""
+        self.password = cred.get("password", "")
+        # No OAuth here at all; the base class only set it for the token flow.
+        self.refresh_token = ""
+        self.host = GMAIL_HOST
+        self.port = 993
+        self.timeout = timeout
+        self._session = None
+        self._session_at = 0.0
+        # Junk is checked at most this often, and only when the inbox was empty.
+        # A LIST plus a second SELECT+SEARCH is ~1.5s, and the poll loop runs
+        # every few seconds - doing it on every poll doubles the cost of the
+        # common case (mail not there yet) to catch a case that did not happen
+        # once across the aliases measured.
+        self._junk_after = 0.0
+        self._junk_folders = None
+
+    def connect(self, attempts=3):
+        """Authenticated IMAP session, by app password.
+
+        A rejected password fails identically every time, so it raises
+        MailAuthError rather than spending the retry budget on it - the operator
+        needs to hear "wrong app password", not "mail fetch failed" three times.
+        """
+        last = None
+        for i in range(attempts):
+            M = None
+            try:
+                cls = type("BoundTunnelIMAP4", (TunnelIMAP4,), {
+                    "proxy_url": self.proxy_url, "timeout": self.timeout})
+                M = cls(self.host, self.port, timeout=self.timeout)
+                M.login(self.inbox, self.password)
+                return M
+            except imaplib.IMAP4.error as e:
+                self._logout(M)
+                raise MailAuthError(
+                    f"{self.inbox}: Gmail 拒绝登录（{str(e)[:90]}）——要用应用专用"
+                    f"密码，并在 Gmail 设置里开启 IMAP") from e
+            except Exception as e:
+                last = e
+                self._logout(M)
+                time.sleep(1.5 * (i + 1))
+        raise last
+
+    @staticmethod
+    def _logout(M):
+        if M is None:
+            return
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+    def _live(self):
+        """A session that survives between polls.
+
+        Logging in costs a TLS handshake and a SASL round trip through the proxy
+        - measured 1.1-1.8s against 0.4s for the search itself. The poll loop
+        runs every few seconds for the whole link_timeout, so reconnecting each
+        time spends most of the wait on handshakes. One session is kept until
+        the server drops it or it goes stale.
+        """
+        with self._lock:
+            if self._session is not None and \
+                    time.time() < self._session_at + self._SESSION_TTL:
+                try:
+                    typ, _ = self._session.noop()
+                    if typ == "OK":
+                        return self._session
+                except Exception:
+                    pass
+            self._logout(self._session)
+            self._session = self.connect()
+            self._session_at = time.time()
+            # The folder list belongs to the server, not the session, but it is
+            # only worth asking once per reconnect either way.
+            self._junk_folders = None
+            return self._session
+
+    def close(self):
+        """Drop the held session. Called when the account is finished with."""
+        with self._lock:
+            self._logout(self._session)
+            self._session = None
+            self._junk_folders = None
+
+    def _junk(self, M):
+        """Folders flagged as junk, discovered once per session."""
+        if self._junk_folders is None:
+            self._junk_folders = _candidate_folders(M)[1:]
+        return self._junk_folders
+
+    def _search_args(self, not_before=None):
+        args = ["TO", self.email]
+        if not_before:
+            # SINCE has day granularity and compares the time the server took
+            # the message, so widen by a day and let the exact timestamp decide.
+            # It is also cheap: measured 0.4s against 0.9s for an unbounded
+            # SEARCH, because the server can cut straight to a date range.
+            args += ["SINCE", time.strftime(
+                "%d-%b-%Y", time.gmtime(not_before - 86400))]
+        return args
+
+    def _fetch_folder(self, M, folder, limit, not_before):
+        try:
+            typ, _ = M.select(folder, readonly=True)
+            if typ != "OK":
+                return []
+            typ, hit = M.search(None, *self._search_args(not_before))
+            if typ != "OK" or not hit or not hit[0]:
+                return []
+        except Exception:
+            return []
+        out = []
+        # Gmail returns ids in ascending arrival order, so the tail is the
+        # newest mail for this alias.
+        for i in reversed(hit[0].split()[-limit:]):
+            try:
+                typ, raw = M.fetch(i, "(RFC822)")
+            except Exception:
+                continue
+            if not raw or not isinstance(raw[0], tuple):
+                continue
+            msg = email.message_from_bytes(raw[0][1])
+            # _message_text already returns whichever MIME part holds the token,
+            # which matters here: measured, the Oasis verification mail is
+            # multipart/mixed with a text/html part and no text/plain part at
+            # all, so a reader that insists on plain text sees nothing.
+            out.append((_message_text(msg), _message_stamp(msg)))
+        return out
+
+    def messages(self, limit=12, not_before=None):
+        """Newest-first (body, stamp) pairs, for this alias only."""
+        M = self._live()
+        out = self._fetch_folder(M, "INBOX", limit, not_before)
+        if not out and time.time() >= self._junk_after:
+            self._junk_after = time.time() + self._JUNK_EVERY
+            for folder in self._junk(M):
+                out = self._fetch_folder(M, folder, limit, not_before)
+                if out:
+                    break
+        out.sort(key=lambda pair: pair[1] or 0, reverse=True)
+        return out[:limit]
+
+
 def hme_catalog(base="", password="", timeout=30):
     """Every alias the iCloud Hide-My-Email service knows about.
 
@@ -956,6 +1159,10 @@ def make_mailbox(cred, protocol="graph", proxy_url=""):
     proxy_url defaults to empty (direct dial): mail does not need to share the
     registration traffic's exit.
     """
+    if cred.get("provider") == "alias" or protocol == ALIAS_PROTOCOL:
+        # Before the HmeMailbox test on purpose: these addresses are @icloud.com
+        # too, and is_hme() would otherwise route them to the Apple service.
+        return GmailAliasMailbox(cred, proxy_url=proxy_url)
     if cred.get("provider") == "hme" or is_hme(cred.get("email", "")):
         return HmeMailbox(cred, proxy_url=proxy_url)
     if cred.get("provider") == "google" or is_gmail(cred.get("email", "")):

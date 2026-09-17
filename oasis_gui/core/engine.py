@@ -525,6 +525,14 @@ class Engine:
                 if self.config.get("debug"):
                     self._log("debug", traceback.format_exc()[-600:])
             finally:
+                # The Gmail alias reader holds an IMAP session open between
+                # polls (logging in per poll cost more than the search itself),
+                # so it has to be told when this account is done with it. A
+                # no-op for every reader that reconnects each time.
+                try:
+                    mailbox.close()
+                except Exception:
+                    pass
                 self._emit("stats", self.store.stats())
                 if delay_between:
                     time.sleep(delay_between)

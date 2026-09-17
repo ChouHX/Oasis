@@ -19,6 +19,12 @@ const HINT = (
     <Text code>gmail@x.com----密码----client_id----client_secret----refresh_token</Text>
     <br />
     <Text code>别名@icloud.com----acc_xxxxxxxx----hme</Text>
+    <br />
+    <Text code>别名@icloud.com----gmail地址----应用专用密码----gmail-imap</Text>
+    <br />
+    iCloud 隐私邮箱走 Gmail 取件时，只要在「设置」里填好别名收件箱，
+    <Text strong>直接粘贴纯别名列表就行</Text>
+    （<Text code>别名@icloud.com</Text> 一行一个），收件箱会自己补进去。
   </>
 );
 
@@ -177,6 +183,7 @@ function ImportPanel({ onImported }) {
             { value: "graph", label: "Microsoft Graph" },
             { value: "imap", label: "IMAP" },
             { value: "hme", label: "iCloud HME" },
+            { value: "alias-imap", label: "iCloud 别名（Gmail 取件）" },
           ]}
         />
         <Button type="primary" icon={<UploadOutlined />} loading={busy}

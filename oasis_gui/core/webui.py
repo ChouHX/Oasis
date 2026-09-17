@@ -320,6 +320,10 @@ class WebAdmin:
             lines = split_lines((body or {}).get("lines") or "")
             if not lines:
                 return self._json(400, {"error": "没有可导入的行"})
+            try:
+                lines = self._expand_aliases(lines)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
             protocol = (body or {}).get("protocol") or "auto"
             added, dup = self.store.add_mailboxes(lines, protocol)
             self.log("info", f"web: imported {added} account(s), {dup} duplicate")
@@ -385,6 +389,36 @@ class WebAdmin:
         if not path.startswith("/api/"):
             return self._page()
         return self._json(404, {"error": "not found"})
+
+    def _expand_aliases(self, lines):
+        """Complete bare iCloud alias addresses into full credential lines.
+
+        Pasting the alias list is how this pool actually gets built, and the
+        inbox address and app password are identical on every line: making the
+        operator repeat them is noise, and one typo in one of them is a mailbox
+        that silently never receives anything. So a line that is nothing but an
+        iCloud address is filled in from the configured inbox.
+
+        Raises ValueError with something the operator can act on when no inbox
+        has been configured yet, rather than importing rows that cannot be read.
+        """
+        inbox = (self.config.get("alias_inbox") or "").strip()
+        secret = (self.config.get("alias_inbox_password") or "").strip()
+        out = []
+        for raw in lines:
+            line = raw.strip()
+            if line and "----" not in line and "@" in line:
+                domain = line.rsplit("@", 1)[-1].lower()
+                if domain in mailbox.HME_ICLOUD_DOMAINS:
+                    if not (inbox and secret):
+                        raise ValueError(
+                            f"{line} 是 iCloud 别名，要先在「设置」里填收件的 "
+                            f"Gmail 地址和应用专用密码；或者用完整格式 "
+                            f"别名----gmail地址----应用专用密码----gmail-imap")
+                    out.append(f"{line}----{inbox}----{secret}----gmail-imap")
+                    continue
+            out.append(raw)
+        return out
 
     def _icloud_catalog(self):
         """Aliases on the iCloud service, flagged with what is already imported.

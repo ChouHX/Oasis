@@ -39,9 +39,16 @@ DEFAULTS = {
     "google_proxy": "",
     # Mailbox fetches go direct unless this is set.
     "mail_proxy": "",
-    # --- iCloud Hide-My-Email service (see core/mailbox.HmeMailbox) --------
+    # --- iCloud Hide-My-Email service (see core.mailbox.HmeMailbox) --------
     "hme_base": "http://127.0.0.1:8081",
     "hme_password": "",
+    # --- iCloud aliases read through Gmail (see core.mailbox.GmailAliasMailbox)
+    # An alias is only a forwarding address: what is sent to it lands in the
+    # Gmail account that owns the Apple ID, so one inbox credential covers the
+    # whole alias list. Paste bare alias addresses at import time and these fill
+    # in the rest of the credential line.
+    "alias_inbox": "",
+    "alias_inbox_password": "",
     # --- timeouts ----------------------------------------------------------
     # How long to wait for the verification mail.
     "link_timeout": 300,

@@ -27,6 +27,12 @@ const FIELDS = [
   { key: "hme_base", label: "iCloud 服务地址", type: "text", wide: true,
     hint: "容器里要用 host.docker.internal，不是 127.0.0.1。" },
   { key: "hme_password", label: "iCloud 密码", type: "password", wide: true },
+  { key: "alias_inbox", label: "别名收件箱（Gmail）", type: "text", wide: true,
+    hint: "iCloud 隐私邮箱只是转发地址：发给它的信会落到 Apple ID 绑定的那个 Gmail 里，" +
+          "所以一个收件箱覆盖整份别名列表。填 Gmail 地址后，导入页可以直接粘贴纯别名，" +
+          "取件走上面的「取件代理」。" },
+  { key: "alias_inbox_password", label: "Gmail 应用专用密码", type: "password", wide: true,
+    hint: "不是 Google 登录密码。在 Gmail 设置里生成应用专用密码，并确认已开启 IMAP。" },
   { key: "front_proxy", label: "前置代理（链路）", type: "text", wide: true },
   { key: "google_proxy", label: "Google 分流代理", type: "text", wide: true,
     hint: "浏览器模式必须能访问 Google（reCAPTCHA 在上面）。注册代理不通 Google 时填一个能通的。" },

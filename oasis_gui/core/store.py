@@ -157,6 +157,14 @@ class Store:
         if not raw or raw.startswith("#"):
             return None
         parts = [p.strip() for p in raw.split("----")]
+        # iCloud Hide-My-Email read through Gmail:
+        #   alias@icloud.com----<the gmail that owns the Apple ID>----<app password>----gmail-imap
+        # The gmail address rides in client_id and the app password in password -
+        # both columns exist, and the reader needs nothing else.
+        if len(parts) >= 3 and parts[-1].lower() in ("gmail-imap", "alias-imap"):
+            return {"email": parts[0], "client_id": parts[1],
+                    "password": parts[2], "refresh_token": "",
+                    "_protocol": "alias-imap"}
         # iCloud Hide-My-Email: alias@icloud.com----acc_xxxxxxxx----hme
         if len(parts) >= 2 and parts[-1].lower() == "hme":
             # the HME account id goes in client_id: add_mailbox persists that
@@ -177,15 +185,17 @@ class Store:
         """Bulk import credential lines.
 
         The whole batch shares one fetch protocol (graph or imap), chosen at
-        import time. Gmail lines carry an extra field and are recognised by
-        shape, so a mixed batch imports cleanly.
+        import time - except for the lines that carry their own. Gmail lines are
+        recognised by shape, and an iCloud alias read through Gmail names its
+        reader in the line itself, so a mixed batch imports cleanly and each row
+        ends up with the protocol that can actually read it.
         """
         added, dup = 0, 0
         for raw in lines:
             cred = self.parse_line(raw)
             if not cred:
                 continue
-            _, created = self.add_mailbox(cred, protocol)
+            _, created = self.add_mailbox(cred, cred.get("_protocol") or protocol)
             added += 1 if created else 0
             dup += 0 if created else 1
         return added, dup
@@ -377,10 +387,23 @@ class Store:
         return f"{base}{row['refresh_token']}"
 
     def cred_lines(self):
-        """Current credential lines, for exporting the working set."""
-        return [self._cred_line(r) for r in self.conn().execute(
-            "SELECT email,password,client_id,client_secret,refresh_token "
-            "FROM accounts WHERE refresh_token <> '' ORDER BY id")]
+        """Current credential lines, for exporting the working set.
+
+        Written in the shape that imports back in. An iCloud alias read through
+        Gmail has no refresh token at all - its credential is the inbox address
+        and the app password - so it gets its own form instead of being skipped
+        by the refresh_token test or written as a Microsoft line.
+        """
+        out = []
+        for r in self.conn().execute(
+                "SELECT email,password,client_id,client_secret,refresh_token,"
+                "protocol FROM accounts ORDER BY id"):
+            if r["protocol"] == "alias-imap":
+                out.append(f"{r['email']}----{r['client_id'] or ''}----"
+                           f"{r['password'] or ''}----gmail-imap")
+            elif r["refresh_token"]:
+                out.append(self._cred_line(r))
+        return out
 
     def cred_line_for(self, account_id):
         row = self.conn().execute(
