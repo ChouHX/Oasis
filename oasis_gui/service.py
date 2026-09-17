@@ -409,14 +409,17 @@ def main():
         # read per round, so a change made in the web UI applies from the
         # next round without a restart
         threads = int(conf.get("threads") or 1)
-        log("info", f"round {rounds}: {pending} pending, {threads} worker(s)")
+        limit = int(conf.get("limit") or 0)
+        log("info", f"round {rounds}: {pending} pending, {threads} worker(s)"
+                    + (f", 上限 {limit} 个" if limit else ""))
         try:
             # Everything here is read fresh each round, so a change made in the
             # web UI applies from the next round without a restart.
             engine.start(threads=threads, order=conf.get("shows"),
                          link_timeout=int(conf.get("link_timeout") or 240),
                          delay_between=float(conf.get("delay_between") or 0),
-                         mode=conf.get("mode"))
+                         mode=conf.get("mode"),
+                         limit=int(conf.get("limit") or 0))
             while engine.busy and not STOP.is_set():
                 time.sleep(1)
             if STOP.is_set():

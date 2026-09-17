@@ -344,8 +344,10 @@ class WebAdmin:
                 return self._json(400, {"error": "threads must be > 0"})
             if self.controller.running():
                 return self._json(409, {"error": "engine already running"})
+            limit = int((body or {}).get("limit") or 0)
             self.config.data["threads"] = threads
             self.config.data["mode"] = mode
+            self.config.data["limit"] = max(0, limit)
             self.config.save()
             self.controller.start(threads, mode)
             return self._json(200, {"ok": True})

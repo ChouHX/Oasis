@@ -34,6 +34,10 @@ DEFAULTS = {
     # --- what to run -------------------------------------------------------
     "mode": "browser",
     "threads": 4,
+    # Cap on how many accounts a round touches; 0 = the whole queue. Meant for
+    # trying a change on one or two accounts before letting it loose on the
+    # pool, where a mistake costs accounts.
+    "limit": 0,
     "shows": ["knebworth", "slane", "glasgow"],
     "delay_between": 0.0,          # pause after each account; 0 = none
     # --- proxy pool --------------------------------------------------------

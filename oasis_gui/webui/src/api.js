@@ -32,7 +32,7 @@ export const api = {
   proxies: () => call("/api/proxies"),
   saveProxies: (lines) => call("/api/proxies", { method: "POST", body: { lines } }),
   log: (since) => call(`/api/log?since=${since}`),
-  start: (threads, mode) => call("/api/start", { method: "POST", body: { threads, mode } }),
+  start: (threads, mode, limit = 0) => call("/api/start", { method: "POST", body: { threads, mode, limit } }),
   stop: () => call("/api/stop", { method: "POST" }),
   saveConfig: (patch) => call("/api/config", { method: "POST", body: patch }),
   resetAccounts: () => call("/api/accounts/reset", { method: "POST" }),

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Card, Row, Col, Statistic, Button, InputNumber, Select, Space, Typography,
-  Tag, App as AntApp, Checkbox,
+  Tag, Tooltip, App as AntApp, Checkbox,
 } from "antd";
-import { CaretRightOutlined, PauseOutlined, ClearOutlined } from "@ant-design/icons";
+import {
+  CaretRightOutlined, PauseOutlined, ClearOutlined, QuestionCircleOutlined,
+} from "@ant-design/icons";
 import { api, STATUS, SHOW_LABEL } from "../api.js";
 
 const { Text } = Typography;
@@ -92,6 +94,7 @@ export default function Dashboard({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [threads, setThreads] = useState(2);
   const [mode, setMode] = useState("browser");
+  const [limit, setLimit] = useState(0);
   const [shows, setShows] = useState(["glasgow", "manchester", "paris"]);
   const [busy, setBusy] = useState(false);
 
@@ -111,6 +114,7 @@ export default function Dashboard({ state, refresh }) {
     seeded.current = true;
     if (c.threads) setThreads(c.threads);
     if (c.mode) setMode(c.mode);
+    if (c.limit !== undefined) setLimit(c.limit || 0);
     if (Array.isArray(c.shows) && c.shows.length) setShows(c.shows);
   }, [state?.config]);
 
@@ -139,6 +143,12 @@ export default function Dashboard({ state, refresh }) {
   const changeMode = (v) => {
     setMode(v);
     persist({ mode: v });
+  };
+
+  const changeLimit = (v) => {
+    const n = Math.max(0, v || 0);
+    setLimit(n);
+    persist({ limit: n });
   };
 
   const saveShows = async () => {
@@ -221,6 +231,16 @@ export default function Dashboard({ state, refresh }) {
                          disabled={state?.running} />
           </Space>
           <Space size={6}>
+            <Text type="secondary">上限</Text>
+            <InputNumber min={0} max={100000} value={limit}
+                         onChange={changeLimit}
+                         disabled={state?.running}
+                         style={{ width: 104 }} />
+            <Tooltip title="本轮最多处理几个账号，0 表示不限。想先拿一两条试手时用它。">
+              <QuestionCircleOutlined style={{ color: "#8c8c8c" }} />
+            </Tooltip>
+          </Space>
+          <Space size={6}>
             <Text type="secondary">模式</Text>
             <Select
               value={mode}
@@ -238,7 +258,7 @@ export default function Dashboard({ state, refresh }) {
             icon={<CaretRightOutlined />}
             loading={busy}
             disabled={state?.running}
-            onClick={() => run(() => api.start(threads, mode), "已启动")}
+            onClick={() => run(() => api.start(threads, mode, limit), "已启动")}
           >
             开始注册
           </Button>

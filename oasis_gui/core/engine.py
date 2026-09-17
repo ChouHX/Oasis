@@ -48,6 +48,9 @@ class Engine:
         self._running = False
         self._lock = threading.Lock()
         self._done = 0
+        # Per-round cap on how many accounts to touch; 0 means no cap.
+        self._limit = 0
+        self._claimed = 0
         # browser mode needs the relay's Google split routing
         self.relays = RelayPool(log=lambda m: self._log("debug", m))
         self.browser = BrowserRegistrar(
@@ -227,7 +230,7 @@ class Engine:
 
     # ------------------------------------------------------------------- control
     def start(self, threads=4, order=None, link_timeout=300,
-              delay_between=0.0, mode="browser"):
+              delay_between=0.0, mode="browser", limit=0):
         if self._running:
             self._log("warn", "engine already running")
             return
@@ -241,10 +244,16 @@ class Engine:
             return
 
         self._stop.clear()
+        self._limit = max(0, int(limit or 0))
+        self._claimed = 0
         self._transient_left = max(TRANSIENT_PER_ROUND, threads)
         with self._lock:
             self._mail_since.clear()
-        self._start_prefetcher(threads)
+        if self._limit:
+            self._log("info", f"本轮最多处理 {self._limit} 个账号"
+                              f"（队列里有 {pending} 个）")
+        self._start_prefetcher(threads if not self._limit
+                               else min(threads, self._limit))
         self._running = True
         self._done = 0
         # Relays are per-upstream and cached; drop them so a changed
@@ -291,6 +300,23 @@ class Engine:
         self.relays.stop_all()
 
     # -------------------------------------------------------------------- worker
+    def _take_slot(self):
+        """Take one of this round's account slots, when a limit is set.
+
+        A limit of 0 means "no limit" and costs nothing. The slot is taken
+        before the account is claimed, so the number is what the round started
+        with rather than what it managed to finish: a run whose accounts keep
+        failing would otherwise never reach the count the operator asked to try
+        with, which defeats the point of trying with a count.
+        """
+        if not self._limit:
+            return True
+        with self._lock:
+            if self._claimed >= self._limit:
+                return False
+            self._claimed += 1
+            return True
+
     def _worker(self, wid, order, link_timeout, delay_between, mode):
         rnd = random.Random()
         tag = f"w{wid}"
@@ -304,6 +330,9 @@ class Engine:
     def _loop(self, wid, tag, rnd, order, link_timeout, delay_between,
               mode):
         while not self._stop.is_set():
+            if not self._take_slot():
+                self._log("info", f"{tag}: 本轮已跑满 {self._limit} 个，worker 退出")
+                break
             rows = self.store.claim_pending(1)
             if not rows:
                 self._log("info", f"{tag}: queue empty, worker exits")
