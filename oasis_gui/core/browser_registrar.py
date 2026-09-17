@@ -1100,9 +1100,16 @@ class BrowserRegistrar:
             page.keyboard.press("Tab")
             # Either the error shows up (fast) or it never does; either way we
             # are done in ~0.7s instead of always paying 1.2s.
+            #
+            # Both messages matter, and only one was checked before. Measured on
+            # a live run: with the form freshly reloaded the component sometimes
+            # drops the value again, and the page then says "Phone number is
+            # required" - which this probe did not look for, so it reported
+            # success and the whole details step died one step later.
             bad = self._settle(
-                page, "() => document.body.innerText"
-                      ".includes('Please enter a valid phone number')", 700)
+                page, "() => {const t = document.body.innerText;"
+                      "return t.includes('Please enter a valid phone number')"
+                      " || t.includes('Phone number is required');}", 700)
             if not bad:
                 break
             log(f"    phone attempt {attempt + 1} rejected "
@@ -1327,9 +1334,19 @@ class BrowserRegistrar:
         if not submit:
             raise BrowserRegistrationError("no submit button on the T&C page")
         submit.click()
-        page.wait_for_function(
-            "() => document.body.innerText.toLowerCase()"
-            ".includes('thanks for registering')", timeout=90000)
+        try:
+            page.wait_for_function(
+                "() => document.body.innerText.toLowerCase()"
+                ".includes('thanks for registering')", timeout=90000)
+        except Exception as e:
+            # What the page is showing right now is the only evidence of why the
+            # submit did not land - a reCAPTCHA that never loaded looks exactly
+            # like a rejected submission otherwise, and both look like a bare
+            # timeout. Carry it out in the error instead of losing it.
+            raise BrowserRegistrationError(
+                "submitted but the page never said 'thanks for registering' "
+                "within 90s; page says: "
+                + " ".join(page.inner_text("body").split())[:400]) from e
         page.wait_for_timeout(1500)
         # Hand back what was actually chosen. The SPA builds its own request
         # body, so this is the only record of the answers; without it the row
