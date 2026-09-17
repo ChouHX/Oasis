@@ -1301,6 +1301,17 @@ class BrowserRegistrar:
         browser mode is measured not to send the success mail.
         """
         page.wait_for_selector("#soundcheckConfirmFirstName", timeout=90000)
+        # Let the reCAPTCHA client arrive before touching the form.
+        #
+        # It loads asynchronously, and the page will not leave this step without
+        # it. Checking only after a failed Continue means judging it at the worst
+        # possible moment - the client may simply not have finished loading, and
+        # the account gets blamed for a slow script. Waiting here also gives the
+        # "reCAPTCHA never loaded" diagnosis a fair chance to be true.
+        deadline = time.time() + 25
+        while time.time() < deadline and not self._recaptcha_ready(page):
+            page.wait_for_timeout(500)
+        log(f"    recaptcha ready: {self._recaptcha_ready(page)}")
         last_shown = []
         for attempt in range(2):
             if attempt and mail_url:
