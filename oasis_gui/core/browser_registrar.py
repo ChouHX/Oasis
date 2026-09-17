@@ -1256,6 +1256,21 @@ class BrowserRegistrar:
         except Exception:
             return False
 
+    @staticmethod
+    def _recaptcha_ready(page):
+        """Is the page's reCAPTCHA client actually loaded and usable?
+
+        The SPA needs a token from it before it will leave the details step, and
+        when the script never arrived the page simply sits there. Checked before
+        blaming the form.
+        """
+        try:
+            return bool(page.evaluate(
+                "() => !!(window.grecaptcha && window.grecaptcha.enterprise"
+                " && typeof window.grecaptcha.enterprise.execute === 'function')"))
+        except Exception:
+            return False
+
     def _pick_show(self, page, venue, log):
         """Pick one venue in the preference multiselect, by its city name."""
         want = registrar.SHOW_META.get(venue, ("", "", ""))[1].lower()
@@ -1286,6 +1301,7 @@ class BrowserRegistrar:
         browser mode is measured not to send the success mail.
         """
         page.wait_for_selector("#soundcheckConfirmFirstName", timeout=90000)
+        last_shown = []
         for attempt in range(2):
             if attempt and mail_url:
                 # Start the step over on a freshly loaded page. Measured: the
@@ -1297,6 +1313,17 @@ class BrowserRegistrar:
                 page.goto(mail_url, wait_until="domcontentloaded",
                           timeout=self.browser_timeout * 1000)
                 page.wait_for_selector("#soundcheckConfirmFirstName", timeout=60000)
+                # A fresh number on the outer retry too. The inner loop does draw
+                # new ones, but only once it decides the field is unhappy - and
+                # measured, the page sometimes says so only after Continue, by
+                # which point the inner loop has already finished and this one is
+                # about to hand the site the same number it just refused.
+                if "Please enter a valid phone number" in last_shown:
+                    ident = dict(ident)
+                    ident["phone"] = ident_mod.random_phone(
+                        random.Random(),
+                        (ident.get("location") or {}).get("countryCode", "US"))
+                    log(f"    retrying with a fresh number {ident['phone']}")
             self._fill_details(page, ident, log)
             if self._click_continue(page, until="cities", timeout=60):
                 break
@@ -1305,6 +1332,23 @@ class BrowserRegistrar:
                                  "Location is required", "Phone number is required",
                                  "Name is required", "Date of birth is required")
                      if m in body]
+            last_shown = shown
+            # A form that neither advances nor complains is nearly always a
+            # reCAPTCHA that never loaded: the page needs a token before it will
+            # move on, and it says nothing at all when it cannot get one. Caught
+            # live - the console showed "reCAPTCHA script failed to load -
+            # marked as blocked by content blocker" and window.grecaptcha was
+            # undefined while every field held the right value and the Continue
+            # button was enabled. Without this check the whole thing reads as
+            # "the form silently refuses", which sends you looking at the phone
+            # field for a day.
+            if not shown and not self._recaptcha_ready(page):
+                raise TransientError(
+                    "reCAPTCHA 没有加载，页面因此不会前进（字段都填对了，"
+                    "Continue 也可点，但页面需要 captcha token 才肯走）。"
+                    "说明 Google 在当前出口上不可达 —— "
+                    "给「Google 分流代理」填一个能访问 www.google.com 的出口。"
+                    "这不是账号的问题，账号未消耗。")
             log(f"    details rejected ({shown or 'no message'}), "
                 f"retry {attempt + 1} on a fresh page")
             if attempt == 1:
