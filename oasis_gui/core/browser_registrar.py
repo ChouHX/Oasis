@@ -450,6 +450,9 @@ class _SharedBrowser:
         # them does not pay for the refusal on every account.
         self._preferred = None
         self._home_noted = False
+        # For eviction: the least recently handed-out browser is the one to
+        # close when the cap is reached.
+        self.last_used = 0.0
         # RLock: endpoint() holds this while starting, and callers may already
         # hold it (see BrowserRegistrar._shared_browser) to close the race where
         # two workers both see "not started yet" and each launch a browser.
@@ -458,6 +461,7 @@ class _SharedBrowser:
     def endpoint(self):
         """Start chromium if needed; return the CDP http endpoint."""
         with self._lock:
+            self.last_used = time.time()
             if self.proc and self.proc.poll() is None:
                 return f"http://127.0.0.1:{self.port}"
             self._start()
@@ -771,7 +775,8 @@ class BrowserRegistrationError(Exception):
 class BrowserRegistrar:
     """One browser session per registration."""
 
-    def __init__(self, relay_pool, headless=True, browser_timeout=90, log=None):
+    def __init__(self, relay_pool, headless=True, browser_timeout=90, log=None,
+                 max_browsers=3):
         self.relays = relay_pool
         self.headless = headless
         self.browser_timeout = browser_timeout
@@ -785,6 +790,9 @@ class BrowserRegistrar:
         # How many workers are standing on each shared browser. A worker that
         # failed to attach must not tear one down while someone is using it.
         self._shared_users = {}
+        # Ceiling on live browsers. The engine sets this to the thread count,
+        # which is the number of browsers that can actually be in use at once.
+        self._max_browsers = max(1, int(max_browsers or 1))
         # Set once the shared scheme has failed often enough to be called
         # broken on this host; every worker then launches its own browser.
         self._solo = False
@@ -803,17 +811,73 @@ class BrowserRegistrar:
     def _shared_browser(self, relay_url):
         """The single browser process for this proxy, guaranteed started.
 
-        Starting it inside the lock matters: a freshly built _SharedBrowser has
-        no process yet, so two workers arriving together would both read it as
-        dead and each launch one.
+        Everything slow happens outside the lock: starting chromium takes
+        seconds and eviction stops a process (up to ten more), while the lock is
+        held by every other worker looking for its own browser. The lock is also
+        not reentrant, so calling eviction from inside it deadlocks outright -
+        which is exactly what a first attempt at this did.
         """
         with self._shared_lock:
             shared = self._shared.get(relay_url)
-            if shared is None or not shared.alive():
-                shared = _SharedBrowser(relay_url, self.log)
-                self._shared[relay_url] = shared
-            shared.endpoint()           # idempotent; starts if needed
-            return shared
+            if shared is not None and shared.alive():
+                shared.endpoint()
+                return shared
+
+        self._evict_excess(keep=relay_url)
+
+        fresh = _SharedBrowser(relay_url, self.log)
+        with self._shared_lock:
+            existing = self._shared.get(relay_url)
+            if existing is not None and existing.alive():
+                shared = existing                  # another worker got there first
+            else:
+                self._shared[relay_url] = fresh
+                shared = fresh
+        if shared is not fresh:
+            try:
+                fresh.stop()
+            except Exception:
+                pass
+        shared.endpoint()
+        return shared
+
+    def cap_browsers(self, n):
+        """Set how many shared browsers may live at once, and trim to it.
+
+        One chromium per *proxy* is the wrong unit - the unit is one per worker,
+        because only a worker can be using one at a time. Measured on the
+        deployed box: ten proxies with three threads produced ten browsers at
+        ~210MB each and took a 3.8GB machine to the edge of OOM. Past the thread
+        count the extra browsers buy nothing; they exist only because a
+        different upstream happened to be dialled.
+        """
+        self._max_browsers = max(1, int(n or 1))
+        self._evict_excess()
+
+    def _evict_excess(self, keep=None):
+        """Close least-recently-used browsers until the cap is met.
+
+        Never closes one a worker is standing on: going over the cap for a
+        moment is survivable, killing the browser under someone's feet is not.
+        """
+        while True:
+            with self._shared_lock:
+                if len(self._shared) < self._max_browsers:
+                    return
+                idle = [(sb.last_used, url) for url, sb in self._shared.items()
+                        if url != keep and not self._shared_users.get(url)]
+                if not idle:
+                    return
+                _when, url = min(idle)
+                shared = self._shared.pop(url, None)
+            if shared is None:
+                return
+            self.log(f"    closing idle browser for {url} "
+                     f"(cap {self._max_browsers})")
+            try:
+                shared.stop()
+            except Exception:
+                pass
 
 
     def close_warm(self):

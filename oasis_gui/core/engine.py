@@ -264,6 +264,10 @@ class Engine:
             return
 
         self._stop.clear()
+        # One browser per worker, not one per proxy: only a worker can be using
+        # one at a time, and a pool of ten upstreams was turning into ten
+        # chromium processes at ~210MB each.
+        self.browser.cap_browsers(threads)
         self._limit = max(0, int(limit or 0))
         self._claimed = 0
         # One mail request per account this round will actually touch.
