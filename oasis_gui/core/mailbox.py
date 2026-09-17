@@ -929,11 +929,8 @@ class GmailAliasMailbox(ImapMailbox):
         self.timeout = timeout
         self._session = None
         self._session_at = 0.0
-        # Junk is checked at most this often, and only when the inbox was empty.
-        # A LIST plus a second SELECT+SEARCH is ~1.5s, and the poll loop runs
-        # every few seconds - doing it on every poll doubles the cost of the
-        # common case (mail not there yet) to catch a case that did not happen
-        # once across the aliases measured.
+        # Junk is checked at most this often, never on every poll: a second
+        # SELECT+SEARCH is ~0.5s and the poll loop runs every few seconds.
         self._junk_after = 0.0
         self._junk_folders = None
 
@@ -1055,12 +1052,16 @@ class GmailAliasMailbox(ImapMailbox):
         """Newest-first (body, stamp) pairs, for this alias only."""
         M = self._live()
         out = self._fetch_folder(M, "INBOX", limit, not_before)
-        if not out and time.time() >= self._junk_after:
+        # Junk is checked on a timer, not "only when the inbox was empty": these
+        # aliases receive plenty of unrelated mail - the inbox of one here holds
+        # 36 messages, including an LA28 draw confirmation - so an empty inbox
+        # is not the signal. Missing a verification mail that the provider filed
+        # as spam costs a whole account, and the check is one SELECT+SEARCH on a
+        # folder list that is already cached.
+        if time.time() >= self._junk_after:
             self._junk_after = time.time() + self._JUNK_EVERY
             for folder in self._junk(M):
-                out = self._fetch_folder(M, folder, limit, not_before)
-                if out:
-                    break
+                out += self._fetch_folder(M, folder, limit, not_before)
         out.sort(key=lambda pair: pair[1] or 0, reverse=True)
         return out[:limit]
 
