@@ -358,7 +358,7 @@ def main():
         srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
         threading.Thread(target=srv.serve_forever, daemon=True,
                          name="status-http").start()
-        log("info", f"admin UI on :{port}  (/, /health, /stats)")
+        log("info", f"admin UI on :{port}  (/, /health)")
 
     def shutdown(signum, _frame):
         log("info", f"signal {signum}: draining workers, then exiting")

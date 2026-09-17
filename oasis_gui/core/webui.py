@@ -21,6 +21,7 @@ import time
 import urllib.parse
 from http.cookies import SimpleCookie
 from core import mailbox, registrar
+from core.browser_registrar import _build_stamp
 
 from http.server import BaseHTTPRequestHandler
 
@@ -47,7 +48,7 @@ npm install
 npm run build</pre>
 <p>或者直接用生产镜像（CI 已经构建并发布）：</p>
 <pre>docker compose pull &amp;&amp; docker compose up -d</pre>
-<p>只有 API 是就绪的：<code>/api/state</code>、<code>/health</code>、<code>/stats</code>。</p>
+<p>只有 API 是就绪的：<code>/api/state</code>、<code>/health</code>。</p>
 </div></body></html>"""
 # 12h: long enough to be convenient from a phone, short enough that a leaked
 # cookie stops working the same day.
@@ -190,6 +191,14 @@ class WebAdmin:
         hit = self._static(path)
         if hit:
             return hit
+
+        # Liveness, and the one endpoint that answers "which image is this?".
+        # Unauthenticated on purpose: the container healthcheck polls it before
+        # any password exists in the request, and it carries nothing but the
+        # build stamp. It used to fall through to the login page, so the
+        # healthcheck was parsing HTML as JSON and failing forever.
+        if path == "/health":
+            return self._json(200, {"ok": True, "build": _build_stamp()})
 
         if path == "/login" and method == "POST":
             return self._login(body)
