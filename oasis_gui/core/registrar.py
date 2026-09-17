@@ -142,6 +142,23 @@ class RegistrationError(Exception):
     """The site refused this registration. Retrying the same account is pointless."""
 
 
+class RegistrationClosed(RegistrationError):
+    """The site has already closed this registration session.
+
+    Read off the token: check-verification answers with claims carrying `closed`.
+    Measured across six addresses - the four that kept failing all came back
+    `closed: true`, while the one that registered and the one that was merely
+    unfinished both came back `closed: false`.
+
+    A closed session still renders the page, but without a usable form, so
+    filling it in and pressing Continue neither advances nor complains. That is
+    exactly the "details step did not advance; page says nothing" in the log,
+    and none of it is retryable: the address has been dealt with (by us or by
+    hand) or the site retired the session. Retrying only pushes the account
+    round the queue for ever.
+    """
+
+
 class TransientError(Exception):
     """A failure that says nothing about the account.
 
@@ -361,6 +378,11 @@ def check_verification(session, token, log=print):
     claims = data.get("claims") or {}
     if not claims.get("emailValid"):
         raise RegistrationError(f"emailValid false: {claims}")
+    if claims.get("closed"):
+        raise RegistrationClosed(
+            f"站点已关闭该会话（closed=true, "
+            f"session={claims.get('sessionId')}）：该地址已处理过，"
+            f"或站点因重复请求作废了它")
     return data.get("token") or token, claims
 
 

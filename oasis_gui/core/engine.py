@@ -501,6 +501,20 @@ class Engine:
                     self._log("error", "本轮传输失败过多（代理池可能整体不可用），"
                                        "提前结束本轮，交由外层退避")
                     self.stop()
+            except registrar.RegistrationClosed as e:
+                # The site has already closed this session, so the form renders
+                # without accepting anything. Measured: every address that kept
+                # failing came back closed=true from check-verification, while
+                # the one that registered came back false. Nothing to retry and
+                # nothing wrong with the exit - record it once and move on. Left
+                # as 'submitted' rather than 'failed' because the address really
+                # has been dealt with (here or by hand); because it is no longer
+                # 'pending' the queue will not pick it up again.
+                err = str(e)[:300]
+                self.store.mark_submitted(account_id, err)
+                self._log("warn", f"{tag}: {acct['email']} 站点已关闭该会话，"
+                                  f"不再重试 - {err[:120]}")
+                self._emit("closed", {"email": acct["email"], "reason": err})
             except Exception as e:
                 err = str(e)[:300]
                 self.store.fail(account_id, err)

@@ -1500,6 +1500,13 @@ class BrowserRegistrar:
             claims = data.get("claims") or {}
             if not claims.get("emailValid"):
                 raise BrowserRegistrationError(f"emailValid false: {claims}")
+            if claims.get("closed"):
+                # The form will render without ever accepting a submission, and
+                # the page says nothing about why - see RegistrationClosed.
+                raise registrar.RegistrationClosed(
+                    f"站点已关闭该会话（closed=true, "
+                    f"session={claims.get('sessionId')}）：该地址已处理过，"
+                    f"或站点因重复请求作废了它")
             token = data.get("token") or token
             url = f"{registrar.RETURN_URL}?token={token}"
             log(f"  [{mailbox.email}] emailValid=true "
