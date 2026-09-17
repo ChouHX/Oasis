@@ -3,23 +3,30 @@
 import json
 import os
 
-# Modes the engine accepts. A config written by an older build may still say
-# "http" or "hybrid"; load() coerces anything unrecognised to "browser" rather
-# than letting the engine abort on an unknown mode.
+# Modes the engine accepts.
 #
-# Only the browser flow is carried.
+# A config written by an older build may still say "hybrid"; that flow is gone
+# for good and anything unrecognised is coerced to "browser" rather than letting
+# the engine abort on an unknown mode.
 #
-# A hybrid flow used to live here: mint a real captcha in a warm browser, then
-# submit with curl_cffi. It is gone, but be precise about why - curl itself was
-# not the problem. Measured 2026-09-16: a captcha-less curl_cffi submission
-# completed six registrations, while a browser-minted captcha replayed through
-# curl_cffi never did. The token appears to be bound to the client that minted
-# it, so pairing the two halves fails.
+# "browser" drives the official SPA in Chromium. It is the strong flow: the page
+# builds its own request body (location.county from radar.io, `ip` from
+# Cloudflare's trace) and mints its own reCAPTCHA token, so the request the site
+# sees is the one a real visitor sends. It costs a browser and about 25-75s per
+# account, and it is the only flow that can read the page's own confirmation.
 #
-# The stronger reason to drive the SPA is that the SPA builds its own request
-# body: location.county from radar.io and `ip` from Cloudflare's trace are
-# filled in by the page, and a hand-built body cannot reproduce them.
-VALID_MODES = ("browser",)
+# "http" issues the same calls with curl_cffi and sends the captcha field EMPTY.
+# Measured 2026-09-16 on this endpoint: empty completes the registration and the
+# success mail arrives, while a real token minted in Chromium and replayed from
+# curl never once did - a reCAPTCHA Enterprise token is bound to the client that
+# minted it, so the empty string is not a shortcut around the captcha, it is the
+# better half of that trade. Cheaper and faster (no browser at all), but nothing
+# renders, so the success mail is the only evidence it worked.
+#
+# The hybrid flow that used to live here - mint a real captcha in a warm browser,
+# then submit with curl_cffi - is gone: pairing the two halves failed every time
+# for the reason above.
+VALID_MODES = ("browser", "http")
 
 DEFAULTS = {
     # --- where things live -------------------------------------------------

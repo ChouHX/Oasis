@@ -91,16 +91,20 @@ const SHOW_ORDER = ["glasgow", "manchester", "paris", "munich", "barcelona",
 export default function Dashboard({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [threads, setThreads] = useState(2);
+  const [mode, setMode] = useState("browser");
   const [shows, setShows] = useState(["glasgow", "manchester", "paris"]);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!state?.config) return;
     if (state.config.threads) setThreads(state.config.threads);
+    // Remember the mode that was last used, so starting a run does not quietly
+    // switch the operator back to the other flow.
+    if (state.config.mode) setMode(state.config.mode);
     if (Array.isArray(state.config.shows) && state.config.shows.length) {
       setShows(state.config.shows);
     }
-  }, [state?.config?.threads, state?.config?.shows]);
+  }, [state?.config?.threads, state?.config?.shows, state?.config?.mode]);
 
   const stats = state?.stats || {};
   const host = state?.host || {};
@@ -183,12 +187,25 @@ export default function Dashboard({ state, refresh }) {
             <InputNumber min={1} max={64} value={threads} onChange={setThreads}
                          disabled={state?.running} />
           </Space>
+          <Space size={6}>
+            <Text type="secondary">模式</Text>
+            <Select
+              value={mode}
+              onChange={setMode}
+              disabled={state?.running}
+              style={{ width: 220 }}
+              options={[
+                { value: "browser", label: "浏览器（SPA 全流程）" },
+                { value: "http", label: "纯 HTTP（curl，captcha 留空）" },
+              ]}
+            />
+          </Space>
           <Button
             type="primary"
             icon={<CaretRightOutlined />}
             loading={busy}
             disabled={state?.running}
-            onClick={() => run(() => api.start(threads, "browser"), "已启动")}
+            onClick={() => run(() => api.start(threads, mode), "已启动")}
           >
             开始注册
           </Button>

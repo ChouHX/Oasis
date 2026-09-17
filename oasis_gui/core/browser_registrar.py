@@ -739,14 +739,9 @@ def _browser_env():
 SOLO_AFTER = 2
 
 
-class TransientError(Exception):
-    """A failure that says nothing about the account.
-
-    Dead proxy, dropped connection, relay out of upstreams - the account is
-    untouched and should go back in the queue rather than be written off. Kept
-    separate from BrowserRegistrationError so the engine can tell "this account
-    was refused" from "this attempt never reached the site".
-    """
+# TransientError lives in registrar: both flows raise it, and only one of them
+# involves a browser. Re-exported here so existing imports keep working.
+from .registrar import RegistrationError, TransientError   # noqa: F401,E402
 
 
 # Substrings Chromium and the relay use for transport failures. Matched against

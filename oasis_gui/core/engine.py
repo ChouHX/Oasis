@@ -267,7 +267,8 @@ class Engine:
         except Exception as e:
             self._log("warn", f"page resolve 跳过（{type(e).__name__}: "
                               f"{str(e)[:70]}），沿用内置的 artist/page id")
-        label = "浏览器 (驱动官方 SPA 全流程)"
+        label = ("纯 HTTP (curl_cffi，captcha 留空)" if mode == "http"
+                 else "浏览器 (驱动官方 SPA 全流程)")
         gp = self.relays.google_fallback or "不分流（全部走上游）"
         self._log("info", f"engine start: {threads} threads, {pending} pending, "
                           f"mode={label}, google={gp}, shows {' > '.join(order)}")
@@ -366,19 +367,25 @@ class Engine:
             vok = bool(self.config.get("verify_success", False))
             vto = int(self.config.get("success_timeout", 180) or 180)
             try:
-                self._log("info", f"{tag}: {acct['email']} | mode=browser | "
+                self._log("info", f"{tag}: {acct['email']} | mode={mode} | "
                                   f"mail={protocol} | proxy={proxy.split('@')[-1]}")
                 # Transport failures say nothing about the account, so a retry
                 # here is cheap insurance against one dead connection costing a
                 # queue pass. Anything the site itself decides is not retried.
                 for attempt in range(TRANSIENT_RETRIES + 1):
                     try:
-                        result = self.browser.register(
-                            mailbox, ident, order, proxy_url=proxy,
-                            link_timeout=link_timeout,
-                            verify_success=vok, success_timeout=vto,
-                            mail_since=self._take_mail_since(acct["email"]),
-                            log=lambda m: self._log("info", f"{tag} {m.strip()}"))
+                        if mode == "http":
+                            result = self._register_http(
+                                mailbox, ident, order, proxy, link_timeout, vto,
+                                self._take_mail_since(acct["email"]),
+                                log=lambda m: self._log("info", f"{tag} {m.strip()}"))
+                        else:
+                            result = self.browser.register(
+                                mailbox, ident, order, proxy_url=proxy,
+                                link_timeout=link_timeout,
+                                verify_success=vok, success_timeout=vto,
+                                mail_since=self._take_mail_since(acct["email"]),
+                                log=lambda m: self._log("info", f"{tag} {m.strip()}"))
                         break
                     except TransientError as e:
                         self.pool.report(proxy, False, str(e))
@@ -459,6 +466,39 @@ class Engine:
                 self._emit("stats", self.store.stats())
                 if delay_between:
                     time.sleep(delay_between)
+
+    def _register_http(self, mailbox, ident, order, proxy, link_timeout,
+                       success_timeout, mail_since, log=print):
+        """The whole registration over curl_cffi, with no browser in it.
+
+        Dials the same local relay the browser flow uses, so the traffic leaves
+        from the same place and only the client differs. The success mail is
+        always waited for here: nothing renders in this mode, so unlike the
+        browser flow there is no page to confirm the registration first, and
+        `verify_success` (which exists to decide whether a page-confirmed
+        registration is worth waiting on) has nothing to say about it.
+        """
+        relay = self.relays.get(proxy)
+        session = registrar.make_session(relay.url, timeout=90)
+        try:
+            return registrar.register_over_http(
+                session, mailbox, ident, order,
+                link_timeout=link_timeout, success_timeout=success_timeout,
+                mail_since=mail_since, log=log)
+        except registrar.RegistrationError:
+            raise
+        except Exception as e:
+            # The same split browser_registrar makes: a transport failure says
+            # nothing about the account and belongs back in the queue, while
+            # anything else is a real error worth seeing.
+            if registrar._is_transient(e):
+                raise TransientError(str(e)[:200]) from e
+            raise
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def finish(self):
         self._running = False
