@@ -90,6 +90,11 @@ class Store:
                       "NOT NULL DEFAULT 'graph'")
         if "client_secret" not in cols:
             c.execute("ALTER TABLE accounts ADD COLUMN client_secret TEXT")
+        if "mail_requested_at" not in cols:
+            # When the site was last asked for a verification mail for this
+            # address. Persisted because asking twice is actively harmful - see
+            # mark_mail_requested.
+            c.execute("ALTER TABLE accounts ADD COLUMN mail_requested_at REAL")
         rcols = {r["name"] for r in c.execute("PRAGMA table_info(registrations)")}
         if "mode" not in rcols:
             c.execute("ALTER TABLE registrations ADD COLUMN mode TEXT "
@@ -330,16 +335,42 @@ class Store:
             return [dict(r) for r in c.execute(sql + " LIMIT ?", (limit,))]
         return [dict(r) for r in c.execute(sql)]
 
+    def mail_requested(self, email):
+        """Epoch the verification mail was last asked for, or None.
+
+        Two reasons this is persisted rather than kept in memory. The site
+        answers a *repeat* request with a brand new session whose token comes
+        back `closed: true`, while the original session stays usable - so asking
+        again does not refresh anything, it just manufactures a session the
+        worker will pick up and fail on. And the pool outlives a restart, so an
+        in-memory record would let the next boot ask all over again.
+        """
+        row = self.conn().execute(
+            "SELECT mail_requested_at FROM accounts WHERE email=?",
+            (email,)).fetchone()
+        return row["mail_requested_at"] if row else None
+
+    def mark_mail_requested(self, email, when):
+        return self._write(lambda c: c.execute(
+            "UPDATE accounts SET mail_requested_at=? WHERE email=?",
+            (when, email)))
+
     def pending_emails(self, limit=20):
         """Oldest-first pending addresses, for the mail prefetcher.
 
         Deliberately minimal: the prefetcher only needs to know which addresses
         will be worked on next, and pulling whole rows (credentials included)
         on every poll would be wasteful.
+
+        Addresses already asked for are excluded outright. Asking a second time
+        is not a refresh - measured, the new session comes back closed=true and
+        the worker then fails on it, which is how a pool ends up with a dozen
+        dead sessions per address.
         """
         c = self.conn()
-        return [r["email"] for r in c.execute(
-            "SELECT email FROM accounts WHERE status='pending' "
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM accounts WHERE status='pending' "
+            "AND (mail_requested_at IS NULL OR mail_requested_at = 0) "
             "ORDER BY id LIMIT ?", (limit,))]
 
     def protocol_for(self, account_id):

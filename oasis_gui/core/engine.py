@@ -14,7 +14,7 @@ import traceback
 from . import identity as ident_mod
 from . import registrar
 from .browser_registrar import BrowserRegistrar, TransientError
-from .mailbox import make_mailbox
+from .mailbox import TOKEN_RE, make_mailbox
 from .relay import RelayPool
 
 
@@ -118,10 +118,17 @@ class Engine:
         with self._lock:
             self._mail_since.clear()
             self._mail_since.update(fresh)
-        for email in self.store.pending_emails(max(depth * 3, 6)):
+        for acct in self.store.pending_emails(max(depth * 3, 6)):
             if len(wanted) >= depth:
                 break
+            email = acct["email"]
             if email in fresh:
+                continue
+            # The prefetcher runs before any worker, so it is the first thing to
+            # touch a fresh address - and if it asks for a mail without looking,
+            # it manufactures the dead session the worker then fails on. Same
+            # rule as the worker: if the mail is already in the inbox, use it.
+            if self._mail_in_inbox(acct):
                 continue
             wanted.append(email)
         if not wanted:
@@ -144,6 +151,10 @@ class Engine:
                             return
                         self._prefetch_budget -= 1
                     self._mail_since[email] = time.time()
+                # Persisted as well: an in-memory record dies with the process,
+                # and the next boot would ask the site again - which costs the
+                # address its usable session rather than refreshing anything.
+                self.store.mark_mail_requested(email, self._mail_since[email])
                 try:
                     registrar.request_verification(
                         session, email,
@@ -164,23 +175,53 @@ class Engine:
             except Exception:
                 pass
 
-    def _take_mail_since(self, email):
-        """The epoch this account's mail was requested at, if still fresh.
+    def _ensure_mail_requested(self, mailbox, email, relay_url):
+        """Ask the site for this address's verification mail, once and once only.
 
-        Deliberately does NOT consume the entry. An account that is requeued and
-        tried again is the same account with the same mail already sitting in its
-        inbox, so asking the site for a second verification mail would be two
-        requests for one registration - which is the pattern an anti-abuse system
-        looks for, and it is what the deployed log showed: a stuck round fired
-        verification mails at fifteen different accounts while the workers got
-        nowhere. The entry ages out on its own, and after that a re-request is
-        the honest thing to do.
+        Measured: the site answers a repeat request with a brand new session
+        whose token reads `closed: true`, while the original session stays
+        usable. So a second request does not refresh anything - it manufactures
+        a session the worker will pick up and fail on, which is how a pool ends
+        up with a dozen dead sessions per address.
+
+        The timestamp lives in the store so this promise survives a restart.
+        Returns the epoch to use as `mail_since`, so the caller never has to
+        request it itself.
         """
-        with self._lock:
-            sent = self._mail_since.get(email)
-            if sent is not None and time.time() - sent >= PREFETCH_MAX_AGE:
-                self._mail_since.pop(email, None)
-                return None
+        sent = self.store.mail_requested(email)
+        if sent:
+            return sent
+
+        # Look before asking. An address imported today may already have been
+        # asked for a mail by an earlier build or by hand, and that mail is
+        # still sitting in the inbox with the only usable session attached to
+        # it. Asking again would not refresh it - it would add a dead session
+        # and leave the worker picking the newest mail, which is the dead one.
+        existing = self._existing_mail_time(mailbox, email)
+        if existing:
+            self.store.mark_mail_requested(email, existing)
+            self._log("info", f"{email} 的收件箱里已有验证邮件，直接用它"
+                              f"（不再向站点请求，重复请求会作废会话）")
+            return existing
+
+        session = registrar.make_session(relay_url, timeout=45)
+        try:
+            registrar.request_verification(
+                session, email, lambda m: self._log("debug", f"    {m.strip()}"))
+        except Exception as e:
+            # Nothing recorded, so the next attempt is free to try again.
+            self._log("debug", f"mail request for {email} failed: "
+                               f"{type(e).__name__}")
+            return None
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+        sent = time.time()
+        self.store.mark_mail_requested(email, sent)
+        self._log("info", f"已为 {email} 请求验证邮件（只请求一次，重复请求会"
+                          f"让站点把新会话标记为已关闭）")
         return sent
 
     # ------------------------------------------------------------------ helpers
@@ -353,6 +394,57 @@ class Engine:
             self._log("error", f"{tag}: worker crashed\n{traceback.format_exc()[-800:]}")
         self._log("info", f"{tag}: worker stopped ({self._done} ok so far)")
 
+    def _mail_in_inbox(self, acct):
+        """Is a verification mail for this account already sitting in its inbox?
+
+        Returns the arrival time and records it, or None. Costs one search, and
+        it is what keeps the prefetcher from re-asking for addresses that were
+        already asked for by an earlier run or by hand.
+        """
+        try:
+            mailbox = make_mailbox(self._mail_cred(acct),
+                                   acct.get("protocol") or "graph",
+                                   self.config.get("mail_proxy", "") or "")
+        except Exception:
+            return None
+        stamp = self._existing_mail_time(mailbox, acct["email"])
+        try:
+            mailbox.close()
+        except Exception:
+            pass
+        if stamp:
+            self.store.mark_mail_requested(acct["email"], stamp)
+            self._log("info", f"{acct['email']} 收件箱里已有验证邮件，跳过请求")
+        return stamp
+
+    def _mail_cred(self, acct):
+        return {
+            "email": acct["email"], "password": acct["password"],
+            "client_id": acct["client_id"],
+            "client_secret": acct.get("client_secret") or "",
+            "refresh_token": acct["refresh_token"],
+            "hme_base": self.config.get("hme_base", "") or "",
+            "hme_password": self.config.get("hme_password", "") or "",
+            "hme_account": acct.get("client_id") or "",
+        }
+
+    @staticmethod
+    def _existing_mail_time(mailbox, email):
+        """When the earliest verification mail for this address arrived, if any.
+
+        Earliest on purpose. Measured on one address: the token from the first
+        mail read closed=false, a freshly requested second mail read closed=true,
+        and the first one was still closed=false afterwards. The older mail is
+        the one attached to the usable session.
+        """
+        try:
+            for body, stamp in reversed(mailbox.messages(limit=10)):
+                if TOKEN_RE.search(body):
+                    return stamp
+        except Exception:
+            return None
+        return None
+
     def _loop(self, wid, tag, rnd, order, link_timeout, delay_between,
               mode):
         while not self._stop.is_set():
@@ -408,15 +500,7 @@ class Engine:
 
             protocol = acct.get("protocol") or "graph"
             mail_proxy = self.config.get("mail_proxy", "") or ""
-            mailbox = make_mailbox({
-                "email": acct["email"], "password": acct["password"],
-                "client_id": acct["client_id"],
-                "client_secret": acct.get("client_secret") or "",
-                "refresh_token": acct["refresh_token"],
-                # ignored by the Microsoft/Google readers, used by HmeMailbox
-                "hme_base": self.config.get("hme_base", "") or "",
-                "hme_password": self.config.get("hme_password", "") or "",
-                "hme_account": acct.get("client_id") or ""}, protocol, mail_proxy)
+            mailbox = make_mailbox(self._mail_cred(acct), protocol, mail_proxy)
 
             t0 = time.time()
             vok = bool(self.config.get("verify_success", False))
@@ -429,17 +513,19 @@ class Engine:
                 # queue pass. Anything the site itself decides is not retried.
                 for attempt in range(TRANSIENT_RETRIES + 1):
                     try:
+                        mail_since = self._ensure_mail_requested(
+                            mailbox, acct["email"], self.relays.get(proxy).url)
                         if mode == "http":
                             result = self._register_http(
                                 mailbox, ident, order, proxy, link_timeout, vto,
-                                self._take_mail_since(acct["email"]),
+                                mail_since,
                                 log=lambda m: self._log("info", f"{tag} {m.strip()}"))
                         else:
                             result = self.browser.register(
                                 mailbox, ident, order, proxy_url=proxy,
                                 link_timeout=link_timeout,
                                 verify_success=vok, success_timeout=vto,
-                                mail_since=self._take_mail_since(acct["email"]),
+                                mail_since=mail_since,
                                 log=lambda m: self._log("info", f"{tag} {m.strip()}"))
                         break
                     except TransientError as e:
