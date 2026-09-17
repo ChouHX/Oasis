@@ -3,50 +3,59 @@
 import json
 import os
 
-# Modes the engine accepts. A config saved before the captcha-less path was
-# removed still says "http"; coerce it rather than letting the engine abort.
-# Only the browser flow is carried now. A plain curl_cffi submission is
-# measured to be caught by the site's risk control, so hybrid was removed
-# rather than left as a footgun in the UI.
+# Modes the engine accepts. A config written by an older build may still say
+# "http" or "hybrid"; load() coerces anything unrecognised to "browser" rather
+# than letting the engine abort on an unknown mode.
+#
+# Only the browser flow is carried.
+#
+# A hybrid flow used to live here: mint a real captcha in a warm browser, then
+# submit with curl_cffi. It is gone, but be precise about why - curl itself was
+# not the problem. Measured 2026-09-16: a captcha-less curl_cffi submission
+# completed six registrations, while a browser-minted captcha replayed through
+# curl_cffi never did. The token appears to be bound to the client that minted
+# it, so pairing the two halves fails.
+#
+# The stronger reason to drive the SPA is that the SPA builds its own request
+# body: location.county from radar.io and `ip` from Cloudflare's trace are
+# filled in by the page, and a hand-built body cannot reproduce them.
 VALID_MODES = ("browser",)
 
 DEFAULTS = {
+    # --- where things live -------------------------------------------------
     "db_path": "oasis.db",
-    "proxies": [],
+    # --- what to run -------------------------------------------------------
+    "mode": "browser",
     "threads": 4,
     "shows": ["knebworth", "slane", "glasgow"],
-    # hybrid or browser. The captcha-less HTTP mode was removed from the UI; the
-    # flow it used (curl_cffi calls) is what hybrid still runs underneath.
-    "mode": "browser",
-    "mail_proxy": "",
-    "google_proxy": "",
-    # Optional local proxy that every upstream is dialled through. Needed when
-    # the residential endpoints cannot be reached directly (e.g. they are only
-    # reachable from outside the local network) - e.g. socks5://127.0.0.1:10808
+    "delay_between": 0.0,          # pause after each account; 0 = none
+    # --- proxy pool --------------------------------------------------------
+    "proxies": [],
+    # Optional local proxy every upstream is dialled through, for endpoints
+    # only reachable from outside the local network (e.g. socks5://127.0.0.1:10808)
     "front_proxy": "",
-    # iCloud Hide-My-Email service (see core/mailbox.HmeMailbox)
+    # Second egress for Google. Browser mode needs it: reCAPTCHA lives there,
+    # and an upstream that blocks Google stalls the page on wait_for_function.
+    "google_proxy": "",
+    # Mailbox fetches go direct unless this is set.
+    "mail_proxy": "",
+    # --- iCloud Hide-My-Email service (see core/mailbox.HmeMailbox) --------
     "hme_base": "http://127.0.0.1:8081",
     "hme_password": "",
-    # Warn-only by default. The theory that a captcha/confirm egress mismatch
-    # makes the server drop the registration is NOT proven: the single hybrid
-    # failure traced back to a bad account, which failed in http mode too.
-    # Set True only after confirming on your own proxy that a mismatch bites -
-    # otherwise it rejects accounts that would have gone through.
+    # --- timeouts ----------------------------------------------------------
+    # How long to wait for the verification mail.
     "link_timeout": 300,
-    "delay_between": 0.0,
-    # Randomised pause between reading the mail link and submitting, so the
-    # confirm does not land milliseconds after the verification. 0 disables.
-    # confirm answers {"status":"OK"} even for an address it refuses, so the
-    # only trustworthy receipt is the "Registration Complete" mail. Turning
-    # this on makes the run wait for it (and fail the account without it), at
-    # the cost of one extra wait per account.
-    # Whether hybrid mints and sends a real captcha. OFF deliberately - see the
-    # README; measured, sending one makes confirm fail silently.
-    # OFF on purpose: measured 2026-09-16, a real captcha token makes confirm
-    # fail silently (empty token completes, a valid 2382-char token does not),
-    # most likely because the token is bound to the client that minted it.
+    # `confirm` answers {"status":"OK"} even for an address it refuses, so when
+    # the page did not confirm, the mail is the only evidence left and this is
+    # how long that search runs. When the page DID confirm it only waits
+    # MAIL_GRACE_AFTER_PAGE (30s) - browser mode is measured not to send the
+    # success mail, so a full wait there is a minute of nothing.
     "verify_success": False,
     "success_timeout": 180,
+    # --- diagnostics -------------------------------------------------------
+    "debug": False,
+    # Desktop-only: the console writes its own log file. The service logs to
+    # stdout, which is where docker picks it up.
     "log_file": "oasis_run.log",
     "debug": False,
 }

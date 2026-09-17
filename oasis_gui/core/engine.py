@@ -139,8 +139,7 @@ class Engine:
         self.relays.stop_all()
         self.relays.google_fallback = self.config.get("google_proxy", "") or ""
         self.relays.front = self.config.get("front_proxy", "") or ""
-        label = {"hybrid": "混合 (浏览器取 captcha + curl_cffi 提交)",
-                 "browser": "浏览器 (Playwright 全流程)"}.get(mode, mode)
+        label = "浏览器 (驱动官方 SPA 全流程)"
         gp = self.relays.google_fallback or "不分流（全部走上游）"
         self._log("info", f"engine start: {threads} threads, {pending} pending, "
                           f"mode={label}, google={gp}, shows {' > '.join(order)}")

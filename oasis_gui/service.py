@@ -141,9 +141,8 @@ def build_config():
 
     if fresh:
         # First boot starts from the service's own defaults, not the desktop
-        # console's. The desktop defaults to hybrid because its window can pick
-        # a mode; an unattended server wants the full browser flow, and wants
-        # its thread count derived from the machine rather than a fixed 4.
+        # console's. The desktop ships a fixed 4 threads for its window; an
+        # unattended server wants its thread count derived from the machine.
         conf.data["mode"] = "browser"
         conf.data["threads"] = 0
         conf.data["shows"] = list(registrar.DEFAULT_ORDER)
@@ -303,7 +302,7 @@ def main():
         # proxies pasted in without ever touching .env.
         log("warn", "no proxies configured yet - set them in the admin UI "
                     "(代理池页) or via OASIS_PROXIES; rounds will fail until then")
-    if conf.get("mode") in ("hybrid", "browser") and not conf.get("google_proxy"):
+    if not conf.get("google_proxy"):
         log("warn", "no OASIS_GOOGLE_PROXY: reCAPTCHA cannot load unless the "
                     "upstream itself reaches Google - browser mode will stall")
 

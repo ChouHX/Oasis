@@ -2,9 +2,8 @@
 """Host capacity, so the console can suggest a sane thread count.
 
 Browser mode is the expensive one: every worker gets its own browser context
-inside the shared chromium process. Measured on this project: ~200MB per hybrid
-worker and ~250MB per browser-mode worker, on top of the shared browser itself
-(~250MB) and the Qt UI (~150MB). Recommending more than the machine can hold is
+inside the shared chromium process. Measured on this project: ~250MB per worker,
+on top of the shared browser itself (~250MB) and the Qt UI (~150MB). Recommending more than the machine can hold is
 worse than recommending too little: the OS starts swapping and every worker
 slows down together.
 """
@@ -14,7 +13,7 @@ import sys
 # Reserved so the desktop, the console itself and any other browser keep
 # working; a run that eats all free memory is slower than a smaller one.
 HEADROOM_MB = 1024
-MB_PER_WORKER = {"browser": 250, "hybrid": 200}
+MB_PER_WORKER = {"browser": 250}
 MAX_WORKERS = 16
 
 

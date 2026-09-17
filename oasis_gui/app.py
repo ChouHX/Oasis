@@ -1171,7 +1171,7 @@ class MainWindow(FluentWindow):
             self.dash.run_hint.setText(self.dash.idle_hint())
 
     # ----------------------------------------------------------------- control
-    def start_engine(self, threads, delay, mode="hybrid"):
+    def start_engine(self, threads, delay, mode="browser"):
         self.cfg.set("threads", threads)
         self.cfg.set("delay_between", delay)
         self.cfg.set("mode", mode)
@@ -1206,7 +1206,7 @@ class MainWindow(FluentWindow):
                 e.ignore()
                 return
             self.engine.stop()
-        # hybrid mode keeps one shared chromium alive between accounts; nothing
+        # browser mode keeps one shared chromium alive between accounts; nothing
         # else shuts it down, so an exited console would leave it running.
         try:
             self.engine.browser.close_warm()
