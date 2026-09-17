@@ -117,6 +117,30 @@ export default function Dashboard({ state, refresh }) {
   const stats = state?.stats || {};
   const host = state?.host || {};
 
+  // Persist the run controls as they are changed, not only when a run starts.
+  //
+  // They are settings, and they used to be written to the server only by
+  // 开始注册. So changing the thread count and reloading the page brought back
+  // the old number: the edit had never left the browser. Debounced, because a
+  // number field fires on every keystroke and each write goes to disk.
+  const saveTimer = useRef(null);
+  const persist = (patch) => {
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      api.saveConfig(patch).catch(() => {});
+    }, 700);
+  };
+
+  const changeThreads = (v) => {
+    setThreads(v);
+    if (v) persist({ threads: v });
+  };
+
+  const changeMode = (v) => {
+    setMode(v);
+    persist({ mode: v });
+  };
+
   const saveShows = async () => {
     if (new Set(shows).size !== shows.length) {
       message.warning("三个偏好不能重复");
@@ -192,14 +216,15 @@ export default function Dashboard({ state, refresh }) {
         <Space wrap size={12}>
           <Space size={6}>
             <Text type="secondary">线程</Text>
-            <InputNumber min={1} max={64} value={threads} onChange={setThreads}
+            <InputNumber min={1} max={64} value={threads}
+                         onChange={changeThreads}
                          disabled={state?.running} />
           </Space>
           <Space size={6}>
             <Text type="secondary">模式</Text>
             <Select
               value={mode}
-              onChange={setMode}
+              onChange={changeMode}
               disabled={state?.running}
               style={{ width: 220 }}
               options={[
@@ -227,7 +252,7 @@ export default function Dashboard({ state, refresh }) {
           </Button>
           {recommended && (
             <Tag color="blue" style={{ cursor: "pointer" }}
-                 onClick={() => setThreads(recommended)}>
+                 onClick={() => changeThreads(recommended)}>
               建议 {recommended} 线程
             </Tag>
           )}
