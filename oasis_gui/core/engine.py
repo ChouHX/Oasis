@@ -116,14 +116,22 @@ class Engine:
             for email in wanted:
                 if self._stop.is_set():
                     return
+                # Claim the slot before the request, not after. Recording it
+                # afterwards leaves a window where a worker has already claimed
+                # the account but cannot see the prefetch, so it sends its own
+                # verify - and its later mail_since then filters out the mail
+                # the prefetch already triggered, making the account slower.
+                with self._lock:
+                    self._mail_since[email] = time.time()
                 try:
                     registrar.request_verification(
                         session, email,
                         lambda m: self._log("debug", f"prefetch{m}"))
-                    with self._lock:
-                        self._mail_since[email] = time.time()
                     self._log("info", f"prefetch: 已为 {email} 触发验证邮件")
                 except Exception as e:
+                    # give the slot back so a worker will retry it
+                    with self._lock:
+                        self._mail_since.pop(email, None)
                     self._log("debug", f"prefetch {email} failed: "
                                        f"{type(e).__name__}")
                 self._prefetch_stop.wait(PREFETCH_GAP)
@@ -220,14 +228,22 @@ class Engine:
             for email in wanted:
                 if self._stop.is_set():
                     return
+                # Claim the slot before the request, not after. Recording it
+                # afterwards leaves a window where a worker has already claimed
+                # the account but cannot see the prefetch, so it sends its own
+                # verify - and its later mail_since then filters out the mail
+                # the prefetch already triggered, making the account slower.
+                with self._lock:
+                    self._mail_since[email] = time.time()
                 try:
                     registrar.request_verification(
                         session, email,
                         lambda m: self._log("debug", f"prefetch{m}"))
-                    with self._lock:
-                        self._mail_since[email] = time.time()
                     self._log("info", f"prefetch: 已为 {email} 触发验证邮件")
                 except Exception as e:
+                    # give the slot back so a worker will retry it
+                    with self._lock:
+                        self._mail_since.pop(email, None)
                     self._log("debug", f"prefetch {email} failed: "
                                        f"{type(e).__name__}")
                 self._prefetch_stop.wait(PREFETCH_GAP)

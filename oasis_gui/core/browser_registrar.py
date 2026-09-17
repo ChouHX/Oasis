@@ -37,6 +37,7 @@ import threading
 import time
 import urllib.request
 
+from . import identity as ident_mod
 from . import registrar
 
 # Once the page has confirmed the registration, the success mail is a bonus, not
@@ -669,7 +670,17 @@ class BrowserRegistrar:
             # the value landed beats sleeping on a guess.
             self._settle(page, f"() => document.querySelector({sel!r}).value"
                                f" === {val!r}", 1200)
+        phone = ident["phone"]
         for attempt in range(4):
+            if attempt:
+                # Retrying the same number never worked - measured, 12 attempts
+                # across the per-field and per-step loops all failed on the same
+                # value. Whatever the form dislikes is about that number, so
+                # draw a new one instead of repeating it.
+                phone = ident_mod.random_phone(random.Random(),
+                                               (ident.get("location") or {})
+                                               .get("countryCode", "US"))
+                log(f"    phone retry {attempt + 1} with a fresh number")
             field = page.query_selector("input#soundcheckConfirmPhoneNumber")
             field.click()
             # select-all + delete, not fill(""): the component tracks its own
@@ -677,7 +688,7 @@ class BrowserRegistrar:
             page.keyboard.press("Control+a")
             page.keyboard.press("Delete")
             page.wait_for_timeout(300)
-            page.type("input#soundcheckConfirmPhoneNumber", ident["phone"], delay=110)
+            page.type("input#soundcheckConfirmPhoneNumber", phone, delay=110)
             typed = page.input_value("#soundcheckConfirmPhoneNumber")
             page.keyboard.press("Tab")
             # Either the error shows up (fast) or it never does; either way we
@@ -801,7 +812,7 @@ class BrowserRegistrar:
         browser mode is measured not to send the success mail.
         """
         page.wait_for_selector("#soundcheckConfirmFirstName", timeout=90000)
-        for attempt in range(3):
+        for attempt in range(2):
             self._fill_details(page, ident, log)
             if self._click_continue(page, until="cities", timeout=60):
                 break
@@ -811,7 +822,7 @@ class BrowserRegistrar:
                                  "Name is required", "Date of birth is required")
                      if m in body]
             log(f"    details rejected ({shown or 'no message'}), retry {attempt + 1}")
-            if attempt == 2:
+            if attempt == 1:
                 raise BrowserRegistrationError(
                     f"details step did not advance; page says {shown or 'nothing'}")
 
