@@ -320,6 +320,18 @@ class Store:
             return [dict(r) for r in c.execute(sql + " LIMIT ?", (limit,))]
         return [dict(r) for r in c.execute(sql)]
 
+    def pending_emails(self, limit=20):
+        """Oldest-first pending addresses, for the mail prefetcher.
+
+        Deliberately minimal: the prefetcher only needs to know which addresses
+        will be worked on next, and pulling whole rows (credentials included)
+        on every poll would be wasteful.
+        """
+        c = self.conn()
+        return [r["email"] for r in c.execute(
+            "SELECT email FROM accounts WHERE status='pending' "
+            "ORDER BY id LIMIT ?", (limit,))]
+
     def protocol_for(self, account_id):
         row = self.conn().execute(
             "SELECT protocol FROM accounts WHERE id=?", (account_id,)).fetchone()

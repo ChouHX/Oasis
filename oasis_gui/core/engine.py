@@ -27,6 +27,14 @@ TRANSIENT_RETRIES = 1
 # caller back off.
 TRANSIENT_PER_ROUND = 4
 
+# How long a prefetched verification link is assumed good for. The mail link
+# carries a short-lived token, so a request fired long before the account is
+# picked up is worse than useless - it would make the worker wait on a link
+# that has already expired.
+PREFETCH_MAX_AGE = 600
+# Seconds between prefetch requests, so a burst does not look like abuse.
+PREFETCH_GAP = 1.5
+
 
 class Engine:
     def __init__(self, store, proxy_pool, log_cb, event_cb, config=None):
@@ -48,6 +56,90 @@ class Engine:
         # IP the site will see. One lookup per distinct exit, not per account.
         self._geo_cache = {}
         self._geo_lock = threading.Lock()
+        # email -> epoch the verification mail was requested at. Filled by the
+        # prefetcher so a worker usually finds its mail already on the way.
+        self._mail_since = {}
+        self._prefetch_stop = threading.Event()
+        self._prefetch_thread = None
+
+    # -------------------------------------------------------------- prefetching
+    def _start_prefetcher(self, threads):
+        """Request the verification mail for upcoming accounts ahead of time.
+
+        The mail takes ~10s to arrive, and that was dead time inside the worker:
+        it had nothing to do but poll. Asking for the next few accounts' mails
+        up front, from curl, moves that wait off the critical path entirely -
+        the worker opens the mail link that is already sitting in the inbox
+        instead of waiting for it to show up.
+
+        Depth is kept small on purpose. Requests are cheap but not free, and a
+        verification link goes stale, so asking for twenty accounts at once
+        would mostly produce expired links.
+        """
+        self._prefetch_stop.clear()
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            return
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop, args=(max(1, threads),),
+            daemon=True, name="mail-prefetch")
+        self._prefetch_thread.start()
+
+    def _prefetch_loop(self, depth):
+        while not self._prefetch_stop.is_set() and not self._stop.is_set():
+            try:
+                self._prefetch_once(depth)
+            except Exception as e:
+                self._log("debug", f"prefetch: {type(e).__name__}: {e}")
+            self._prefetch_stop.wait(2)
+
+    def _prefetch_once(self, depth):
+        now = time.time()
+        # one request per pending account that is not already covered
+        wanted = []
+        fresh = {e: t for e, t in self._mail_since.items()
+                 if now - t < PREFETCH_MAX_AGE}
+        with self._lock:
+            self._mail_since.clear()
+            self._mail_since.update(fresh)
+        for email in self.store.pending_emails(max(depth * 3, 6)):
+            if len(wanted) >= depth:
+                break
+            if email in fresh:
+                continue
+            wanted.append(email)
+        if not wanted:
+            return
+        proxy = self.pool.acquire()
+        relay = self.relays.get(proxy)
+        session = registrar.make_session(relay.url, timeout=45)
+        try:
+            for email in wanted:
+                if self._stop.is_set():
+                    return
+                try:
+                    registrar.request_verification(
+                        session, email,
+                        lambda m: self._log("debug", f"prefetch{m}"))
+                    with self._lock:
+                        self._mail_since[email] = time.time()
+                    self._log("info", f"prefetch: 已为 {email} 触发验证邮件")
+                except Exception as e:
+                    self._log("debug", f"prefetch {email} failed: "
+                                       f"{type(e).__name__}")
+                self._prefetch_stop.wait(PREFETCH_GAP)
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _take_mail_since(self, email):
+        """The epoch this account's mail was requested at, if still fresh."""
+        with self._lock:
+            sent = self._mail_since.pop(email, None)
+        if sent and time.time() - sent < PREFETCH_MAX_AGE:
+            return sent
+        return None
 
     # ------------------------------------------------------------------ helpers
     def _proxy_country(self, proxy, dial=None):
@@ -73,6 +165,85 @@ class Engine:
             self._log("warn", f"could not geolocate exit of "
                               f"{proxy.split('@')[-1]}; assuming US")
         return cc
+
+    # -------------------------------------------------------------- prefetching
+    def _start_prefetcher(self, threads):
+        """Request the verification mail for upcoming accounts ahead of time.
+
+        The mail takes ~10s to arrive, and that was dead time inside the worker:
+        it had nothing to do but poll. Asking for the next few accounts' mails
+        up front, from curl, moves that wait off the critical path entirely -
+        the worker opens the mail link that is already sitting in the inbox
+        instead of waiting for it to show up.
+
+        Depth is kept small on purpose. Requests are cheap but not free, and a
+        verification link goes stale, so asking for twenty accounts at once
+        would mostly produce expired links.
+        """
+        self._prefetch_stop.clear()
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            return
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop, args=(max(1, threads),),
+            daemon=True, name="mail-prefetch")
+        self._prefetch_thread.start()
+
+    def _prefetch_loop(self, depth):
+        while not self._prefetch_stop.is_set() and not self._stop.is_set():
+            try:
+                self._prefetch_once(depth)
+            except Exception as e:
+                self._log("debug", f"prefetch: {type(e).__name__}: {e}")
+            self._prefetch_stop.wait(2)
+
+    def _prefetch_once(self, depth):
+        now = time.time()
+        # one request per pending account that is not already covered
+        wanted = []
+        fresh = {e: t for e, t in self._mail_since.items()
+                 if now - t < PREFETCH_MAX_AGE}
+        with self._lock:
+            self._mail_since.clear()
+            self._mail_since.update(fresh)
+        for email in self.store.pending_emails(max(depth * 3, 6)):
+            if len(wanted) >= depth:
+                break
+            if email in fresh:
+                continue
+            wanted.append(email)
+        if not wanted:
+            return
+        proxy = self.pool.acquire()
+        relay = self.relays.get(proxy)
+        session = registrar.make_session(relay.url, timeout=45)
+        try:
+            for email in wanted:
+                if self._stop.is_set():
+                    return
+                try:
+                    registrar.request_verification(
+                        session, email,
+                        lambda m: self._log("debug", f"prefetch{m}"))
+                    with self._lock:
+                        self._mail_since[email] = time.time()
+                    self._log("info", f"prefetch: 已为 {email} 触发验证邮件")
+                except Exception as e:
+                    self._log("debug", f"prefetch {email} failed: "
+                                       f"{type(e).__name__}")
+                self._prefetch_stop.wait(PREFETCH_GAP)
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _take_mail_since(self, email):
+        """The epoch this account's mail was requested at, if still fresh."""
+        with self._lock:
+            sent = self._mail_since.pop(email, None)
+        if sent and time.time() - sent < PREFETCH_MAX_AGE:
+            return sent
+        return None
 
     # ------------------------------------------------------------------ helpers
     def _log(self, level, msg):
@@ -132,6 +303,9 @@ class Engine:
 
         self._stop.clear()
         self._transient_left = max(TRANSIENT_PER_ROUND, threads)
+        with self._lock:
+            self._mail_since.clear()
+        self._start_prefetcher(threads)
         self._running = True
         self._done = 0
         # Relays are per-upstream and cached; drop them so a changed
@@ -249,6 +423,7 @@ class Engine:
                             mailbox, ident, order, proxy_url=proxy,
                             link_timeout=link_timeout,
                             verify_success=vok, success_timeout=vto,
+                            mail_since=self._take_mail_since(acct["email"]),
                             log=lambda m: self._log("info", f"{tag} {m.strip()}"))
                         break
                     except TransientError as e:
@@ -325,4 +500,5 @@ class Engine:
 
     def finish(self):
         self._running = False
+        self._prefetch_stop.set()
         self._emit("stopped", {"stats": self.store.stats()})

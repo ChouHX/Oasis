@@ -792,7 +792,7 @@ class BrowserRegistrar:
         page.keyboard.press("Escape")
         return False
 
-    def _drive_form(self, page, ident, order, log):
+    def _drive_form(self, page, ident, order, log, before_submit=None):
         """Walk the whole SPA form and let the SPA submit itself.
 
         The API calls are the site's own, so the body carries everything a real
@@ -882,6 +882,12 @@ class BrowserRegistrar:
                 # condition missed (different markup, or nothing scrollable):
                 # fall back to the delay that is known to work
                 page.wait_for_timeout(2500)
+        # Extension point: the only moment a caller can still change something
+        # (a captcha source, say) after the page is fully rendered but before
+        # the SPA builds and sends its request.
+        if before_submit:
+            before_submit(page)
+
         submit = page.query_selector("button:has-text('Submit')")
         if not submit:
             raise BrowserRegistrationError("no submit button on the T&C page")
@@ -899,7 +905,13 @@ class BrowserRegistrar:
 
     def register(self, mailbox, ident, order=None, proxy_url=None,
                  link_timeout=300, log=print, verify_success=False,
-                 success_timeout=180):
+                 success_timeout=180, mail_since=None):
+        """Drive the official SPA through one registration.
+
+        `mail_since` is the epoch the verification mail was requested at. A
+        caller that already asked for it (the engine prefetches one account
+        ahead) passes that timestamp; otherwise this sends the request itself.
+        """
         from playwright.sync_api import sync_playwright
 
         order = order or registrar.DEFAULT_ORDER
@@ -923,22 +935,37 @@ class BrowserRegistrar:
             ctx = self._new_context(browser, rnd, ident)
             page = ctx.new_page()
             self.log(f"    context on shared browser via {relay.url}")
-            # 1. load the SPA so the page (and its origin) exists
-            page.goto(registrar.RETURN_URL, wait_until="domcontentloaded",
-                      timeout=self.browser_timeout * 1000)
+            # 1. ask for the verification mail over curl.
+            #
+            #    The submit is what must come from the browser: measured, a real
+            #    captcha sent through curl_cffi never completed, while the same
+            #    flow submitted by the SPA always does. The verify call is a
+            #    different matter - the old hybrid flow sent it with curl and
+            #    the mail arrived normally every time - so sending it here is
+            #    free of the risk that killed hybrid, and it buys two things:
+            #
+            #      * the bare /registration page load disappears (it only
+            #        existed to give the verify fetch an origin)
+            #      * the mail can be requested ahead of time, so the wait moves
+            #        off the worker's critical path
+            if mail_since is None:
+                session = registrar.make_session(
+                    relay.url, timeout=self.browser_timeout)
+                try:
+                    registrar.request_verification(
+                        session, mailbox.email,
+                        lambda m: log(f"  [{mailbox.email}]{m}"))
+                finally:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                mail_since = time.time()
 
-            # 2. ask for the verification mail, from the page
-            res = self._fetch(page, f"{registrar.API}/fan2/verify/verify",
-                              "POST", registrar.build_verify(mailbox.email))
-            if res["status"] != 200:
-                raise BrowserRegistrationError(
-                    f"verify/verify HTTP {res['status']}: {res['text'][:160]}")
-            log(f"  [{mailbox.email}] verify/verify -> {res['text'][:60]}")
-
-            # 3. wait for the link, then open it: this renders the form and
+            # 2. wait for the link, then open it: this renders the form and
             #    is what makes reCAPTCHA initialise
             url, received = mailbox.find_verification_link(
-                timeout=link_timeout, not_before=t0, log=log)
+                timeout=link_timeout, not_before=mail_since, log=log)
             if not url:
                 raise BrowserRegistrationError("verification mail never arrived")
             log(f"  [{mailbox.email}] mail {received}")
