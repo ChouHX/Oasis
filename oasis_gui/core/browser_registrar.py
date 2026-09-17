@@ -366,6 +366,7 @@ class _SharedBrowser:
         self.log = log or (lambda m: None)
         self.proc = None
         self.port = None
+        self._errlog = None
         # RLock: endpoint() holds this while starting, and callers may already
         # hold it (see BrowserRegistrar._shared_browser) to close the race where
         # two workers both see "not started yet" and each launch a browser.
@@ -378,6 +379,19 @@ class _SharedBrowser:
                 return f"http://127.0.0.1:{self.port}"
             self._start()
             return f"http://127.0.0.1:{self.port}"
+
+    def _tail_err(self, lines=6):
+        """Last few lines chromium wrote before dying."""
+        if self._errlog is None:
+            return "（进程没起来，没有输出）"
+        try:
+            self._errlog.flush()
+            with open(self._errlog.name, encoding="utf-8", errors="replace") as fh:
+                tail = fh.read().strip().split("\n")[-lines:]
+            return " | ".join(x.strip()[:160] for x in tail if x.strip()) \
+                   or "（没有输出）"
+        except Exception as e:
+            return f"（读不到：{type(e).__name__}）"
 
     def _start(self):
         if self.proc and self.proc.poll() is None:
@@ -401,16 +415,41 @@ class _SharedBrowser:
             "--disable-background-networking",
             "--disable-default-apps",
             "--no-service-autorun",
+            # In a container chromium runs as an unprivileged user without the
+            # namespaces its sandbox needs, so it dies during startup with
+            # SIGTRAP ("exited immediately (code -5)"). Playwright's own
+            # launch() adds these; launching the process by hand means adding
+            # them here. This is the standard trade-off for containerised
+            # browsers - the browser only ever opens one site.
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
         ]
         if self.proxy_url:
             args.append(f"--proxy-server={self.proxy_url}")
-        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+        # Keep chromium's own stderr instead of discarding it: when it dies at
+        # startup, that text is the only thing that says why.
+        self._errlog = tempfile.NamedTemporaryFile(
+            prefix="oasis-chromium-", suffix=".log", delete=False)
+        try:
+            self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                         stderr=self._errlog)
+        except Exception as e:
+            # Same class of problem as dying at startup - the browser is
+            # unusable for reasons that have nothing to do with any account.
+            raise TransientError(
+                f"cannot start chromium ({self.exe}): "
+                f"{type(e).__name__}: {str(e)[:120]}") from e
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise BrowserRegistrationError(
-                    f"shared chromium exited immediately (code {self.proc.returncode})")
+                # Transient on purpose: if chromium cannot start at all, every
+                # account in the queue would fail for a reason that has nothing
+                # to do with any of them. Requeue and let the round budget stop
+                # the loop instead of marking the pool failed.
+                raise TransientError(
+                    f"shared chromium exited immediately "
+                    f"(code {self.proc.returncode}) - "
+                    f"{self._tail_err()}")
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{self.port}/json/version", timeout=2):
