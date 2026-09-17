@@ -95,16 +95,24 @@ export default function Dashboard({ state, refresh }) {
   const [shows, setShows] = useState(["glasgow", "manchester", "paris"]);
   const [busy, setBusy] = useState(false);
 
+  // Seed the run controls once per visit, and never again.
+  //
+  // /api/state is polled every three seconds and each reply is a brand new
+  // object - `shows` in particular is a new array every time, so an effect
+  // keyed on it re-ran on every poll and put the server's stored values back
+  // over whatever had just been typed. That is how a thread count quietly
+  // reverted to its old value before "开始注册" read it. Seeding once leaves the
+  // controls alone while someone is editing them; leaving the page and coming
+  // back reseeds from the server.
+  const seeded = useRef(false);
   useEffect(() => {
-    if (!state?.config) return;
-    if (state.config.threads) setThreads(state.config.threads);
-    // Remember the mode that was last used, so starting a run does not quietly
-    // switch the operator back to the other flow.
-    if (state.config.mode) setMode(state.config.mode);
-    if (Array.isArray(state.config.shows) && state.config.shows.length) {
-      setShows(state.config.shows);
-    }
-  }, [state?.config?.threads, state?.config?.shows, state?.config?.mode]);
+    const c = state?.config;
+    if (!c || seeded.current) return;
+    seeded.current = true;
+    if (c.threads) setThreads(c.threads);
+    if (c.mode) setMode(c.mode);
+    if (Array.isArray(c.shows) && c.shows.length) setShows(c.shows);
+  }, [state?.config]);
 
   const stats = state?.stats || {};
   const host = state?.host || {};

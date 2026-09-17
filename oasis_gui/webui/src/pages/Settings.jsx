@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Card, Form, Input, Button, Select, Space, Typography, Alert, App as AntApp, Tag,
 } from "antd";
@@ -44,6 +44,10 @@ export default function Settings({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [form] = Form.useForm();
   const [busy, setBusy] = useState(false);
+  // What the server last reported, kept so "撤销改动" can put those values back
+  // instead of clearing the form.
+  const server = useRef({});
+  const seeded = useRef(false);
 
   useEffect(() => {
     const c = state?.config;
@@ -55,6 +59,17 @@ export default function Settings({ state, refresh }) {
       else if (f.type === "bool") init[f.key] = v ? "true" : "false";
       else init[f.key] = v ?? "";
     }
+    server.current = init;
+    // Seed the form once per visit, never again.
+    //
+    // The shell polls /api/state every three seconds and every reply is a fresh
+    // object, so an effect keyed on it re-ran on every poll and wrote the
+    // server's values back over whatever was being typed. The settings form was
+    // effectively read-only: a field could be edited, but the next poll undid
+    // it. Seeding once leaves the form alone while someone is using it, and
+    // leaving the page and coming back reseeds from the server.
+    if (seeded.current) return;
+    seeded.current = true;
     form.setFieldsValue(init);
   }, [state?.config, form]);
 
@@ -91,7 +106,8 @@ export default function Settings({ state, refresh }) {
       size="small"
       extra={
         <Space>
-          <Button icon={<UndoOutlined />} onClick={() => form.resetFields()}>
+          <Button icon={<UndoOutlined />}
+                  onClick={() => form.setFieldsValue(server.current)}>
             撤销改动
           </Button>
           <Button type="primary" icon={<SaveOutlined />} loading={busy} onClick={save}>
