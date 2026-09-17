@@ -313,6 +313,21 @@ class Engine:
         self.relays.stop_all()
         self.relays.google_fallback = self.config.get("google_proxy", "") or ""
         self.relays.front = self.config.get("front_proxy", "") or ""
+        # Resolve artistId / pageId from the site once per run. Pinned copies
+        # would silently fail every request the day a new registration round
+        # opens, so ask; if the lookup fails the captured values stay in place.
+        try:
+            proxy = self.pool.acquire()
+            session = registrar.make_session(self.relays.get(proxy).url, timeout=30)
+            try:
+                # resolve_page takes a one-argument logger, not _log(level, msg)
+                registrar.resolve_page(
+                    session, lambda m: self._log("info", m.strip()))
+            finally:
+                session.close()
+        except Exception as e:
+            self._log("warn", f"page resolve 跳过（{type(e).__name__}: "
+                              f"{str(e)[:70]}），沿用内置的 artist/page id")
         label = "浏览器 (驱动官方 SPA 全流程)"
         gp = self.relays.google_fallback or "不分流（全部走上游）"
         self._log("info", f"engine start: {threads} threads, {pending} pending, "

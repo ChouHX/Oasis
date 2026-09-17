@@ -113,6 +113,29 @@ reCAPTCHA Enterprise 是**评分**机制，不是通过/拒绝二值。空 captc
 识别。留着它只会让人误选然后白丢账号，所以配置、界面、环境变量都清掉了，旧配置
 里的 `hybrid` 会被自动纠正为 `browser`。
 
+### artistId / pageId 是动态取的，不是写死的
+
+这两个值原来硬编码在 `registrar.py` 里（从一次抓包抄下来的）。硬编码的问题不是
+现在不能用，而是**下次开新一轮注册时会静默失效**——站点换了 artist/page id，
+我们发的每个请求都会失败，而且看不出原因。
+
+SPA 自己也是动态取的，加载时发这两个请求：
+
+```
+GET openstage-pages.s3.../oasis/artist.json                    -> {"artist_id": "28400196-..."}
+GET /fan2/page/{artist_id}/registration                        -> {"id": "b4356f65-...",
+                                                                   "metaData":{"content":{"page":{
+                                                                     "title": "Register for Oasis Live '27"}}}}
+```
+
+所以 `resolve_page()` 在每轮开始时做同样两件事，把 artistId、pageId 和渠道名一起
+取回来（渠道名就是那个 title）。取不到就沿用内置值并记一条 warn——**查不到不应该
+让一趟本来能跑的注册停下来**。
+
+实现细节：两个请求各走 `_retry`。会话用的是随机指纹、且 relay 每次重新拨上游，
+所以偶发的 TLS 握手失败是正常的，重试即可——实测加重试前 3 次里失败 2 次，
+加了之后 5/5 成功。
+
 ### verify 请求体与浏览器逐字段一致
 
 `build_verify()` 是现在唯一由 curl 构造、发往站点的请求，所以它必须和 SPA 发的一模一样。
@@ -266,6 +289,29 @@ hybrid 模式不走这条路径——它不打开页面，看不到页面状态�
 `hybrid`（浏览器签 captcha + curl_cffi 提交）已移除：实测 curl 提交会被站点的风控
 识别。留着它只会让人误选然后白丢账号，所以配置、界面、环境变量都清掉了，旧配置
 里的 `hybrid` 会被自动纠正为 `browser`。
+
+### artistId / pageId 是动态取的，不是写死的
+
+这两个值原来硬编码在 `registrar.py` 里（从一次抓包抄下来的）。硬编码的问题不是
+现在不能用，而是**下次开新一轮注册时会静默失效**——站点换了 artist/page id，
+我们发的每个请求都会失败，而且看不出原因。
+
+SPA 自己也是动态取的，加载时发这两个请求：
+
+```
+GET openstage-pages.s3.../oasis/artist.json                    -> {"artist_id": "28400196-..."}
+GET /fan2/page/{artist_id}/registration                        -> {"id": "b4356f65-...",
+                                                                   "metaData":{"content":{"page":{
+                                                                     "title": "Register for Oasis Live '27"}}}}
+```
+
+所以 `resolve_page()` 在每轮开始时做同样两件事，把 artistId、pageId 和渠道名一起
+取回来（渠道名就是那个 title）。取不到就沿用内置值并记一条 warn——**查不到不应该
+让一趟本来能跑的注册停下来**。
+
+实现细节：两个请求各走 `_retry`。会话用的是随机指纹、且 relay 每次重新拨上游，
+所以偶发的 TLS 握手失败是正常的，重试即可——实测加重试前 3 次里失败 2 次，
+加了之后 5/5 成功。
 
 ### verify 请求体与浏览器逐字段一致
 

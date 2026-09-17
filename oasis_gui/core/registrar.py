@@ -26,8 +26,20 @@ from curl_cffi import requests as creq
 API = "https://api.openstage.live"
 RETURN_URL = "https://oasis.hq.fan/registration"
 
+# Where the page's identity comes from. The SPA resolves it the same way on
+# load: artist.json carries the artist id, and /fan2/page/{artistId}/registration
+# carries the page id and title.
+ARTIST_JSON_URL = ("https://openstage-pages.s3.eu-west-2.amazonaws.com"
+                   "/oasis/artist.json")
+PAGE_CONFIG_PATH = "/fan2/page/{artist}/registration"
+
+# Values captured 2026-09-16. They are fallbacks only - resolve_page() replaces
+# them from the site, because a new registration round changes both ids and a
+# pinned copy would then fail every request with no obvious symptom.
 ARTIST_ID = "28400196-01ba-4920-810b-9592f9f1045d"
 PAGE_ID = "b4356f65-bdc5-4dd6-84a8-36369f15b9a8"
+CHANNEL_NAME = "Register for Oasis Live '27"
+CHANNEL_TYPE = "Registration Page"
 
 # reCAPTCHA Enterprise, invisible, evaluated by the page on submit.
 # The site's reCAPTCHA parameters, kept as reference: they are what a captcha
@@ -164,6 +176,60 @@ def make_session(proxy_url=None, timeout=60, impersonate=None):
     return s
 
 
+def resolve_page(session=None, log=print):
+    """Fetch artistId / pageId / channel name from the site, once per run.
+
+    Returns True when the live values were picked up, False when the fallbacks
+    are still in place. Never raises: a lookup failure must not stop a run that
+    would otherwise work with the values captured earlier.
+    """
+    global ARTIST_ID, PAGE_ID, CHANNEL_NAME
+    own = session is None
+    if own:
+        session = creq.Session(impersonate="chrome", timeout=30)
+    try:
+        # Retry once: the session picks a random impersonation and the relay
+        # re-dials the upstream per request, so an occasional TLS handshake
+        # failure is expected rather than a sign of anything wrong.
+        r = _retry(lambda: session.get(ARTIST_JSON_URL, headers=_headers(),
+                                       timeout=30), "artist.json", log)
+        artist = (r.json() or {}).get("artist_id")
+        if not artist:
+            log(f"    page resolve: artist.json 没有 artist_id")
+            return False
+
+        r = _retry(lambda: session.get(
+            f"{API}{PAGE_CONFIG_PATH.format(artist=artist)}",
+            headers=_headers(), timeout=30), "page config", log)
+        cfg = r.json() or {}
+        page = cfg.get("id")
+        title = ((cfg.get("metaData") or {}).get("content") or {}) \
+            .get("page", {}).get("title")
+        if not page:
+            log("    page resolve: 页面配置里没有 id")
+            return False
+
+        changed = (artist != ARTIST_ID) or (page != PAGE_ID)
+        ARTIST_ID = artist
+        PAGE_ID = page
+        if title:
+            CHANNEL_NAME = title
+        log(f"    page resolve: artist={artist[:8]} page={page[:8]} "
+            f"channel={CHANNEL_NAME!r}"
+            + ("  （与内置值不同，已更新）" if changed else ""))
+        return True
+    except Exception as e:
+        log(f"    page resolve 失败（{type(e).__name__}: {str(e)[:90]}），"
+            f"沿用内置值")
+        return False
+    finally:
+        if own:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
 def build_verify(email):
     """Body for POST /fan2/verify/verify (triggers the verification mail).
 
@@ -190,8 +256,8 @@ def build_verify(email):
             # but there is no reason to look different from the SPA.
             "consentEmail": True,
             "acquisition": {
-                "channelName": "Register for Oasis Live '27",
-                "channelType": "Registration Page",
+                "channelName": CHANNEL_NAME,
+                "channelType": CHANNEL_TYPE,
                 "referrer": None,
                 "pageId": PAGE_ID,
             },
