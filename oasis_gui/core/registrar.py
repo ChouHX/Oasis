@@ -411,21 +411,24 @@ def build_confirm(ident, token, url, order=None, captcha="", ip=None):
     below records what that difference is worth.
     """
     order = order or DEFAULT_ORDER
-    primary, *rest = order
-    # Both of these were caught by diffing our body against the one the SPA
-    # actually posts: consentMessaging was missing outright, and the site sends
-    # dateOfBirth as a full ISO instant rather than a bare date.
+    primary, *_rest = order
+    # journeyPollAnswers carries the site's own journey steps and nothing else.
+    # Today that is two: the travel question and the album question, both read
+    # straight out of the page config (journey.steps / .poll.id).
+    #
+    # The preference polls are NOT journey steps. The site declares them in
+    # form.events.preferencePollIds and they exist to rank the three event picks
+    # - sending them inside the journey posts two polls the site never asked
+    # about, which is what this flow did until the config was read properly.
+    journey = [
+        {"pollId": TRAVEL_POLL, "pollAnswerIds": [TRAVEL_NO]},
+        {"pollId": ALBUM_POLL, "pollAnswerIds": [ALBUM_1995]},
+    ]
+
+    # The site sends dateOfBirth as a full ISO instant rather than a bare date.
     dob = ident["date_of_birth"]
     if len(dob) == 10:
         dob = f"{dob}T00:00:00.000Z"
-    journey = []
-    # Slots 2 and 3 of the city poll carry the preference polls, in order.
-    for slot, venue in enumerate(rest[:2]):
-        poll_id = PREF_POLL_2 if slot == 0 else PREF_POLL_3
-        journey.append({"pollId": poll_id,
-                        "pollAnswerIds": [SHOWS[venue][1][slot]]})
-    journey.append({"pollId": TRAVEL_POLL, "pollAnswerIds": [TRAVEL_NO]})
-    journey.append({"pollId": ALBUM_POLL, "pollAnswerIds": [ALBUM_1995]})
 
     return {
         "location": ident["location"],
