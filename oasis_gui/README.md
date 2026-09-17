@@ -113,6 +113,22 @@ reCAPTCHA Enterprise 是**评分**机制，不是通过/拒绝二值。空 captc
 识别。留着它只会让人误选然后白丢账号，所以配置、界面、环境变量都清掉了，旧配置
 里的 `hybrid` 会被自动纠正为 `browser`。
 
+### verify 请求体与浏览器逐字段一致
+
+`build_verify()` 是现在唯一由 curl 构造、发往站点的请求，所以它必须和 SPA 发的一模一样。
+拿浏览器抓包逐字段比对过，13 个字段全部一致：
+
+```
+returnUrl · artistId · pageId · locale · type · email
+data.tags · data.pollAnswerIds · data.consentEmail · data.acquisition.*
+```
+
+`artistId` 和 `pageId` 是**页面级常量**，不是请求协商出来的——它们标识 Oasis Live '27
+这个注册页，所有账号都一样，所以直接写死在 `registrar.py` 里。
+
+比对时发现我们少了一个 `data.consentEmail: true`（而且代码注释还错误地断言"没有这个
+字段"，那是更早一次抓包的结论）。补上之后实测 verify 仍返回 200、邮件正常到达。
+
 ### 性能：实测 90~150 秒 → 24 秒
 
 单账号稳定态耗时，每个数字都是实测：
@@ -250,6 +266,22 @@ hybrid 模式不走这条路径——它不打开页面，看不到页面状态�
 `hybrid`（浏览器签 captcha + curl_cffi 提交）已移除：实测 curl 提交会被站点的风控
 识别。留着它只会让人误选然后白丢账号，所以配置、界面、环境变量都清掉了，旧配置
 里的 `hybrid` 会被自动纠正为 `browser`。
+
+### verify 请求体与浏览器逐字段一致
+
+`build_verify()` 是现在唯一由 curl 构造、发往站点的请求，所以它必须和 SPA 发的一模一样。
+拿浏览器抓包逐字段比对过，13 个字段全部一致：
+
+```
+returnUrl · artistId · pageId · locale · type · email
+data.tags · data.pollAnswerIds · data.consentEmail · data.acquisition.*
+```
+
+`artistId` 和 `pageId` 是**页面级常量**，不是请求协商出来的——它们标识 Oasis Live '27
+这个注册页，所有账号都一样，所以直接写死在 `registrar.py` 里。
+
+比对时发现我们少了一个 `data.consentEmail: true`（而且代码注释还错误地断言"没有这个
+字段"，那是更早一次抓包的结论）。补上之后实测 verify 仍返回 200、邮件正常到达。
 
 ### 性能：实测 90~150 秒 → 24 秒
 

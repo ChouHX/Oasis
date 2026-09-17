@@ -30,16 +30,14 @@ ARTIST_ID = "28400196-01ba-4920-810b-9592f9f1045d"
 PAGE_ID = "b4356f65-bdc5-4dd6-84a8-36369f15b9a8"
 
 # reCAPTCHA Enterprise, invisible, evaluated by the page on submit.
+# The site's reCAPTCHA parameters, kept as reference: they are what a captcha
+# service (or any manual debugging) needs, and they identify which reCAPTCHA
+# this endpoint uses. The browser flow does not read them - the SPA fetches its
+# own configuration and mints the token itself.
 SITEKEY = "6LcMjSsqAAAAANqPn-O5M5wUDtJm-Zjx2d3NtWTp"
 CAPTCHA_ACTION = "fan_verification"
 
 EVENTS_POLL = "e0f2f14d-daed-4afb-978b-dc38f2164e01"
-PREF_POLL_2 = "f3f3fdeb-20d7-4bd1-b84d-c7545886a904"
-PREF_POLL_3 = "03890a33-7440-470e-b5a4-d12133d01a99"
-TRAVEL_POLL = "d9ec070f-2bb0-4e83-a64d-0b2451ac2252"
-TRAVEL_NO = "62777823-211b-4436-803e-2ba57f735fa5"
-ALBUM_POLL = "47ea91f1-5f0f-4556-8d32-db7b22f43ade"
-ALBUM_1995 = "c107232e-b35c-4f40-bf45-ba74018a43fe"
 
 # venue -> (own pollAnswerId, [answer for the 2nd slot, answer for the 3rd slot])
 # All eleven cities from the registration form, in the order the page lists them.
@@ -169,10 +167,14 @@ def make_session(proxy_url=None, timeout=60, impersonate=None):
 def build_verify(email):
     """Body for POST /fan2/verify/verify (triggers the verification mail).
 
-    Byte-for-byte the same shape the SPA sends, captured from the live page:
-    four top-level fields plus `data`, and `data` carries only tags,
-    pollAnswerIds and acquisition - there is no consentEmail inside it and no
-    captcha field.
+    Field for field what the SPA sends, checked against a fresh capture from a
+    real browser: six top-level fields plus `data`, with `data` carrying tags,
+    pollAnswerIds, consentEmail and acquisition. There is no captcha field on
+    this endpoint.
+
+    `artistId` and `pageId` are page-level constants rather than anything the
+    request negotiates - they identify the Oasis Live '27 registration page and
+    are the same for every account, which is why they are pinned here.
     """
     return {
         "returnUrl": RETURN_URL,
@@ -184,6 +186,9 @@ def build_verify(email):
         "data": {
             "tags": [],
             "pollAnswerIds": [],
+            # Present in the real request. Verification still worked without it,
+            # but there is no reason to look different from the SPA.
+            "consentEmail": True,
             "acquisition": {
                 "channelName": "Register for Oasis Live '27",
                 "channelType": "Registration Page",
@@ -206,86 +211,10 @@ def request_verification(session, email, log=print):
     return r
 
 
-def check_verification(session, token, log=print):
-    """The mail-link step: re-issues the token with emailValid=true."""
-    hdr = _headers()
-    r = _retry(lambda: session.get(
-        f"{API}/fan2/verify/check-verification",
-        params={"token": token, "artistId": ARTIST_ID, "pageId": PAGE_ID},
-        headers=hdr), "check-verification", log)
-    if r.status_code != 200:
-        raise RegistrationError(
-            f"check-verification HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    claims = data.get("claims") or {}
-    if not claims.get("emailValid"):
-        raise RegistrationError(f"emailValid false: {claims}")
-    return data.get("token") or token, claims
 
 
-def build_confirm(ident, token, url, order=None, captcha="", ip=None):
-    order = order or DEFAULT_ORDER
-    primary, *rest = order
-    first = SHOWS[primary]
-    journey = []
-    # slots 2 and 3 of the city poll use the preference polls, in order
-    for slot, venue in enumerate(rest[:2]):
-        poll_id = PREF_POLL_2 if slot == 0 else PREF_POLL_3
-        journey.append({"pollId": poll_id,
-                        "pollAnswerIds": [SHOWS[venue][1][slot]]})
-    journey.append({"pollId": TRAVEL_POLL, "pollAnswerIds": [TRAVEL_NO]})
-    journey.append({"pollId": ALBUM_POLL, "pollAnswerIds": [ALBUM_1995]})
-
-    return {
-        "location": ident["location"],
-        "captcha": captcha,
-        "consentEmail": True,
-        "countryCallingCode": ident.get("country_calling_code", "1"),
-        "nationalPhoneNumber": ident["phone"],
-        "firstName": ident["first_name"],
-        "lastName": ident["last_name"],
-        "dateOfBirth": ident["date_of_birth"],
-        "journeyPollAnswers": journey,
-        "pollAnswerIds": [first[0]],
-        "artistId": ARTIST_ID,
-        "ip": ip,
-        "locale": "en-US",
-        "pageId": PAGE_ID,
-        "pollId": EVENTS_POLL,
-        "tags": ["welcome", "signup-live-27-registration"],
-        "token": token,
-        "url": url,
-    }
 
 
-def confirm(session, body, log=print):
-    """POST /fan2/verify/confirm.
-
-    NOTE: measured 2026-09-16 - a *real* captcha token makes this fail. Same
-    proxy, same mailbox, same minute, only the captcha changed:
-
-        captcha empty -> registration completed (success mail arrived)
-        captcha 2382c -> confirm answered OK, no success mail, ever
-
-    The likely reason is that a reCAPTCHA Enterprise token is bound to the
-    client that minted it, so a token signed in Chromium and replayed from
-    curl_cffi scores as invalid. Sending one is therefore opt-in (send_captcha),
-    off by default, and not enforced here.
-    """
-    r = _retry(lambda: session.post(
-        f"{API}/fan2/verify/confirm", json=body,
-        headers=_headers({"content-type": "application/json"})),
-        "confirm", log)
-    text = r.text.strip()
-    if r.status_code != 200:
-        raise RegistrationError(f"confirm HTTP {r.status_code}: {text[:200]}")
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": text}
-    if data.get("error"):
-        raise RegistrationError(f"confirm rejected: {data['error']}")
-    return data, text
 
 
 def probe_proxy(proxy_url, timeout=25):
@@ -304,33 +233,10 @@ def probe_proxy(proxy_url, timeout=25):
 # ip-api.com free tier: HTTP only, ~45 requests/minute. Results are cached per
 # proxy by the caller, so one lookup per distinct exit is all we ever spend.
 GEO_URL = "http://ip-api.com/json/?fields=status,countryCode,country,city,query"
-IPIFY_URL = "https://api.ipify.org?format=json"
-CF_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
 
-def client_ip(session):
-    """Public IP as Cloudflare sees it.
-
-    The SPA fetches this exact URL before submitting and puts the result in the
-    confirm body's `ip` field; leaving it null is the one structural difference
-    left between our request and the real browser's.
-    """
-    try:
-        txt = session.get(CF_TRACE_URL, timeout=25).text
-    except Exception:
-        return None
-    for line in txt.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()
-    return None
 
 
-def egress_ip(session):
-    """The public IP this curl_cffi session goes out from."""
-    try:
-        return session.get(IPIFY_URL, timeout=25).json().get("ip")
-    except Exception:
-        return None
 
 
 def exit_geo(proxy_url, timeout=20):
