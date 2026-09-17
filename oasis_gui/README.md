@@ -136,6 +136,30 @@ GET /fan2/page/{artist_id}/registration                        -> {"id": "b4356f
 所以偶发的 TLS 握手失败是正常的，重试即可——实测加重试前 3 次里失败 2 次，
 加了之后 5/5 成功。
 
+### 漏斗埋点也一并发
+
+站点在一个**不同的域名**上收漏斗事件（`queue.openstage.live`），浏览器抓包能看到：
+
+```
+页面加载      -> hit, uniquehit
+提交邮箱      -> verify/verify  +  email-entered-hit
+打开邮件链接  -> hit, uniquehit
+```
+
+我们原来一条都不发，而 flow 是「curl 先发 verify、浏览器后开邮件链接」——
+于是站点看到的是「一个 verify 请求，前面没有页面加载、后面没有提交埋点」，
+是个可识别的模式。现在按真实顺序补齐，实测 4 条全部 200：
+
+```
+telemetry hit               -> 200
+telemetry uniquehit         -> 200
+verify/verify               -> {"status":"OK"}
+telemetry email-entered-hit -> 200
+```
+
+埋点失败不影响账号（`report_telemetry` 从不抛异常）——一次统计请求不该让一趟
+注册白跑。
+
 ### verify 请求体与浏览器逐字段一致
 
 `build_verify()` 是现在唯一由 curl 构造、发往站点的请求，所以它必须和 SPA 发的一模一样。
@@ -312,6 +336,30 @@ GET /fan2/page/{artist_id}/registration                        -> {"id": "b4356f
 实现细节：两个请求各走 `_retry`。会话用的是随机指纹、且 relay 每次重新拨上游，
 所以偶发的 TLS 握手失败是正常的，重试即可——实测加重试前 3 次里失败 2 次，
 加了之后 5/5 成功。
+
+### 漏斗埋点也一并发
+
+站点在一个**不同的域名**上收漏斗事件（`queue.openstage.live`），浏览器抓包能看到：
+
+```
+页面加载      -> hit, uniquehit
+提交邮箱      -> verify/verify  +  email-entered-hit
+打开邮件链接  -> hit, uniquehit
+```
+
+我们原来一条都不发，而 flow 是「curl 先发 verify、浏览器后开邮件链接」——
+于是站点看到的是「一个 verify 请求，前面没有页面加载、后面没有提交埋点」，
+是个可识别的模式。现在按真实顺序补齐，实测 4 条全部 200：
+
+```
+telemetry hit               -> 200
+telemetry uniquehit         -> 200
+verify/verify               -> {"status":"OK"}
+telemetry email-entered-hit -> 200
+```
+
+埋点失败不影响账号（`report_telemetry` 从不抛异常）——一次统计请求不该让一趟
+注册白跑。
 
 ### verify 请求体与浏览器逐字段一致
 

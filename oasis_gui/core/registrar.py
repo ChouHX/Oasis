@@ -24,6 +24,9 @@ import time
 from curl_cffi import requests as creq
 
 API = "https://api.openstage.live"
+# Funnel telemetry lives on a different host from the API. The SPA fires it as
+# the visitor moves through the form.
+TELEMETRY_URL = "https://queue.openstage.live/fan1/telemetry"
 RETURN_URL = "https://oasis.hq.fan/registration"
 
 # Where the page's identity comes from. The SPA resolves it the same way on
@@ -265,7 +268,39 @@ def build_verify(email):
     }
 
 
+def report_telemetry(session, metric, log=print):
+    """One funnel event, exactly as the page sends it.
+
+    Captured from a live browser: `hit` and `uniquehit` go out when a page
+    loads, `email-entered-hit` immediately after the verify request. They are
+    the site's own telemetry, and a registration that never reports itself is a
+    difference worth not having - it costs one small POST.
+
+    Never raises. Telemetry failing must not cost an account.
+    """
+    body = {
+        "metric": metric,
+        "resource": RETURN_URL,
+        "origin": RETURN_URL,
+        "pageId": PAGE_ID,
+        "artistId": ARTIST_ID,
+    }
+    try:
+        r = session.post(TELEMETRY_URL, json=body,
+                         headers=_headers(), timeout=20)
+        log(f"    telemetry {metric} -> {r.status_code}")
+        return r.status_code == 200
+    except Exception as e:
+        log(f"    telemetry {metric} 失败（{type(e).__name__}），忽略")
+        return False
+
+
 def request_verification(session, email, log=print):
+    # The order mirrors the real page: a page load reports itself, then the
+    # submit does, then the verify request sits between the two.
+    report_telemetry(session, "hit", log)
+    report_telemetry(session, "uniquehit", log)
+
     body = build_verify(email)
     r = _retry(lambda: session.post(f"{API}/fan2/verify/verify", json=body,
                                     headers=_headers(
@@ -274,6 +309,7 @@ def request_verification(session, email, log=print):
     if r.status_code != 200:
         raise RegistrationError(f"verify/verify HTTP {r.status_code}: {r.text[:200]}")
     log(f"    verify/verify -> {r.text[:80]}")
+    report_telemetry(session, "email-entered-hit", log)
     return r
 
 
