@@ -96,7 +96,7 @@ print(f"[{'OK ' if ok2 else 'FAIL'}] 读到 {len(mails)} 封，判定 {kinds}，
 print("\n== 3. monitor 收到拒绝之后退回全量，账号照样判中签 ==")
 DB = os.path.join(tempfile.mkdtemp(prefix="oasis-fallback-"), "probe.db")
 store = Store(DB)
-store.add_mailboxes(["fallback@outlook.com----pw----cid----rt"], "imap")
+store.add_mailboxes(["fallback@outlook.com----pw----cid----rt"], "imap", opted_in=True)
 # 先让它有 check_count，从而走粗筛那条路（首次是全量，测不出降级）。
 store.record_check(store.check_targets()[0]["id"])
 

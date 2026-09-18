@@ -4,7 +4,7 @@
 不是「能 import 就算数」—— 构造 MainWindow 会把每张页面实例化，再逐个 refresh()，
 走的是和操作者点进去时同一条路径。无头运行，不需要显示器。
 
-    QT_QPA_PLATFORM=offscreen python3 tests/test_desktop.py
+    QT_QPA_PLATFORM=offscreen python3 tests/test_desktop.py [oasis.db]
 """
 import os
 import shutil
@@ -16,9 +16,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-POOL = ROOT / "oasis.db"
-if not POOL.exists():
-    POOL = ROOT.parent / "oasis.db"
+def default_pool():
+    for candidate in (ROOT / "oasis.db", ROOT.parent / "oasis.db"):
+        if candidate.exists():
+            return candidate
+    return ROOT / "oasis.db"
+
+
+POOL = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else default_pool()
 if not POOL.exists():
     print(f"跳过：找不到账号池 {POOL}")
     sys.exit(0)

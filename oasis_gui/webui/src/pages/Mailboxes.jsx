@@ -143,13 +143,14 @@ function ImportPanel({ onImported }) {
   const { message } = AntApp.useApp();
   const [lines, setLines] = useState("");
   const [protocol, setProtocol] = useState("auto");
+  const [opted, setOpted] = useState(true);
   const [busy, setBusy] = useState(false);
 
   const doImport = async () => {
     if (!lines.trim()) { message.warning("先粘贴内容"); return; }
     setBusy(true);
     try {
-      const d = await api.importAccounts(lines, protocol);
+      const d = await api.importAccounts(lines, protocol, opted);
       message.success(`新增 ${d.added} 条，重复 ${d.duplicate} 条`);
       setLines("");
       onImported();
@@ -190,14 +191,28 @@ function ImportPanel({ onImported }) {
                 onClick={doImport}>
           导入到数据库
         </Button>
+        <Checkbox checked={opted} onChange={(e) => setOpted(e.target.checked)}>
+          标记为已预约（纳入检测）
+        </Checkbox>
       </Space>
+      <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 8, marginBottom: 0 }}>
+        只有「已预约」的地址会被检测 —— 没预约过的邮箱收不到中签信。这里的勾选默认
+        打开，因为粘一批地址进来图的本来就是「查这些」；想先放进来再说，取消勾选即可，
+        之后在下面的表格里标记。
+      </Paragraph>
     </Card>
   );
 }
 
-export default function Mailboxes({ refresh }) {
+export default function Mailboxes({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [rows, setRows] = useState([]);
+  const [selected, setSelected] = useState([]);
+  // 池子层面的数字来自 /api/state 的 stats；这个页面自己的 total 是「筛选后
+  // 有多少行」，两者不是一回事，所以分开取名字。
+  const stats = state?.stats || {};
+  const poolTotal = stats.total ?? 0;
+  const optedCount = stats.opted ?? 0;
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [per, setPer] = useState(50);
@@ -223,6 +238,20 @@ export default function Mailboxes({ refresh }) {
 
   const refreshAll = () => { load(page); refresh(); };
 
+  const mark = async (patch, ok) => {
+    setBusy(true);
+    try {
+      const d = await api.optAccounts(patch);
+      message.success(ok(d.changed));
+      setSelected([]);
+      refreshAll();
+    } catch (e) {
+      message.error(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const reset = async () => {
     const d = await api.resetAccounts();
     message.success(`重置 ${d.changed} 条`);
@@ -233,6 +262,12 @@ export default function Mailboxes({ refresh }) {
     { title: "ID", dataIndex: "id", width: 70 },
     { title: "邮箱", dataIndex: "email", ellipsis: true },
     { title: "协议", dataIndex: "protocol", width: 96 },
+    {
+      title: "已预约", dataIndex: "opted_in", width: 110,
+      render: (v, r) => (v
+        ? <Tag color="blue" title={`来源：${r.opted_in_source || "-"}`}>已预约</Tag>
+        : <Tag>未标记</Tag>),
+    },
     {
       title: "中签", dataIndex: "hit_at", width: 130,
       render: (v, r) => (v
@@ -264,11 +299,11 @@ export default function Mailboxes({ refresh }) {
       <ImportPanel onImported={refreshAll} />
 
       <Card
-        title="账号池"
+        title={`账号池（共 ${poolTotal} · 已预约 ${optedCount} · 未标记 ${poolTotal - optedCount}）`}
         size="small"
         extra={
           <Space>
-            <Text type="secondary" style={{ fontSize: 12 }}>共 {total} 条</Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>本页 {rows.length} / 筛选后 {total} 条</Text>
             <Select value={status} onChange={setStatus} style={{ width: 150 }}
                     options={STATUS_FILTER} />
             <Button icon={<ReloadOutlined />} onClick={() => load(1)}>刷新</Button>
@@ -283,13 +318,56 @@ export default function Mailboxes({ refresh }) {
           </Space>
         }
       >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 10 }}
+          message="只有「已预约」的地址会被检测"
+          description={
+            <span style={{ fontSize: 12 }}>
+              没预约过的邮箱收不到中签信，扫它没有意义。已预约的判定来自三处：上一版
+              程序留下的成功记录（打开库时自动并入）、导入时的勾选、以及这里的标记。
+              用别的工具或手工预约过的地址，勾上后点「标记为已预约」把它们加进来。
+            </span>
+          }
+        />
+        <Space wrap style={{ marginBottom: 10 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            已选 {selected.length} 个
+          </Text>
+          <Button size="small" type="primary" disabled={!selected.length || busy}
+                  onClick={() => mark({ ids: selected, on: true },
+                                      (n) => `已标记 ${n} 个为已预约`)}>
+            标记为已预约
+          </Button>
+          <Button size="small" disabled={!selected.length || busy}
+                  onClick={() => mark({ ids: selected, on: false },
+                                      (n) => `已取消标记 ${n} 个`)}>
+            取消标记
+          </Button>
+          <Popconfirm
+            title={`把 ${poolTotal - optedCount} 个未标记账号全部标记为已预约？`}
+            description="它们会从下一轮开始被检测。"
+            okText="全部标记" cancelText="取消"
+            onConfirm={() => mark({ scope: "unmarked", on: true },
+                                  (n) => `已标记 ${n} 个为已预约`)}
+          >
+            <Button size="small" disabled={poolTotal - optedCount === 0 || busy}>
+              全部标记未标记的
+            </Button>
+          </Popconfirm>
+        </Space>
         <Table
           rowKey="id"
           size="small"
           loading={loading}
           columns={columns}
           dataSource={rows}
-          scroll={{ x: 900 }}
+          rowSelection={{
+            selectedRowKeys: selected,
+            onChange: (keys) => setSelected(keys),
+          }}
+          scroll={{ x: 1000 }}
           pagination={{
             current: page,
             pageSize: per,

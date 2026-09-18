@@ -67,6 +67,7 @@ class HitMonitor:
         self.limit = max(0, int(self.setting("limit", None, 0) or 0))
         # 服务端只拉 Oasis 的来信（见 core.mailbox 的 OASIS_SENDER_HINT）。
         # 首次检测一个账号时始终走全量，之后才用粗筛 —— 理由在 _read_and_judge 里。
+        self.only_opted = bool(self.setting("only_opted", None, True))
         self.mail_filter = bool(self.setting("mail_filter", None, True))
         # 某个服务端明确拒绝粗筛之后置位：本轮剩下的账号直接走全量，不浪费一次
         # 必然失败的搜索。
@@ -124,7 +125,7 @@ class HitMonitor:
     # ------------------------------------------------------------------- control
     def start(self, threads=None, interval=None, lookback_days=None,
               per_page=None, skip_hits=None, limit=None, mail_filter=None,
-              rounds=0):
+              only_opted=None, rounds=0):
         """开始巡检。
 
         `rounds=0` 是常驻（一直跑，每轮之间等 interval）；`rounds=1` 只跑一轮
@@ -144,6 +145,7 @@ class HitMonitor:
                                            True if skip_hits is None
                                            else skip_hits, True))
         self.limit = max(0, int(self.setting("limit", limit, 0) or 0))
+        self.only_opted = bool(self.setting("only_opted", only_opted, True))
         self.mail_filter = bool(self.setting("mail_filter", mail_filter, True))
         self.mail_filter_broken = False
         self._abandoned = set()
@@ -151,8 +153,10 @@ class HitMonitor:
         self._stop.clear()
         self._wake.clear()
         self._running = True
-        total = self.store.stats().get("total", 0)
-        self._log("info", f"中签检测启动：{total} 个账号 · {self.threads} 并发 · "
+        stats = self.store.stats()
+        scope = (f"{stats.get('opted', 0)}/{stats.get('total', 0)} 个已预约账号"
+                 if self.only_opted else f"{stats.get('total', 0)} 个账号（含未标记）")
+        self._log("info", f"中签检测启动：{scope} · {self.threads} 并发 · "
                           f"每 {self.interval}s 一轮 · 回看 "
                           f"{int(self.lookback_days)} 天 · "
                           f"{'跳过已中签' if self.skip_hits else '重复检查已中签'}")
@@ -204,7 +208,8 @@ class HitMonitor:
         """跑完一轮：把还没中签的账号全部读一遍。返回本轮统计。"""
         started = time.time()
         targets = [a for a in self.store.check_targets(
-                       skip_hits=self.skip_hits, limit=self.limit or None)
+                       skip_hits=self.skip_hits, limit=self.limit or None,
+                       only_opted=self.only_opted)
                    if not self._busy(a["id"])]
         # 上限是「本轮读几个」，所以 busy 过滤掉的那几个要从后面补回来，
         # 否则设了 3 却只读 1 个 —— 上限就成了掷骰子。
@@ -212,14 +217,18 @@ class HitMonitor:
             short = self.limit - len(targets)
             if short > 0:
                 more = [a for a in self.store.check_targets(
-                            skip_hits=self.skip_hits, limit=self.limit + short)
+                            skip_hits=self.skip_hits, limit=self.limit + short,
+                            only_opted=self.only_opted)
                         if a not in targets and not self._busy(a["id"])]
                 targets += more[:short]
         self._round += 1
         self._last_sweep = started
         if not targets:
-            self._log("info", f"第 {self._round} 轮：没有需要检测的账号"
-                              f"（{'全部已中签' if self.skip_hits else '账号池为空'}）")
+            stats = self.store.stats()
+            why = ("全部已中签" if self.skip_hits else "没有待检测的账号")
+            if self.only_opted and not stats.get("opted"):
+                why = "池子里没有已预约的账号（用界面上的标记功能把要查的加进来）"
+            self._log("info", f"第 {self._round} 轮：没有需要检测的账号（{why}）")
             return {"targets": 0, "checked": 0, "hits": 0, "failed": 0}
         groups = self._group(targets)
         before_hits = self.store.stats().get("hits", 0)

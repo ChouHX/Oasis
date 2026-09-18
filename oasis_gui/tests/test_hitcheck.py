@@ -87,11 +87,11 @@ lines = [
     "g-broken@outlook.com----p----cid----rt",           # G 读信失败
     "h-result@outlook.com----p----cid----rt",           # H 结果信（无成功标记）
 ]
-added, dup = store.add_mailboxes(lines, "graph")
+added, dup = store.add_mailboxes(lines, "graph", opted_in=True)
 assert added == 6, (added, dup)
 
 # E: 那条被旧程序写成失败的记录 —— 用户点名要 merge 的一类
-store.add_mailboxes(["e-nomail@outlook.com----p----cid----rt"], "graph")
+store.add_mailboxes(["e-nomail@outlook.com----p----cid----rt"], "graph", opted_in=True)
 e_id = [r for r in store.accounts() if r["email"] == "e-nomail@outlook.com"][0]["id"]
 store._write(lambda c: c.execute(
     "UPDATE accounts SET status='failed', error=? WHERE id=?",
@@ -99,7 +99,7 @@ store._write(lambda c: c.execute(
      e_id)))
 
 # F: 浏览器模式留下的「页面确认」记录
-store.add_mailboxes(["f-page@outlook.com----p----cid----rt"], "graph")
+store.add_mailboxes(["f-page@outlook.com----p----cid----rt"], "graph", opted_in=True)
 f_id = [r for r in store.accounts() if r["email"] == "f-page@outlook.com"][0]["id"]
 store._write(lambda c: c.execute(
     "UPDATE accounts SET status='submitted', error='页面确认注册成功' WHERE id=?",
@@ -108,7 +108,7 @@ store._write(lambda c: c.execute(
 # 同收件箱的三条 iCloud 别名：必须共用一个 reader（分组复用）
 alias_lines = [f"alias{i}@icloud.com----owner@gmail.com----app-pass----gmail-imap"
                for i in range(3)]
-store.add_mailboxes(alias_lines, "auto")
+store.add_mailboxes(alias_lines, "auto", opted_in=True)
 first_alias = [r for r in store.accounts() if r["email"] == "alias0@icloud.com"][0]
 store._write(lambda c: c.execute(
     "UPDATE accounts SET baseline_at=? WHERE email LIKE '%@icloud.com'",

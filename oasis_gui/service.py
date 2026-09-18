@@ -110,6 +110,7 @@ ENV_KEYS = {
     "OASIS_PER_PAGE": "per_page",
     "OASIS_LIMIT": "limit",
     "OASIS_MAIL_FILTER": "mail_filter",
+    "OASIS_ONLY_OPTED": "only_opted",
     "OASIS_DEBUG": "debug",
     "OASIS_MAIL_PROXY": "mail_proxy",
     "OASIS_HME_BASE": "hme_base",
@@ -118,7 +119,7 @@ ENV_KEYS = {
     "OASIS_ALIAS_PASSWORD": "alias_inbox_password",
 }
 _INT_KEYS = ("interval", "threads", "lookback_days", "per_page", "limit")
-_BOOL_KEYS = ("debug", "skip_hits", "mail_filter")
+_BOOL_KEYS = ("debug", "skip_hits", "mail_filter", "only_opted")
 
 
 def build_config():
@@ -290,6 +291,8 @@ def main():
     log("info", f"build {sysinfo.build_stamp()}")
     if stats.get("hits"):
         log("info", f"名单里已有 {stats['hits']} 个中签账号（含上一版程序并入的）")
+    log("info", f"检测范围：已预约 {stats.get('opted', 0)} 个 · "
+                f"未标记 {stats.get('unmarked', 0)} 个（默认不查）")
     if not stats.get("total"):
         log("warn", "账号池是空的 - 到管理界面的「邮箱池」导入账号")
 
@@ -297,7 +300,9 @@ def main():
     if imported and os.path.exists(imported):
         lines = [l for l in open(imported, encoding="utf-8").read().splitlines()
                  if l.strip()]
-        added, dup = store.add_mailboxes(lines, "auto")
+        # 标记为已预约：这份文件是操作者放进来「要查的」名单，不标记的话它会被
+        # 检测范围排除掉 —— 启动时说「导入了 300 个」，然后一个都不查。
+        added, dup = store.add_mailboxes(lines, "auto", opted_in=True)
         log("info", f"imported {added} new account(s) from {imported} ({dup} dup)")
 
     monitor = HitMonitor(store, log, on_event, conf)
@@ -371,8 +376,13 @@ def main():
         STATUS.set(state="running", sweeps=sweeps, stats=store.stats(),
                    threads=conf.get("threads"), interval=interval,
                    monitor=monitor.stats())
-        log("info", f"巡检 {sweeps}：并发 {conf.get('threads')} · "
-                    f"间隔 {interval}s · 回看 {conf.get('lookback_days')} 天"
+        st = store.stats()
+        only_opted = bool(conf.get("only_opted", True))
+        scope = (f"已预约 {st.get('opted', 0)}" if only_opted
+                 else f"全部 {st.get('total', 0)}")
+        log("info", f"巡检 {sweeps}：范围 {scope}/{st.get('total', 0)} · "
+                    f"并发 {conf.get('threads')} · 间隔 {interval}s · "
+                    f"回看 {conf.get('lookback_days')} 天"
                     + (f" · 本轮上限 {conf.get('limit')} 个"
                        if conf.get("limit") else ""))
         try:
@@ -386,6 +396,7 @@ def main():
                                  skip_hits=bool(conf.get("skip_hits", True)),
                                  limit=int(conf.get("limit") or 0),
                                  mail_filter=bool(conf.get("mail_filter", True)),
+                                 only_opted=bool(conf.get("only_opted", True)),
                                  rounds=1):
                 log("warn", "上一轮还没结束，这一轮跳过（下一轮接上）")
             monitor.join()

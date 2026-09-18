@@ -38,8 +38,10 @@ export const api = {
   resetAccounts: () => call("/api/accounts/reset", { method: "POST" }),
   deleteAccounts: (status) =>
     call("/api/accounts/delete", { method: "POST", body: { status } }),
-  importAccounts: (lines, protocol) =>
-    call("/api/accounts/import", { method: "POST", body: { lines, protocol } }),
+  importAccounts: (lines, protocol, opted = true) =>
+    call("/api/accounts/import", { method: "POST", body: { lines, protocol, opted } }),
+  // 把地址纳进/移出检测范围：给一批 id，或者给 scope（unmarked = 全部还没标记的）。
+  optAccounts: (patch) => call("/api/accounts/opt", { method: "POST", body: patch }),
   icloudAliases: () => call("/api/icloud/aliases"),
   icloudImport: (emails) =>
     call("/api/icloud/import", { method: "POST", body: { emails } }),
@@ -53,19 +55,26 @@ export const api = {
 // `hits` is the only conclusive number; `unchecked` / `checked` / `check_errors`
 // are progress. The old status words (registered / submitted / failed) are not
 // shown: a database from the previous build folds them into hits on open.
+// 口径分两层：`total` 是池子里有多少地址，`opted` 是其中真的预约过、因此会被
+// 检测的那部分。进度类的三个数只在 opted 里算 —— 没预约过的邮箱不会收到中签信，
+// 扫它没有意义，把它算进「还没查过」只会让进度看起来永远落后。
 export const STATUS = {
-  total: { label: "账号总数", color: "#1677ff" },
+  total: { label: "账号总数", color: "#8c8c8c" },
+  opted: { label: "已预约（检测范围）", color: "#1677ff" },
+  unmarked: { label: "未标记（不查）", color: "#bfbfbf" },
   hits: { label: "已中签", color: "#52c41a" },
   unchecked: { label: "还没查过", color: "#8c8c8c" },
   checked: { label: "查过未中签", color: "#13c2c2" },
   check_errors: { label: "读信失败", color: "#ff4d4f" },
-  registrations: { label: "旧预约记录", color: "#722ed1" },
 };
 
 export const STATUS_FILTER = [
   { value: "", label: "全部账号" },
+  { value: "opted", label: "已预约（检测范围）" },
+  { value: "unmarked", label: "未标记" },
   { value: "hit", label: "已中签" },
-  { value: "pending", label: "未中签" },
+  { value: "waiting", label: "未中签" },
+  { value: "error", label: "读信失败" },
 ];
 
 // 中签证据。后端每个中签行都带 label，这份映射只用于筛选与图例。

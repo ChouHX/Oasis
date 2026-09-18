@@ -29,11 +29,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFontMetrics, QTextCursor
-from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout,
-                             QHBoxLayout, QTableWidgetItem, QTextEdit,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
+                             QFrame, QGridLayout, QHBoxLayout,
+                             QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
-from qfluentwidgets import (BodyLabel, CaptionLabel,
+from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox,
                             CompactSpinBox, ComboBox, FluentIcon as FIF,
                             FluentWindow, HeaderCardWidget, InfoBar,
                             InfoBarPosition, LineEdit, MenuAnimationType,
@@ -311,13 +311,17 @@ class DashboardPage(ScrollArea):
 
         row = QHBoxLayout()
         row.setSpacing(GAP)
+        # 口径分两层：账号总数是池子里有多少地址，已预约是其中真的会被检测的那
+        # 部分，进度三个数只在已预约里算。混在一起看会以为进度永远落后 —— 分母里
+        # 有一半地址本来就不会被查。
         self.cards = {
-            "total": StatCard("账号总数", "#3b7dd8"),
+            "total": StatCard("账号总数", "#8a8f98"),
+            "opted": StatCard("已预约（检测范围）", "#3b7dd8"),
+            "unmarked": StatCard("未标记（不查）", "#a0a4ab"),
             "hits": StatCard("已中签", "#1f9d55"),
             "unchecked": StatCard("还没查过", "#8a8f98"),
             "checked": StatCard("查过未中签", "#3fa88a"),
             "check_errors": StatCard("读信失败", "#d64545"),
-            "registrations": StatCard("旧预约记录", "#7a6ad8"),
         }
         for c in self.cards.values():
             row.addWidget(c, 1)
@@ -400,12 +404,17 @@ class DashboardPage(ScrollArea):
         s = self.win.store.stats()
         if not s.get("total", 0):
             return "先到「邮箱池」导入账号，然后点「开始检测」。"
+        scope = (f"检测范围：已预约 {s.get('opted', 0)} 个"
+                 f"（未标记 {s.get('unmarked', 0)} 个不查）")
+        if not s.get("opted", 0):
+            return ("池子里还没有已预约的账号 —— 到「邮箱池」勾上要查的地址点"
+                    "「所选标为已预约」，或导入时勾选「标记为已预约」。")
         if s.get("hits"):
-            return (f"就绪：{s['total']} 个账号 · 已中签 {s['hits']} · "
-                    f"未检测 {s.get('unchecked', 0)} · "
-                    f"并发 {self.threads.value()} · 每 {self.interval.value()}s 一轮")
-        return (f"就绪：{s['total']} 个账号全部待检 · "
-                f"并发 {self.threads.value()} · 每 {self.interval.value()}s 一轮")
+            return (f"{scope} · 已中签 {s['hits']} · 未检测 "
+                    f"{s.get('unchecked', 0)} · 并发 {self.threads.value()} · "
+                    f"每 {self.interval.value()}s 一轮")
+        return (f"{scope} · 并发 {self.threads.value()} · "
+                f"每 {self.interval.value()}s 一轮")
 
     def refresh_host(self):
         """内存 + 推荐并发数。检测程序不吃内存，瓶颈在上游并发限制。"""
@@ -512,14 +521,26 @@ class MailboxPage(QWidget):
         self.btn_export.clicked.connect(self.on_export)
         for b in (self.btn_import, self.btn_file, self.btn_verify, self.btn_export):
             row.addWidget(b)
+        self.opted_on_import = CheckBox("标记为已预约（纳入检测）")
+        self.opted_on_import.setChecked(True)
+        self.opted_on_import.setToolTip(
+            "只有「已预约」的地址会被检测 —— 没预约过的邮箱收不到中签信。\n"
+            "默认勾上：粘一批地址进来，图的本来就是「查这些」。")
+        row.addWidget(self.opted_on_import)
         row.addStretch(1)
         ibody.addLayout(row)
         root.addWidget(imp)
 
         lst, lbody = make_card("账号列表")
         self.list_card = lst
-        self.table = make_table(["ID", "邮箱", "协议", "中签", "证据来源",
-                                 "最近来信", "检查次数", "检测错误", "更新时间"])
+        self.table = make_table(["ID", "邮箱", "协议", "已预约", "中签",
+                                 "证据来源", "最近来信", "检查次数",
+                                 "检测错误", "更新时间"])
+        # 多选 + 整行选中：标记功能是按行勾的，逐格点选没有意义。
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         lbody.addWidget(self.table, 1)
         rrow = QHBoxLayout()
         rrow.setSpacing(8)
@@ -530,6 +551,19 @@ class MailboxPage(QWidget):
         rrow.addWidget(self.btn_refresh)
         rrow.addWidget(self.btn_reset)
         rrow.addStretch(1)
+        rrow.addWidget(CaptionLabel("标记："))
+        # 图标只用项目里已经在用的那几个（ADD / DELETE / UPDATE）。曾经用过
+        # FIF.SELECT_ALL，它在真实版本的 qfluentwidgets 里不存在，桌面版一构造就
+        # AttributeError —— 在容器里跑渲染测试才发现的。
+        self.btn_mark_on = PushButton(FIF.ADD, "所选标为已预约")
+        self.btn_mark_on.clicked.connect(lambda: self.on_mark(True))
+        self.btn_mark_off = PushButton(FIF.DELETE, "取消标记")
+        self.btn_mark_off.clicked.connect(lambda: self.on_mark(False))
+        self.btn_mark_all = PushButton(FIF.UPDATE, "全部未标记的标进来")
+        self.btn_mark_all.clicked.connect(self.on_mark_all)
+        for b in (self.btn_mark_on, self.btn_mark_off, self.btn_mark_all):
+            rrow.addWidget(b)
+        rrow.addSpacing(10)
         rrow.addWidget(CaptionLabel("清理："))
         self.btn_clean_hit = PushButton(FIF.DELETE, "已中签")
         self.btn_clean_hit.clicked.connect(lambda: self.on_clean("hit"))
@@ -591,7 +625,8 @@ class MailboxPage(QWidget):
     def on_import(self):
         proto = mailbox.PROTOCOLS[self.protocol.currentIndex()]
         added, dup = self.win.store.add_mailboxes(
-            self.text.toPlainText().splitlines(), proto)
+            self.text.toPlainText().splitlines(), proto,
+            opted_in=self.opted_on_import.isChecked())
         self.text.clear()
         self.refresh()
         self.win.notify("success",
@@ -605,7 +640,8 @@ class MailboxPage(QWidget):
         proto = mailbox.PROTOCOLS[self.protocol.currentIndex()]
         with open(path, "r", encoding="utf-8", errors="ignore") as fh:
             lines = fh.read().splitlines()
-        added, dup = self.win.store.add_mailboxes(lines, proto)
+        added, dup = self.win.store.add_mailboxes(
+            lines, proto, opted_in=self.opted_on_import.isChecked())
         self.refresh()
         self.win.notify("success",
                         f"[{mailbox.PROTOCOL_LABEL[proto]}] 新增 {added}，重复 {dup}")
@@ -650,6 +686,47 @@ class MailboxPage(QWidget):
             fh.write("\n".join(lines))
         self.win.notify("success", f"已导出 {len(lines)} 条")
 
+    def selected_ids(self):
+        """表格里选中的账号 id（第 0 列就是 ID）。"""
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        out = []
+        for r in rows:
+            item = self.table.item(r, 0)
+            if item and item.text().strip().isdigit():
+                out.append(int(item.text()))
+        return out
+
+    def on_mark(self, on):
+        ids = self.selected_ids()
+        if not ids:
+            self.win.notify("warning", "先在表里选几行（可以按住 Shift 多选）")
+            return
+        n = self.win.store.mark_opted(ids, on=on)
+        self.refresh()
+        self.win._refresh_all()
+        self.win.notify("success",
+                        f"{'已标记' if on else '已取消标记'} {n} 个账号")
+        self.win.log("warn", f"标记 {n} 个账号 opted_in={on}")
+
+    def on_mark_all(self):
+        """把整份名单一次标进来 —— 用别的工具预约过的地址是这里的主客。"""
+        s = self.win.store.stats()
+        n = s.get("unmarked", 0)
+        if not n:
+            self.win.notify("warning", "没有未标记的账号")
+            return
+        if not MessageBox(
+                "全部标记为已预约",
+                f"把 {n} 个未标记账号全部标记为已预约？\n\n"
+                f"它们会从下一轮开始被检测。若其中有些地址其实没预约过，"
+                f"检测它们不会有结果，只是白花时间。", self).exec():
+            return
+        changed = self.win.store.mark_unmarked(on=True)
+        self.refresh()
+        self.win._refresh_all()
+        self.win.notify("success", f"已标记 {changed} 个账号为已预约")
+        self.win.log("warn", f"批量标记 {changed} 个账号为已预约")
+
     def on_reset(self):
         n = self.win.store.reset_checks()
         self.refresh()
@@ -660,10 +737,12 @@ class MailboxPage(QWidget):
         s = self.win.store.stats()
         rows = self.win.store.accounts(DISPLAY_LIMIT)
         self.list_card.setTitle(
-            f"账号列表（共 {s.get('total', 0)} 条，中签 {s.get('hits', 0)}，"
+            f"账号列表（共 {s.get('total', 0)} · 已预约 {s.get('opted', 0)} · "
+            f"未标记 {s.get('unmarked', 0)} · 中签 {s.get('hits', 0)}，"
             f"显示最近 {len(rows)}）")
         fill_row(self.table, [
             [r["id"], r["email"], r.get("protocol") or "graph",
+             "已预约" if r.get("opted_in") else "未标记",
              _when(r.get("hit_at")), hitcheck.SOURCE_LABEL.get(
                  r.get("hit_source"), r.get("hit_source") or ""),
              _when(r.get("last_mail_at")), r.get("check_count") or 0,
@@ -720,6 +799,12 @@ class SettingsPage(ScrollArea):
         self.skip_hits.setToolTip(
             "开启后已中签的账号不再重复检测 —— 同一个答案重复搜索没有意义。\n"
             "若想连后续的付款/取票通知一起盯，把它关掉。")
+        self.only_opted = SwitchButton()
+        self.only_opted.setChecked(bool(win.cfg.get("only_opted", True)))
+        self.only_opted.setToolTip(
+            "只检测标记为「已预约」的地址。没预约过的邮箱收不到中签信，扫它没有\n"
+            "意义 —— 八百人的池子里常常只有一半提交过注册。判定来自上一版程序的\n"
+            "成功记录（打开库时自动并入）、导入时的勾选、以及邮箱池的手工标记。")
         self.mail_filter = SwitchButton()
         self.mail_filter.setChecked(bool(win.cfg.get("mail_filter", True)))
         self.mail_filter.setToolTip(
@@ -735,6 +820,7 @@ class SettingsPage(ScrollArea):
                 ("首次回看(天)", self.lookback_days),
                 ("每箱取信(封)", self.per_page),
                 ("跳过已中签", self.skip_hits),
+                ("只查已预约的", self.only_opted),
                 ("只拉 Oasis 来信", self.mail_filter),
                 ("调试堆栈", self.debug)]
         for i, (label, w) in enumerate(rows):
@@ -826,6 +912,7 @@ class SettingsPage(ScrollArea):
             "lookback_days": self.lookback_days.value(),
             "per_page": self.per_page.value(),
             "skip_hits": self.skip_hits.isChecked(),
+            "only_opted": self.only_opted.isChecked(),
             "mail_filter": self.mail_filter.isChecked(),
             "mail_proxy": self.mail_proxy.text().strip(),
             "hme_base": self.hme_base.text().strip(),

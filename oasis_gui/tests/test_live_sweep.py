@@ -56,8 +56,11 @@ if len(picked) < 2:
     sys.exit(0)
 
 
-def limited(limit=None, skip_hits=True, only=None):
-    return [r for r in real_targets(skip_hits=skip_hits, only=only)
+def limited(limit=None, skip_hits=True, only=None, only_opted=True):
+    # 这个桩自己指定两个样本，所以 opted 的筛选在这里不参与 —— 但签名要跟上，
+    # 否则 monitor 一传 only_opted 就 TypeError。
+    return [r for r in real_targets(skip_hits=skip_hits, only=only,
+                                    only_opted=False)
             if r["email"] in picked]
 
 

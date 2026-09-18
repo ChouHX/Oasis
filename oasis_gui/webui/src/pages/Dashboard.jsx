@@ -94,6 +94,7 @@ export default function Dashboard({ state, refresh }) {
   const [lookback, setLookback] = useState(30);
   const [skipHits, setSkipHits] = useState(true);
   const [mailFilter, setMailFilter] = useState(true);
+  const [onlyOpted, setOnlyOpted] = useState(true);
   const [busy, setBusy] = useState(false);
 
   // Seed the run controls once per visit, and never again.
@@ -114,6 +115,7 @@ export default function Dashboard({ state, refresh }) {
     if (c.lookback_days !== undefined) setLookback(c.lookback_days);
     if (c.skip_hits !== undefined) setSkipHits(!!c.skip_hits);
     if (c.mail_filter !== undefined) setMailFilter(!!c.mail_filter);
+    if (c.only_opted !== undefined) setOnlyOpted(!!c.only_opted);
   }, [state?.config]);
 
   const stats = state?.stats || {};
@@ -140,6 +142,7 @@ export default function Dashboard({ state, refresh }) {
   };
   const changeSkipHits = (v) => { setSkipHits(v); persist({ skip_hits: v }); };
   const changeMailFilter = (v) => { setMailFilter(v); persist({ mail_filter: v }); };
+  const changeOnlyOpted = (v) => { setOnlyOpted(v); persist({ only_opted: v }); };
 
   const run = async (fn, ok) => {
     setBusy(true);
@@ -214,6 +217,13 @@ export default function Dashboard({ state, refresh }) {
             <Switch size="small" checked={skipHits} onChange={changeSkipHits} />
           </Space>
           <Space size={6}>
+            <Text type="secondary">只查已预约</Text>
+            <Tooltip title="没预约过的邮箱收不到中签信，扫它没有意义。默认只检测标记为「已预约」的地址 —— 判定来自上一版程序的成功记录、导入时的勾选、以及邮箱池页的手工标记。关掉它则整池都查。">
+              <Switch size="small" checked={onlyOpted}
+                      onChange={changeOnlyOpted} />
+            </Tooltip>
+          </Space>
+          <Space size={6}>
             <Text type="secondary">只拉 Oasis 来信</Text>
             <Tooltip title="让服务端只把 Oasis 的信拉回来（发件人 openstage 或标题含 Oasis），而不是把「最近 N 封」整个拉回本地挑。首次检测一个账号时始终走全量，保证不漏掉已经发过的结果信。若站点换了发件人域、结果标题里又没有 Oasis，把它关掉。">
               <Switch size="small" checked={mailFilter}
@@ -227,7 +237,8 @@ export default function Dashboard({ state, refresh }) {
             disabled={state?.running}
             onClick={() => run(
               () => api.start({ threads, interval, lookback_days: lookback,
-                                skip_hits: skipHits, mail_filter: mailFilter }),
+                                skip_hits: skipHits, mail_filter: mailFilter,
+                                only_opted: onlyOpted }),
               "已开始检测")}
           >
             开始检测

@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_mail_at    REAL,
     last_mail_subject TEXT,
     baseline_at     REAL,
+    -- 「这个地址真的预约过」。只有预约过的地址才可能收到中签信，所以检测范围
+    -- 默认就是 opted_in=1 的账号；池子里的其他地址（试过但没成功、或者压根只是
+    -- 存着）不查。见 migrate_legacy_hits 与 mark_opted。
+    opted_in        INTEGER NOT NULL DEFAULT 0,
+    opted_in_source TEXT,
+    opted_in_at     REAL,
     UNIQUE (first_name, last_name, phone)
 );
 
@@ -103,9 +109,10 @@ class Store:
         c.executescript(SCHEMA)
         self._migrate(c)
         c.commit()
-        n = self.migrate_legacy_hits()
-        if n:
-            print(f"store: 旧记录并入中签名单 {n} 条", flush=True)
+        merged, opted = self.migrate_legacy_hits()
+        if merged or opted:
+            print(f"store: 旧记录并入中签名单 {merged} 条，"
+                  f"推断出已预约 {opted} 个", flush=True)
 
     def _migrate(self, c):
         """Additive migrations for databases created by an earlier build."""
@@ -126,7 +133,9 @@ class Store:
                 ("checked_at", "REAL"),
                 ("check_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("check_error", "TEXT"), ("last_mail_at", "REAL"),
-                ("last_mail_subject", "TEXT"), ("baseline_at", "REAL")):
+                ("last_mail_subject", "TEXT"), ("baseline_at", "REAL"),
+                ("opted_in", "INTEGER NOT NULL DEFAULT 0"),
+                ("opted_in_source", "TEXT"), ("opted_in_at", "REAL")):
             if name not in cols:
                 c.execute(f"ALTER TABLE accounts ADD COLUMN {name} {decl}")
         rcols = {r["name"] for r in c.execute("PRAGMA table_info(registrations)")}
@@ -163,19 +172,24 @@ class Store:
                 raise
 
     # ------------------------------------------------------------------ mailboxes
-    def add_mailbox(self, cred, protocol="graph"):
-        """Insert one mailbox credential; returns (id, created?)."""
+    def add_mailbox(self, cred, protocol="graph", opted_in=False):
+        """Insert one mailbox credential; returns (id, created?).
+
+        `opted_in` 把新账号直接纳入检测范围。导入面板默认勾上它 —— 操作者把
+        一批地址粘进来，图的本来就是「查这些」，再让他勾一遍是多余的。
+        """
         email = cred["email"].strip().lower()
         ts = now()
 
         def op(c):
             cur = c.execute(
                 "INSERT INTO accounts (email,password,client_id,client_secret,"
-                "refresh_token,protocol,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "refresh_token,protocol,created_at,updated_at,opted_in,"
+                "opted_in_source,opted_in_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (email, cred.get("password", ""), cred.get("client_id", ""),
                  cred.get("client_secret", ""), cred.get("refresh_token", ""),
-                 protocol or "graph", ts, ts))
+                 protocol or "graph", ts, ts, 1 if opted_in else 0,
+                 "import" if opted_in else None, time.time() if opted_in else None))
             return cur.lastrowid
 
         try:
@@ -220,7 +234,7 @@ class Store:
                     "client_id": parts[2], "refresh_token": parts[3]}
         return None
 
-    def add_mailboxes(self, lines, protocol="graph"):
+    def add_mailboxes(self, lines, protocol="graph", opted_in=False):
         """Bulk import credential lines.
 
         The whole batch shares one fetch protocol (graph or imap), chosen at
@@ -234,13 +248,25 @@ class Store:
             cred = self.parse_line(raw)
             if not cred:
                 continue
-            _, created = self.add_mailbox(cred, cred.get("_protocol") or protocol)
+            account_id, created = self.add_mailbox(
+                cred, cred.get("_protocol") or protocol, opted_in=opted_in)
+            if not created and opted_in and account_id:
+                # 重复导入的地址如果这次要求标记，就顺手标上：操作者粘贴一整份
+                # 名单时，其中一部分早就在池子里了，不该只标记新来的那一半。
+                self.mark_opted([account_id], on=True, source="import")
             added += 1 if created else 0
             dup += 0 if created else 1
         return added, dup
 
-    def check_targets(self, limit=None, skip_hits=True, only=None):
+    def check_targets(self, limit=None, skip_hits=True, only=None,
+                      only_opted=True):
         """要检测的账号，最久没查过的优先（凭据全带）。
+
+        `only_opted` 默认只给「已预约」的地址：没预约过的邮箱不会收到中签信，
+        扫它纯属浪费 —— 一个 800 人的池子里可能只有一半提交过注册，每一轮把这
+        另一半也读一遍是实打实的无效请求。检测范围由 opted_in 决定，而它来自
+        三处：上一版程序留下的成功记录（自动并入）、导入时的标记、以及手工标记。
+
 
         顺序是刻意的：`checked_at IS NULL` 排最前（新导入的账号先看一遍），
         然后是等得最久的。这样一轮扫描的时间不会因为某个邮箱卡住而永远轮不到
@@ -250,7 +276,8 @@ class Store:
         仍想继续盯（比如后续还会发付款链接）就把它关掉。
         """
         sql = ("SELECT * FROM accounts WHERE "
-               + ("hit_at IS NULL" if skip_hits else "1=1")
+               + ("opted_in=1" if only_opted else "1=1")
+               + (" AND hit_at IS NULL" if skip_hits else "")
                + (" AND status=?" if only else "")
                + " ORDER BY checked_at IS NOT NULL, checked_at ASC, id ASC")
         args = [only] if only else []
@@ -388,8 +415,60 @@ class Store:
                 "SELECT account_id FROM registrations WHERE response LIKE ?)",
                 (stamp, now(), f"%{hitcheck.NO_MAIL_OK_MARK}%"))
             changed += cur.rowcount
-            return changed
+            # 4) 「这个地址预约过」的推断。
+            #
+            # 池子里绝大多数地址没预约过 —— 试过但没成功、或者只是被存着 —— 而没
+            # 预约过的邮箱不可能收到中签信。检测范围因此默认只含 opted_in=1 的
+            # 账号，这一句把上一版程序留下的「预约过」的全部证据翻出来：中签的、
+            # 状态是 registered/submitted 的、以及有 registrations 行的。
+            #
+            # 唯一不在这里的是「用别的工具/手工预约的地址」—— 那种只有操作者知道，
+            # 由界面上的标记功能补上。
+            cur = c.execute(
+                "UPDATE accounts SET opted_in=1, opted_in_source='legacy', "
+                "opted_in_at=? WHERE opted_in=0 AND ("
+                "hit_at IS NOT NULL "
+                "OR status IN ('registered','submitted') "
+                "OR error LIKE ? "
+                "OR id IN (SELECT account_id FROM registrations))",
+                (stamp, f"%{hitcheck.NO_MAIL_OK_MARK}%"))
+            opted = cur.rowcount
+            return changed, opted
         return self._write(op)
+
+    def mark_opted(self, account_ids, on=True, source="manual"):
+        """把一批账号标进/移出检测范围。
+
+        这是给「用别的工具或手工预约的邮箱」准备的口子：程序推不出来它们预约过，
+        但操作者知道。返回真正改变的行数。
+        """
+        ids = [int(i) for i in (account_ids or [])]
+        if not ids:
+            return 0
+        flag = 1 if on else 0
+        stamp = time.time() if on else None
+        marks = ",".join("?" * len(ids))
+
+        def op(c):
+            cur = c.execute(
+                f"UPDATE accounts SET opted_in=?, opted_in_source=?, "
+                f"opted_in_at=?, updated_at=? WHERE id IN ({marks})",
+                [flag, source if on else None, stamp, now()] + ids)
+            return cur.rowcount
+        return self._write(op)
+
+    def mark_unmarked(self, on=True, source="manual"):
+        """把所有还没标记的账号一次性标进来（或全部取消）。
+
+        一整份名单一次标完，是这里的典型用法 —— 让操作者逐个勾八百个邮箱没有
+        意义。
+        """
+        flag = 1 if on else 0
+        stamp = time.time() if on else None
+        return self._write(lambda c: c.execute(
+            "UPDATE accounts SET opted_in=?, opted_in_source=?, opted_in_at=?, "
+            "updated_at=? WHERE opted_in=0",
+            (flag, source if on else None, stamp, now())).rowcount)
 
     def reset_checks(self):
         """清掉检测错误，让每个账号重新排队（不触碰已成立的中签）。"""
@@ -419,10 +498,13 @@ class Store:
 
     # --------------------------------------------------------------------- queries
     def stats(self):
-        """计数。`hits` 是唯一的结论性数字，其余是检测进度。
+        """计数。
 
-        `registered` / `submitted` / `failed` 是上一版程序留下的 status 值，
-        登录到中签名单后它们仍会被统计出来，所以老库的第一眼不会是一片空白。
+        口径分成两层，别混：`total` 是池子里有多少地址，`opted` 是其中真的预约
+        过、因此会被检测的那部分。进度类的三个数（unchecked / checked /
+        check_errors）都只在 opted 里算 —— 以前它们按全体算，于是「还没查过 453」
+        里混着一堆永远不会被查、查了也没有意义的地址，看起来像进度落后，实际
+        是分母错了。
         """
         c = self.conn()
         out = {}
@@ -430,16 +512,20 @@ class Store:
             out[row["status"]] = row["n"]
         out["total"] = c.execute(
             "SELECT COUNT(*) n FROM accounts").fetchone()["n"]
+        out["opted"] = c.execute(
+            "SELECT COUNT(*) n FROM accounts WHERE opted_in=1").fetchone()["n"]
+        out["unmarked"] = out["total"] - out["opted"]
         out["hits"] = c.execute(
             "SELECT COUNT(*) n FROM accounts WHERE hit_at IS NOT NULL").fetchone()["n"]
-        out["checked"] = c.execute(
-            "SELECT COUNT(*) n FROM accounts WHERE checked_at IS NOT NULL").fetchone()["n"]
         out["unchecked"] = c.execute(
-            "SELECT COUNT(*) n FROM accounts WHERE checked_at IS NULL AND "
-            "hit_at IS NULL").fetchone()["n"]
+            "SELECT COUNT(*) n FROM accounts WHERE opted_in=1 AND hit_at IS NULL "
+            "AND checked_at IS NULL").fetchone()["n"]
+        out["checked"] = c.execute(
+            "SELECT COUNT(*) n FROM accounts WHERE opted_in=1 AND hit_at IS NULL "
+            "AND checked_at IS NOT NULL").fetchone()["n"]
         out["check_errors"] = c.execute(
-            "SELECT COUNT(*) n FROM accounts WHERE check_error IS NOT NULL AND "
-            "hit_at IS NULL").fetchone()["n"]
+            "SELECT COUNT(*) n FROM accounts WHERE opted_in=1 AND hit_at IS NULL "
+            "AND check_error IS NOT NULL").fetchone()["n"]
         out["registrations"] = c.execute(
             "SELECT COUNT(*) n FROM registrations").fetchone()["n"]
         return out
@@ -452,7 +538,8 @@ class Store:
         """
         sql = ("SELECT id,email,first_name,last_name,phone,date_of_birth,status,"
                "protocol,error,updated_at,hit_at,hit_source,hit_note,checked_at,"
-               "check_count,check_error,last_mail_at,last_mail_subject "
+               "check_count,check_error,last_mail_at,last_mail_subject,"
+               "opted_in,opted_in_source,opted_in_at "
                "FROM accounts ORDER BY id DESC")
         c = self.conn()
         if limit:

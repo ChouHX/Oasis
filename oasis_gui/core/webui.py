@@ -72,9 +72,21 @@ def _shows_label(raw):
 
 
 def split_lines(raw):
-    """Credential lines: newline or comma separated, # comments dropped."""
+    """凭据行：换行或逗号分隔，`#` 开头的丢掉。列表也接受。
+
+    列表**不能**再 `str()` 一遍：`str(["a@x.com", "b@x.com"])` 是
+    `"['a@x.com', 'b@x.com']"`，按逗号切出来的是带引号和方括号的碎片，然后它们
+    会被当邮箱存进库 —— 接口收到一个数组就静默写出 `['a@x.com` 这种地址。踩过
+    一次，所以这里显式分两种情况。
+    """
+    if isinstance(raw, (list, tuple, set)):
+        chunks = []
+        for item in raw:
+            chunks += str(item).replace(",", "\n").splitlines()
+    else:
+        chunks = str(raw or "").replace(",", "\n").splitlines()
     out = []
-    for chunk in str(raw).replace(",", "\n").splitlines():
+    for chunk in chunks:
         line = chunk.strip()
         if line and not line.startswith("#"):
             out.append(line)
@@ -303,7 +315,8 @@ class WebAdmin:
                      for a in cat if a["email"].lower() in want]
             if not lines:
                 return self._json(400, {"error": "勾选的别名在服务上找不到了"})
-            added, dup = self.store.add_mailboxes(lines, "hme")
+            # 勾选导入的别名同样是「要查的」，一并标记。
+            added, dup = self.store.add_mailboxes(lines, "hme", opted_in=True)
             self.log("info", f"web: imported {added} iCloud alias(es), "
                              f"{dup} already present")
             return self._json(200, {"added": added, "duplicate": dup,
@@ -322,6 +335,15 @@ class WebAdmin:
                                                        r.get("hit_source") or "")
             if status == "hit":
                 rows = [r for r in rows if r.get("hit_at")]
+            elif status == "opted":
+                rows = [r for r in rows if r.get("opted_in")]
+            elif status == "unmarked":
+                rows = [r for r in rows if not r.get("opted_in")]
+            elif status == "waiting":
+                # 「未中签」= 在检测范围里、但还没有中签结论的。
+                rows = [r for r in rows if r.get("opted_in") and not r.get("hit_at")]
+            elif status == "error":
+                rows = [r for r in rows if r.get("check_error")]
             elif status:
                 rows = [r for r in rows if r["status"] == status]
             total = len(rows)
@@ -346,8 +368,11 @@ class WebAdmin:
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
             protocol = (body or {}).get("protocol") or "auto"
-            added, dup = self.store.add_mailboxes(lines, protocol)
-            self.log("info", f"web: imported {added} account(s), {dup} duplicate")
+            # 默认标记为已预约：粘一批地址进来，图的本来就是「查这些」。
+            opted = bool((body or {}).get("opted", True))
+            added, dup = self.store.add_mailboxes(lines, protocol, opted_in=opted)
+            self.log("info", f"web: imported {added} account(s), {dup} duplicate"
+                             + ("（已标记为已预约）" if opted else ""))
             return self._json(200, {"added": added, "duplicate": dup,
                                     "stats": self.store.stats()})
 
@@ -389,6 +414,25 @@ class WebAdmin:
             self.config.save()
             return self._json(200, {"ok": True,
                                     "config": self._public_config()})
+
+        if path == "/api/accounts/opt" and method == "POST":
+            # 把地址纳进/移出检测范围。两种用法：给一批 id（表格勾选），或者
+            # 给一个 scope（「全部未标记的」—— 一整份名单一次标完才是常态）。
+            body = body or {}
+            on = bool(body.get("on", True))
+            scope = (body.get("scope") or "").strip()
+            if scope == "unmarked":
+                n = self.store.mark_unmarked(on=on, source="manual")
+            elif scope == "all":
+                ids = [r["id"] for r in self.store.accounts()]
+                n = self.store.mark_opted(ids, on=on, source="manual")
+            else:
+                ids = body.get("ids") or []
+                if not ids:
+                    return self._json(400, {"error": "没有指定账号"})
+                n = self.store.mark_opted(ids, on=on, source="manual")
+            self.log("info", f"web: {'标记' if on else '取消标记'} {n} 个账号为已预约")
+            return self._json(200, {"changed": n, "stats": self.store.stats()})
 
         if path == "/api/accounts/reset" and method == "POST":
             # 重新排队 = 清掉检测记录重来（不触碰已成立的中签）。
