@@ -169,6 +169,26 @@ print(f"[{'OK ' if broken['check_error'] and not broken['hit_at'] else 'FAIL'}] 
 if not (broken["check_error"] and not broken["hit_at"]):
     ok = False
 
+# 分组：承载收件箱的是 client_id，所以只有 client_id 相同的别名才共用连接。
+# 缺 client_id 的行（老格式、手工粘贴少字段）必须各自一组 —— 拼在一起等于拿
+# A 的收件箱密码去登 B 的别名，读到的要么是别人的邮箱要么是登录失败。
+mixed = monitor_mod.HitMonitor._group([
+    {"id": 1, "email": "a@icloud.com", "protocol": "alias-imap",
+     "client_id": "owner@gmail.com"},
+    {"id": 2, "email": "b@icloud.com", "protocol": "alias-imap",
+     "client_id": "OWNER@gmail.com"},
+    {"id": 3, "email": "c@icloud.com", "protocol": "alias-imap",
+     "client_id": None},
+    {"id": 4, "email": "d@icloud.com", "protocol": "alias-imap",
+     "client_id": ""},
+])
+sizes = [len(g) for g in mixed]
+group_ok = sizes == [2, 1, 1]
+print(f"[{'OK ' if group_ok else 'FAIL'}] 别名分组：同一收件箱合一，缺 client_id 的"
+      f"各自成组（{sizes}）")
+if not group_ok:
+    ok = False
+
 # 分组复用：3 条别名共用一个收件箱 -> 只该建 1 个 reader
 alias_readers = [m for m in built if m.email in
                  ("alias0@icloud.com", "alias1@icloud.com", "alias2@icloud.com")]

@@ -14,6 +14,7 @@ MailSearchUnsupported（而不是空列表）；不加筛选时照常读到信�
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -22,6 +23,8 @@ from core import hitcheck                       # noqa: E402
 from core import monitor as monitor_mod         # noqa: E402
 from core.mailbox import (ImapMailbox, Mail, MailSearchUnsupported,  # noqa: E402
                           parse_cred)
+
+NOW = time.time()
 from core.store import Store                    # noqa: E402
 
 RAW = (b"From: Oasis <oasis@openstageit.com>\r\n"
@@ -138,5 +141,31 @@ for lvl, msg in LOGS:
     if lvl == "warn":
         print(f"       日志：[{lvl}] {msg}")
 
-print("\nRESULT:", "PASS" if (ok1 and ok2 and ok3) else "FAIL")
-sys.exit(0 if (ok1 and ok2 and ok3) else 1)
+print("\n== 4. SEARCH 条件串的形状（IMAP 前缀 OR 只能吃紧随其后的两个条件）==")
+# 这一条是语法级的：账号池里没有能走 IMAP 的邮箱（Outlook 对这些 OAuth 号回
+# "User is authenticated but not connected"），所以真机只验到了 Graph 那一侧。
+# 但条件串必须精确 —— 顺序错了语义就变了：`SINCE d OR FROM a SUBJECT b` 读作
+# `SINCE d AND ((FROM a) OR (SUBJECT b))`，这正是我们要的；而把 OR 挪到最前面
+# 会变成 `(SINCE d OR FROM a) AND SUBJECT b`，直接把验证信筛掉。
+from core.mailbox import GmailAliasMailbox, ImapMailbox   # noqa: E402
+
+days = 30
+since = time.strftime("%d-%b-%Y", time.gmtime(NOW - days * 86400 - 86400))
+want_terms = ["SINCE", since, "OR", "FROM", '"openstage"',
+              "SUBJECT", '"Oasis"']
+plain_terms = ImapMailbox(CRED).search_terms(only_oasis=True,
+                                             not_before=NOW - days * 86400)
+alias = GmailAliasMailbox({"email": "a@icloud.com", "client_id": "owner@gmail.com",
+                           "password": "pw", "refresh_token": ""})
+alias_terms = alias._search_args(not_before=NOW - days * 86400, only_oasis=True)
+want_alias = ["TO", "a@icloud.com"] + want_terms
+ok4 = plain_terms == want_terms and alias_terms == want_alias
+print(f"[{'OK ' if ok4 else 'FAIL'}] IMAP        {plain_terms}")
+print(f"[{'OK ' if ok4 else 'FAIL'}] Gmail 别名  {alias_terms}")
+# imaplib 会把这些拼成 `SEARCH SINCE ... OR FROM "openstage" SUBJECT "Oasis"`：
+# charset 传 None，所以它不会插入 CHARSET 子句。
+ok4 = ok4 and ImapMailbox(CRED).search_terms(only_oasis=False, not_before=None) == ["ALL"]
+print(f"[{'OK ' if ok4 else 'FAIL'}] 两个提示都不给时退回 SEARCH ALL")
+
+print("\nRESULT:", "PASS" if (ok1 and ok2 and ok3 and ok4) else "FAIL")
+sys.exit(0 if (ok1 and ok2 and ok3 and ok4) else 1)

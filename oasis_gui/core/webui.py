@@ -81,6 +81,33 @@ def split_lines(raw):
     return out
 
 
+# 凭据类配置键：它们只报「有没有设置」，内容不出网关。
+#
+# 这件事以前是错的：/api/state 每 3 秒被页面轮询一次，而它把整个配置原样发回
+# 浏览器 —— 包括 hme_password、别名收件箱的应用专用密码、以及带 user:pass 的
+# 取件代理。密码于是每 3 秒在网线上跑一遍，还留在每个打开过这个页面的浏览器
+# 内存与 DevTools 历史里。脱敏之后页面照样能显示「已设置 / 未设置」，而
+# 「不改就留空」的语义由 _keep_secret 在保存那一侧兜住。
+SECRET_KEYS = ("hme_password", "alias_inbox_password")
+
+
+def _mask_url(url):
+    """把代理 URL 里的 user:pass 换成 ***:***，其余照旧。"""
+    raw = str(url or "")
+    if not raw:
+        return ""
+    try:
+        u = urllib.parse.urlsplit(raw)
+        if u.username:
+            host = u.hostname or ""
+            port = f":{u.port}" if u.port else ""
+            return urllib.parse.urlunsplit(
+                (u.scheme, f"***:***@{host}{port}", u.path, u.query, u.fragment))
+    except Exception:
+        pass
+    return raw
+
+
 def _stamp(value):
     """epoch -> 'YYYY-MM-DD HH:MM'（本地时区），空值给空串。
 
@@ -238,11 +265,7 @@ class WebAdmin:
 
         if path == "/api/state":
             info = self.status.snapshot()
-            # The config carries credentials (mail proxy, iCloud password). The
-            # state endpoint only exists to render the dashboard, and the
-            # settings page has its own read; so nothing secret travels here
-            # beyond what the operator already typed into that page.
-            info["config"] = dict(self.config.data)
+            info["config"] = self._public_config()
             info["running"] = self.controller.running()
             info["version"] = 2
             return self._json(200, info)
@@ -353,10 +376,14 @@ class WebAdmin:
 
         if path == "/api/config" and method == "POST":
             for key, value in (body or {}).items():
-                if key in self.config.data:
-                    self.config.data[key] = value
+                if key not in self.config.data:
+                    continue
+                kept = self._keep_secret(key, value)
+                if kept is not None:
+                    self.config.data[key] = kept
             self.config.save()
-            return self._json(200, {"ok": True, "config": dict(self.config.data)})
+            return self._json(200, {"ok": True,
+                                    "config": self._public_config()})
 
         if path == "/api/accounts/reset" and method == "POST":
             # 重新排队 = 清掉检测记录重来（不触碰已成立的中签）。
@@ -394,6 +421,35 @@ class WebAdmin:
         if not path.startswith("/api/"):
             return self._page()
         return self._json(404, {"error": "not found"})
+
+    def _public_config(self):
+        """配置的可外发形态：凭据只报有没有，代理只报主机。"""
+        cfg = dict(self.config.data)
+        for key in SECRET_KEYS:
+            value = cfg.get(key) or ""
+            cfg[key] = ""
+            cfg[f"{key}_set"] = bool(value)
+        if cfg.get("mail_proxy"):
+            cfg["mail_proxy"] = _mask_url(cfg["mail_proxy"])
+        return cfg
+
+    def _keep_secret(self, key, value):
+        """密码与遮罩代理的「留空 / 原样回传」都读作「不改」。
+
+        页面拿到的是脱敏值，所以它回传的 mail_proxy 可能是 `socks5://***:***@host`
+        —— 照着写回去就把密码换成了三个星号。密码字段同理：留空表示不改，而
+        「清空」由显式的一个空格之外的方式表达不了，所以这里一律保守处理。
+
+        返回 None 表示「不改」，否则返回要写入的值。
+        """
+        text = "" if value is None else str(value)
+        if key in SECRET_KEYS:
+            return text if text.strip() else None
+        if key == "mail_proxy":
+            if "***:***@" in text:
+                return None
+            return text
+        return value
 
     def _hits_csv(self):
         """中签名单，人读的 CSV。来源单独一列，因为「站点已确认、邮件没来」

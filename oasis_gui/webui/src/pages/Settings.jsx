@@ -21,7 +21,8 @@ const FIELDS = [
           "「已经发过的结果信」。若哪天站点换了发件人域、结果信标题里又没有 " +
           "Oasis，把它关掉。" },
   { key: "mail_proxy", label: "取件代理", type: "text", wide: true,
-    hint: "留空 = 直连（推荐）。仅在网络必须走代理时才填。" },
+    hint: "留空 = 直连（推荐）。仅在网络必须走代理时才填。" +
+          "此处的代理密码不回显：页面只显示 ***:***@host，原样保存则保持不改。" },
   { key: "hme_base", label: "iCloud 服务地址", type: "text", wide: true,
     hint: "容器里要用 host.docker.internal，不是 127.0.0.1。" },
   { key: "hme_password", label: "iCloud 密码", type: "password", wide: true },
@@ -74,6 +75,9 @@ export default function Settings({ state, refresh }) {
       for (const f of FIELDS) {
         if (f.type === "readonly") continue;
         let v = values[f.key];
+        // 密码留空 = 不修改。服务端收到的从来不是密码本身（它脱敏后就不再外发
+        // 凭据了），所以「清空一个密码」在这里没有可表达的写法 —— 保守处理。
+        if (f.type === "password" && !String(v ?? "").trim()) continue;
         if (f.type === "int") v = parseInt(v, 10);
         if (f.type === "float") v = parseFloat(v);
         if (f.type === "bool") v = String(v) === "true";
@@ -120,7 +124,11 @@ export default function Settings({ state, refresh }) {
                 options={[{ value: "true", label: "开" }, { value: "false", label: "关" }]}
               />
             ) : f.type === "password" ? (
-              <Input.Password />
+              <Input.Password
+                placeholder={state?.config?.[`${f.key}_set`]
+                  ? "已设置 —— 留空则不修改"
+                  : "未设置"}
+              />
             ) : f.type === "readonly" ? (
               <Input disabled />
             ) : (

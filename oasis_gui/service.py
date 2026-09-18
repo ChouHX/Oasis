@@ -85,7 +85,17 @@ def split_list(raw):
     return out
 
 
+# 只在 config 的 debug 打开时才放行 debug 行。
+#
+# 桌面端一直有这个意识（日志页按级别上色），服务端却把每一行都打到 stdout：
+# monitor 的 debug 行（「首次检测，取全量 N 封做基准」之类）每个账号一条，一轮
+# 下来能把真正要紧的几行淹掉。docker logs 是排障的第一现场，不能靠 grep 自救。
+DEBUG = False
+
+
 def log(level, msg):
+    if level == "debug" and not DEBUG:
+        return
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] {msg}", flush=True)
     LOGS.add(level, msg)
 
@@ -269,8 +279,9 @@ def on_event(kind, payload=None):
 
 
 def main():
-    global STATUS, ADMIN
+    global STATUS, ADMIN, DEBUG
     conf, boot = build_config()
+    DEBUG = bool(conf.get("debug"))
 
     store = Store(boot["db_path"])
     stats = store.stats()
@@ -339,7 +350,9 @@ def main():
             if oneshot:
                 log("info", "账号池为空且 OASIS_ONESHOT=1 - 结束")
                 break
-            WAKE.wait(idle * 4)
+            # 空池时等久一点没有代价，但 oneshot 之外的第一轮不该白等：这里用
+            # 一次短等待，让「导入账号后立刻点开始」能马上接上。
+            WAKE.wait(max(idle, 5))
             WAKE.clear()
             continue
         # A stop request means "stop", not "finish this sweep and begin the
@@ -363,14 +376,18 @@ def main():
                     + (f" · 本轮上限 {conf.get('limit')} 个"
                        if conf.get("limit") else ""))
         try:
-            monitor.start(threads=int(conf.get("threads") or 2),
-                          interval=interval,
-                          lookback_days=float(conf.get("lookback_days") or 0),
-                          per_page=int(conf.get("per_page") or 20),
-                          skip_hits=bool(conf.get("skip_hits", True)),
-                          limit=int(conf.get("limit") or 0),
-                          mail_filter=bool(conf.get("mail_filter", True)),
-                          rounds=1)
+            # start() 会拒绝「已在运行中」。不检查返回值的话，那一轮就静默什么
+            # 都没做，而日志上看起来跑过了 —— 上一轮卡住的线程正是这种情况。
+            if not monitor.start(threads=int(conf.get("threads") or 2),
+                                 interval=interval,
+                                 lookback_days=float(
+                                     conf.get("lookback_days") or 0),
+                                 per_page=int(conf.get("per_page") or 20),
+                                 skip_hits=bool(conf.get("skip_hits", True)),
+                                 limit=int(conf.get("limit") or 0),
+                                 mail_filter=bool(conf.get("mail_filter", True)),
+                                 rounds=1):
+                log("warn", "上一轮还没结束，这一轮跳过（下一轮接上）")
             monitor.join()
         except Exception as e:
             log("error", f"巡检 {sweeps} 崩了：{type(e).__name__}: {e}")

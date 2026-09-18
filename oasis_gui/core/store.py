@@ -459,24 +459,6 @@ class Store:
             return [dict(r) for r in c.execute(sql + " LIMIT ?", (limit,))]
         return [dict(r) for r in c.execute(sql)]
 
-    def mail_requested(self, email):
-        """Epoch the site was last asked for a verification mail, or None.
-
-        Nothing writes this any more - the monitor never asks the site for
-        anything. It is kept readable because on an old database it is the
-        record of what the previous build already asked for, which is the first
-        thing to check when an address turns out to have a dead session.
-        """
-        row = self.conn().execute(
-            "SELECT mail_requested_at FROM accounts WHERE email=?",
-            (email,)).fetchone()
-        return row["mail_requested_at"] if row else None
-
-    def mark_mail_requested(self, email, when):
-        return self._write(lambda c: c.execute(
-            "UPDATE accounts SET mail_requested_at=? WHERE email=?",
-            (when, email)))
-
     def protocol_for(self, account_id):
         row = self.conn().execute(
             "SELECT protocol FROM accounts WHERE id=?", (account_id,)).fetchone()

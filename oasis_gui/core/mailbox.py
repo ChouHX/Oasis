@@ -373,13 +373,24 @@ class GraphMailbox(BaseMailbox):
     protocol = "graph"
     scope = GRAPH_SCOPE
 
-    def _folder_messages(self, path, top, only_oasis=False):
+    def _folder_messages(self, path, top, only_oasis=False, not_before=None):
         token = self.access_token()
         opener = self._opener()
         url = f"{GRAPH}{path}?$top={top}&$select={GRAPH_SELECT}"
+        conditions = []
         if only_oasis:
+            conditions.append(f"({GRAPH_OASIS_FILTER})")
+        if not_before:
+            # 回看窗口同样下推。以前这里不发 $filter，于是每一轮都把同一批历史信
+            # 重新下载一遍，而 baseline 只在本地判定时才起作用 —— 语义是对的，
+            # 白拉的流量是真的。
+            conditions.append("receivedDateTime ge " + time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(not_before - 86400)))
+        if conditions:
             # Graph 的 $filter 与 $orderby 互斥，这里没有 orderby，所以安全。
-            url += "&$filter=" + urllib.parse.quote(GRAPH_OASIS_FILTER, safe="()'")
+            url += "&$filter=" + urllib.parse.quote(" and ".join(conditions),
+                                                    safe="()'")
+
         data = _retry(lambda: _open(urllib.request.Request(
             url, headers={"Authorization": "Bearer " + token,
                           "Accept": "application/json"}), opener=opener))
@@ -397,10 +408,10 @@ class GraphMailbox(BaseMailbox):
         between downloading twenty message bodies to keep four and downloading
         the four.
         """
-        msgs = self._folder_messages("/me/messages", limit, only_oasis)
+        msgs = self._folder_messages("/me/messages", limit, only_oasis, not_before)
         try:
             msgs += self._folder_messages("/me/mailFolders/junkemail/messages",
-                                          limit, only_oasis)
+                                          limit, only_oasis, not_before)
         except Exception:
             pass                      # folder missing or not exposed by the API
         seen, out = set(), []
@@ -514,13 +525,29 @@ class ImapMailbox(BaseMailbox):
         return ["OR", "FROM", f'"{OASIS_SENDER_HINT}"',
                 "SUBJECT", f'"{OASIS_SUBJECT_HINT}"']
 
+    def search_terms(self, only_oasis=False, not_before=None):
+        """一次 SEARCH 的全部条件。列表之间默认是 AND，OR 自带括号语义。
+
+        回看窗口（not_before）也在这里下推。以前只有 Gmail 那一支用 SINCE，
+        别的 reader 每次拉最新的 N 封再本地按 baseline 判 —— 结论没错，但同样的
+        历史信每轮都被重新下载一遍。
+        """
+        terms = []
+        if not_before:
+            # SINCE 是日期粒度，且比较的是服务端收件时间，所以放宽一天，由本地
+            # 的精确时间戳收口。
+            terms += ["SINCE", time.strftime("%d-%b-%Y",
+                                             time.gmtime(not_before - 86400))]
+        if only_oasis:
+            terms += self.oasis_search_terms()
+        return terms or ["ALL"]
+
     def messages(self, limit=12, not_before=None, only_oasis=False):
         """Newest-first page of Mail, INBOX + Junk.
 
-        `not_before` is accepted and ignored here: this reader always pulls the
-        newest N regardless, which is right for a mailbox that only holds the
-        few accounts pointed at it. Subclasses with a busier inbox use it to
-        narrow the search on the server instead of filtering at the end.
+        Both hints go down to the server as SEARCH conditions (see
+        search_terms), so a mailbox that receives a hundred unrelated messages
+        fetches the site's four instead of a twenty-message window.
 
         `only_oasis` narrows the SEARCH itself, so a mailbox with a hundred
         unrelated messages fetches the site's four instead of a twenty-message
@@ -531,7 +558,7 @@ class ImapMailbox(BaseMailbox):
         M = self.connect()
         try:
             out = []
-            terms = self.oasis_search_terms() if only_oasis else ["ALL"]
+            terms = self.search_terms(only_oasis, not_before)
             for folder in _candidate_folders(M):
                 try:
                     typ, _ = M.select(folder, readonly=True)
@@ -951,20 +978,15 @@ class GmailAliasMailbox(ImapMailbox):
         return self._junk_folders
 
     def _search_args(self, not_before=None, only_oasis=False):
+        # TO <alias> 与后面的条件是 AND 关系（IMAP 的 OR 只作用于紧随其后的两个
+        # 条件）：读作 `TO <alias> AND (SINCE ...) AND ((FROM openstage) OR
+        # (SUBJECT Oasis))`。别名收件箱里躺着别家的邮件（实测那个 Gmail 里有
+        # LA28 的结果），这几条把它们挡在下载之前。SINCE 很便宜：实测 0.4s 对
+        # 0.9s，因为服务端可以直接跳到日期区间。
         args = ["TO", self.email]
-        if only_oasis:
-            # 前缀 OR 与前面的 TO 是 AND 关系：读作
-            # `TO <alias> AND ((FROM openstage) OR (SUBJECT Oasis))`。
-            # 别名收件箱里有一堆别家的邮件（实测那个 Gmail 里躺着 LA28 的结果），
-            # 这一条把它们挡在下载之前。
-            args += self.oasis_search_terms()
-        if not_before:
-            # SINCE has day granularity and compares the time the server took
-            # the message, so widen by a day and let the exact timestamp decide.
-            # It is also cheap: measured 0.4s against 0.9s for an unbounded
-            # SEARCH, because the server can cut straight to a date range.
-            args += ["SINCE", time.strftime(
-                "%d-%b-%Y", time.gmtime(not_before - 86400))]
+        extra = self.search_terms(only_oasis, not_before)
+        if extra != ["ALL"]:
+            args += extra
         return args
 
     def _fetch_folder(self, M, folder, limit, not_before, only_oasis=False):

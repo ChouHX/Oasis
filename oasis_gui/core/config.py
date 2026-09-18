@@ -16,6 +16,8 @@ import os
 RETIRED_KEYS = (
     "mode", "shows", "link_timeout", "verify_success", "success_timeout",
     "proxies", "front_proxy", "google_proxy",
+    # 从没接到 monitor 上过：账号之间的停顿由 monitor 的 PAGE_GAP 承担。
+    "delay_between",
 )
 
 DEFAULTS = {
@@ -45,8 +47,6 @@ DEFAULTS = {
     "skip_hits": True,
     # 一轮最多检测多少个账号；0 = 全部。用于「先拿一两个试」。
     "limit": 0,
-    # 每封信之间的停顿，0 = 不停（monitor 内部另有 PAGE_GAP）。
-    "delay_between": 0.0,
     # --- 取件通道 ----------------------------------------------------------
     # Mailbox fetches go direct unless this is set.
     "mail_proxy": "",

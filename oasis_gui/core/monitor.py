@@ -19,7 +19,6 @@
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, wait
 
 from . import hitcheck
 from .mailbox import (ALIAS_PROTOCOL, MailAuthError,
@@ -72,6 +71,8 @@ class HitMonitor:
         # 某个服务端明确拒绝粗筛之后置位：本轮剩下的账号直接走全量，不浪费一次
         # 必然失败的搜索。
         self.mail_filter_broken = False
+        # 本轮被放弃等待的账号（见 _mark_overdue）。
+        self._abandoned = set()
         self._rounds = 0
         # 一轮的时间预算。一轮要给几十上百个邮箱轮一遍，而单个坏邮箱（出口不通、
         # 被墙、账号被限）能让一次读信花掉好几分钟 —— 实测过一个直连不通的 Gmail
@@ -145,6 +146,7 @@ class HitMonitor:
         self.limit = max(0, int(self.setting("limit", limit, 0) or 0))
         self.mail_filter = bool(self.setting("mail_filter", mail_filter, True))
         self.mail_filter_broken = False
+        self._abandoned = set()
         self._rounds = int(rounds or 0)
         self._stop.clear()
         self._wake.clear()
@@ -204,6 +206,15 @@ class HitMonitor:
         targets = [a for a in self.store.check_targets(
                        skip_hits=self.skip_hits, limit=self.limit or None)
                    if not self._busy(a["id"])]
+        # 上限是「本轮读几个」，所以 busy 过滤掉的那几个要从后面补回来，
+        # 否则设了 3 却只读 1 个 —— 上限就成了掷骰子。
+        if self.limit:
+            short = self.limit - len(targets)
+            if short > 0:
+                more = [a for a in self.store.check_targets(
+                            skip_hits=self.skip_hits, limit=self.limit + short)
+                        if a not in targets and not self._busy(a["id"])]
+                targets += more[:short]
         self._round += 1
         self._last_sweep = started
         if not targets:
@@ -216,35 +227,35 @@ class HitMonitor:
         self._log("info", f"第 {self._round} 轮：{len(targets)} 个账号 · "
                           f"{len(groups)} 条收件箱连接 · {self.threads} 并发 · "
                           f"本轮预算 {int(budget)}s")
-        pool = ThreadPoolExecutor(max_workers=self.threads,
-                                  thread_name_prefix="hit-scan")
-        # future -> 它负责的账号，超时时才能说出谁没读上。
-        submitted = {}
-        skipped = 0
+        deadline = started + budget
+        # 自己开线程，不用 ThreadPoolExecutor：它的线程不是 daemon 的，解释器退出
+        # 时会 join 它们（concurrent.futures.thread._python_exit）。一个卡在读信上
+        # 的线程于是能把 `docker stop` 拖到超时被硬杀 —— 实测过脚本打印完结果却
+        # 迟迟不退出。daemon 线程随进程结束，退出干净。
+        slots = threading.BoundedSemaphore(self.threads)
+        running = []                       # [(thread, group)]
         try:
             for group in groups:
-                if time.time() - started > budget:
-                    skipped = len(groups) - len(submitted)
+                left = deadline - time.time()
+                if left <= 0 or not slots.acquire(timeout=max(1.0, left)):
+                    skipped = len(groups) - len(running)
                     self._log("warn", f"本轮预算用尽：剩余 {skipped} 条连接留到"
                                       f"下一轮（它们仍排在队首）")
                     break
-                submitted[pool.submit(self._scan_group, group)] = group
-            done, not_done = wait(list(submitted), timeout=self._slice_left(started))
-            for future in done:
-                try:
-                    future.result()
-                except Exception:
-                    self._log("debug", "分组扫描异常：\n"
-                                       + traceback.format_exc()[-400:])
+                t = threading.Thread(target=self._run_group, args=(group, slots),
+                                     daemon=True, name="hit-scan")
+                t.start()
+                running.append((t, group))
+            for t, _group in running:
+                t.join(timeout=max(0.0, deadline - time.time()))
             # 到点还没回来的，本轮不再等：线程会自己撞上 mailbox 的超时并结束，
             # 而账号不推进 checked_at，所以下一轮仍然优先重试。
-            for future in not_done:
-                for acct in submitted[future]:
-                    self._mark_overdue(acct)
+            for t, group in running:
+                if t.is_alive():
+                    for acct in group:
+                        self._mark_overdue(acct)
         finally:
-            # wait=False 是关键：默认的 shutdown 会 join 那些还没超时结束的线程，
-            # 那正是我们要避开的东西。
-            pool.shutdown(wait=False)
+            pass
         after = self.store.stats()
         gained = after.get("hits", 0) - before_hits
         self._log("info", f"第 {self._round} 轮完成：{len(targets)} 个账号 · "
@@ -255,6 +266,15 @@ class HitMonitor:
                              "monitor": self.stats()})
         self._emit("stats", after)
         return {"targets": len(targets), "hits": gained}
+
+    def _run_group(self, group, slots):
+        try:
+            self._scan_group(group)
+        except Exception:
+            self._log("debug", "分组扫描异常：\n"
+                               + traceback.format_exc()[-400:])
+        finally:
+            slots.release()
 
     def _busy(self, account_id):
         """这个账号是不是还有一条连接在读？
@@ -270,12 +290,15 @@ class HitMonitor:
             return False
         return True
 
-    def _slice_left(self, started):
-        """本轮还剩多少秒可等 —— 至少给 5 秒，否则一个提前返回的 future 会立刻
-        把整批判成超时。"""
-        return max(5.0, self.sweep_budget - (time.time() - started))
-
     def _mark_overdue(self, acct):
+        """本轮放弃等它 —— 并且记住放弃了，免得慢线程回来把话说反。
+
+        放弃等待不等于线程结束了：它还会跑完，还会写一次 record_check。那次写入
+        默认会推进 checked_at，于是「下一轮优先重试」这行日志在几秒后就成了假话
+        —— 账号已经排到队尾去了。所以把 id 记进 _abandoned，由 _scan_one 决定
+        这一笔要不要算进进度：结论照写（中签证据不能丢），进度不推进。
+        """
+        self._abandoned.add(acct["id"])
         self.store.record_check(
             acct["id"], error="本轮读信超时，未计入进度，下一轮优先重试", touch=False)
         self._log("warn", f"读信超时 {acct['email']}：本轮不再等它")
@@ -290,11 +313,19 @@ class HitMonitor:
         iCloud 别名共用同一个 Gmail 收件箱，组里串行扫、共用一条 IMAP 连接；
         自己的邮箱（Outlook / Gmail）各自一组，彼此并行。列表顺序保持不变，
         所以一轮里的顺序仍是「最久没查的优先」。
+
+        分组键必须指向一条**真的能读它的凭据**。别名行里承载收件箱的是
+        client_id（见 store.parse_line），所以按它分组；而 client_id 为空的别名
+        行（老格式、手工粘贴缺字段）**不能**被归到一起 —— 那会让其中一条的
+        收件箱密码去登另一条，读到的要么是别人的邮箱要么是登录失败。这种行
+        各自一组，走自己的凭据、坏了也只坏它自己。
         """
         groups, index = [], {}
         for acct in targets:
             if (acct.get("protocol") or "") == ALIAS_PROTOCOL:
-                key = ("alias", (acct.get("client_id") or "").lower())
+                inbox = (acct.get("client_id") or "").strip().lower()
+                # 没有收件箱可复用：当成独立邮箱，别和人拼组。
+                key = ("alias", inbox) if inbox else ("box", acct["email"].lower())
             else:
                 key = ("box", acct["email"].lower())
             slot = index.get(key)
@@ -420,9 +451,17 @@ class HitMonitor:
             source = hitcheck.SOURCE_SITE_OK
             note = "站点已确认（无成功邮件）"
 
+        # 本轮被放弃的账号：结论照写，但不推进进度（见 _mark_overdue）。
+        overdue = account_id in self._abandoned
+        self._abandoned.discard(account_id)
         self.store.record_check(
             account_id, mail_at=latest_at, mail_subject=latest_subject,
-            hit_source=source, hit_note=note, baseline_at=baseline or None)
+            hit_source=source, hit_note=note, baseline_at=baseline or None,
+            touch=not overdue)
+        if overdue:
+            self._log("info", f"{acct['email']}：上一轮放弃等待的那次读信回来了"
+                              f"（{hitcheck.SOURCE_LABEL.get(source, '未中签')}），"
+                              f"进度仍留给下一轮")
         with self._lock:
             self._checked += 1
             if source:
