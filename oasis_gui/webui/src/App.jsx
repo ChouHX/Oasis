@@ -100,6 +100,16 @@ export default function App() {
             定时巡检已导入账号的收件箱 · 邮件证据与站点记录合并判定
           </Text>
           <div style={{ flex: 1 }} />
+          {state?.build && (
+            // 服务端的 build 指纹。部署里 pull 没生效、容器没重建、浏览器拿
+            // 缓存——三种情况界面长得一模一样，而修法各不相同；这一行让页面
+            // 自己说清它连的是哪一版。与 `curl /health` 的 build 应当一致。
+            <Text type="secondary"
+                  style={{ fontSize: 11, fontFamily: "monospace" }}
+                  title={state.build}>
+              {String(state.build).split(" ")[0]}
+            </Text>
+          )}
           {state && (
             <Space size={8}>
               <Tag color={state.running ? "processing" : "default"}>

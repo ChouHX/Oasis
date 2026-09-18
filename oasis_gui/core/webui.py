@@ -266,7 +266,12 @@ class WebAdmin:
         if path == "/api/state":
             info = self.status.snapshot()
             info["config"] = self._public_config()
+            # 界面顶栏把它显示出来。这一条是为了回答一个反复出现的问题：
+            # 「我看的是哪一版？」—— 部署里 pull 没生效、容器没重建、浏览器拿
+            # 缓存，三种情况页面长得一模一样，而它们的修法各不相同。有了这行，
+            # 页面自己就说了。
             info["running"] = self.controller.running()
+            info["build"] = sysinfo.build_stamp()
             info["version"] = 2
             return self._json(200, info)
 
