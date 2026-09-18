@@ -26,13 +26,13 @@ export const api = {
   login: (password) => call("/login", { method: "POST", body: { password } }),
   logout: () => call("/logout", { method: "POST" }),
   state: () => call("/api/state"),
+  hits: () => call("/api/hits"),
   accounts: (status, page) =>
     call(`/api/accounts?page=${page}${status ? `&status=${encodeURIComponent(status)}` : ""}`),
   registrations: () => call("/api/registrations"),
-  proxies: () => call("/api/proxies"),
-  saveProxies: (lines) => call("/api/proxies", { method: "POST", body: { lines } }),
   log: (since) => call(`/api/log?since=${since}`),
-  start: (threads, mode, limit = 0) => call("/api/start", { method: "POST", body: { threads, mode, limit } }),
+  // 「立即巡检一轮」。间隔/并发/回看天数一并落地，所以改完就生效。
+  start: (patch = {}) => call("/api/start", { method: "POST", body: patch }),
   stop: () => call("/api/stop", { method: "POST" }),
   saveConfig: (patch) => call("/api/config", { method: "POST", body: patch }),
   resetAccounts: () => call("/api/accounts/reset", { method: "POST" }),
@@ -48,38 +48,29 @@ export const api = {
 };
 
 // Status keys and their labels/colours, shared by the dashboard, the account
-// table and the registrations table so they never drift apart.
+// table and the hit table so they never drift apart.
+//
+// `hits` is the only conclusive number; `unchecked` / `checked` / `check_errors`
+// are progress. The old status words (registered / submitted / failed) are not
+// shown: a database from the previous build folds them into hits on open.
 export const STATUS = {
   total: { label: "账号总数", color: "#1677ff" },
-  pending: { label: "待注册", color: "#8c8c8c" },
-  running: { label: "进行中", color: "#fa8c16" },
-  registered: { label: "邮件确认注册", color: "#52c41a" },
-  submitted: { label: "页面确认提交", color: "#13c2c2" },
-  failed: { label: "失败", color: "#ff4d4f" },
-  registrations: { label: "预约记录", color: "#722ed1" },
+  hits: { label: "已中签", color: "#52c41a" },
+  unchecked: { label: "还没查过", color: "#8c8c8c" },
+  checked: { label: "查过未中签", color: "#13c2c2" },
+  check_errors: { label: "读信失败", color: "#ff4d4f" },
+  registrations: { label: "旧预约记录", color: "#722ed1" },
 };
 
 export const STATUS_FILTER = [
-  { value: "", label: "全部状态" },
-  { value: "pending", label: "待注册" },
-  { value: "running", label: "进行中" },
-  { value: "registered", label: "邮件确认" },
-  { value: "submitted", label: "页面确认" },
-  { value: "failed", label: "失败" },
+  { value: "", label: "全部账号" },
+  { value: "hit", label: "已中签" },
+  { value: "pending", label: "未中签" },
 ];
 
-// Venue keys -> the same labels the desktop console shows. Kept here so the
-// dashboard dropdowns read identically to the GUI's.
-export const SHOW_LABEL = {
-  glasgow: "2027-05 Glasgow UK",
-  manchester: "2027-06 Manchester UK",
-  munich: "2027-07 Munich DE",
-  barcelona: "2027-07 Barcelona ES",
-  amsterdam: "2027-07 Amsterdam NL",
-  paris: "2027-07 Paris FR",
-  rome: "2027-07 Rome IT",
-  boston: "2027-08 Boston US",
-  lasvegas: "2027-08 Las Vegas US",
-  slane: "2027-09 Slane IE",
-  knebworth: "2027-09 Knebworth UK",
+// 中签证据。后端每个中签行都带 label，这份映射只用于筛选与图例。
+export const SOURCE = {
+  "success-mail": { label: "成功邮件", color: "#52c41a" },
+  "oasis-mail": { label: "Oasis 来信", color: "#13c2c2" },
+  "site-ok": { label: "站点已确认（无成功邮件）", color: "#fa8c16" },
 };

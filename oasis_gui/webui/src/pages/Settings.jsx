@@ -7,35 +7,23 @@ import { api } from "../api.js";
 
 const { Text, Paragraph } = Typography;
 
-// Mirrors the settings page of the desktop console. Proxies and accounts are
-// deliberately absent - they have their own pages, and a proxy list does not
-// belong in a text field on a form.
-// Kept in the same order and with the same labels as the desktop console's
-// settings page, so the two never drift. Threads and the show preference live
-// on the dashboard in both, and proxies/accounts have their own pages.
+// Mirrors the settings page of the desktop console, same order and same labels,
+// so the two never drift. Concurrency, interval, the look-back window and the
+// skip-hits switch live on the dashboard in both.
 const FIELDS = [
-  // Same order and labels as the desktop console's settings page, minus
-  // log_file which only means something to the desktop (the service logs to
-  // stdout, where docker captures it).
-  { key: "link_timeout", label: "等邮件超时（秒）", type: "int" },
-  { key: "verify_success", label: "成功后校验邮件", type: "bool" },
-  { key: "success_timeout", label: "成功邮件超时（秒）", type: "int",
-    hint: "只在页面没确认注册时才等满这个时长。页面已确认时最多再看 30 秒 —— " +
-          "浏览器模式实测不发成功邮件。" },
-  { key: "delay_between", label: "账号间停顿（秒）", type: "float" },
-  { key: "mail_proxy", label: "取件代理", type: "text", wide: true },
+  { key: "per_page", label: "每箱取信（封）", type: "int",
+    hint: "每个邮箱取最近多少封信来判断。判据是「Oasis 来信」本身，" +
+          "所以不需要把整箱读完。" },
+  { key: "mail_proxy", label: "取件代理", type: "text", wide: true,
+    hint: "留空 = 直连（推荐）。仅在网络必须走代理时才填。" },
   { key: "hme_base", label: "iCloud 服务地址", type: "text", wide: true,
     hint: "容器里要用 host.docker.internal，不是 127.0.0.1。" },
   { key: "hme_password", label: "iCloud 密码", type: "password", wide: true },
   { key: "alias_inbox", label: "别名收件箱（Gmail）", type: "text", wide: true,
     hint: "iCloud 隐私邮箱只是转发地址：发给它的信会落到 Apple ID 绑定的那个 Gmail 里，" +
-          "所以一个收件箱覆盖整份别名列表。填 Gmail 地址后，导入页可以直接粘贴纯别名，" +
-          "取件走上面的「取件代理」。" },
+          "所以一个收件箱覆盖整份别名列表。填 Gmail 地址后，导入页可以直接粘贴纯别名。" },
   { key: "alias_inbox_password", label: "Gmail 应用专用密码", type: "password", wide: true,
     hint: "不是 Google 登录密码。在 Gmail 设置里生成应用专用密码，并确认已开启 IMAP。" },
-  { key: "front_proxy", label: "前置代理（链路）", type: "text", wide: true },
-  { key: "google_proxy", label: "Google 分流代理", type: "text", wide: true,
-    hint: "浏览器模式必须能访问 Google（reCAPTCHA 在上面）。注册代理不通 Google 时填一个能通的。" },
   { key: "db_path", label: "数据库路径（只读）", type: "readonly", wide: true },
   { key: "debug", label: "调试堆栈", type: "bool" },
 ];
@@ -64,10 +52,9 @@ export default function Settings({ state, refresh }) {
     //
     // The shell polls /api/state every three seconds and every reply is a fresh
     // object, so an effect keyed on it re-ran on every poll and wrote the
-    // server's values back over whatever was being typed. The settings form was
-    // effectively read-only: a field could be edited, but the next poll undid
-    // it. Seeding once leaves the form alone while someone is using it, and
-    // leaving the page and coming back reseeds from the server.
+    // server's values back over whatever was being typed - the settings form
+    // was effectively read-only. Seeding once leaves the form alone while
+    // someone is using it; leaving the page and coming back reseeds.
     if (seeded.current) return;
     seeded.current = true;
     form.setFieldsValue(init);
@@ -84,9 +71,6 @@ export default function Settings({ state, refresh }) {
         if (f.type === "int") v = parseInt(v, 10);
         if (f.type === "float") v = parseFloat(v);
         if (f.type === "bool") v = String(v) === "true";
-        if (f.type === "list") {
-          v = String(v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-        }
         patch[f.key] = v;
       }
       await api.saveConfig(patch);
@@ -117,8 +101,8 @@ export default function Settings({ state, refresh }) {
       }
     >
       <Paragraph type="secondary" style={{ fontSize: 12 }}>
-        改动会写回服务端配置文件并立即生效（线程数与模式在下一轮开始时读取）。
-        代理池和账号在各自页面管理。
+        改动会写回服务端配置文件；并发与间隔在下一轮巡检开始时读取。
+        账号在「邮箱池」管理，中签结果在「中签名单」。
       </Paragraph>
 
       <Form form={form} layout="vertical" size="small">
@@ -130,7 +114,7 @@ export default function Settings({ state, refresh }) {
                 options={[{ value: "true", label: "开" }, { value: "false", label: "关" }]}
               />
             ) : f.type === "password" ? (
-              <Input.Password placeholder="启动时该服务的管理员密码" />
+              <Input.Password />
             ) : f.type === "readonly" ? (
               <Input disabled />
             ) : (
@@ -143,12 +127,12 @@ export default function Settings({ state, refresh }) {
       <Alert
         type="info"
         showIcon
-        message="浏览器模式必须能访问 Google"
+        message="检测不会向站点发任何请求"
         description={
           <span>
-            reCAPTCHA 在 Google 上。没有配 <Text code>Google 分流代理</Text> 时，
-            如果注册代理本身不通 Google，页面会卡在{" "}
-            <Text code>wait_for_function</Text> 超时。
+            程序只读邮箱。旧版程序里「重复向站点请求验证邮件会作废会话」这件事在这里
+            不可能发生 —— 没有任何代码路径会碰站点。<Text code>取件代理</Text>{" "}
+            只影响 IMAP / Graph 的连接方式。
           </span>
         }
       />
@@ -160,7 +144,7 @@ export default function Settings({ state, refresh }) {
             <Text type="secondary" style={{ fontSize: 12 }}>
               内存 {state.host.total_mb - state.host.available_mb} /{" "}
               {state.host.total_mb} MB 在用 · 可用 {state.host.available_mb} MB ·{" "}
-              {state.host.cores} 核 · 建议 {state.host.recommended} 线程
+              {state.host.cores} 核 · 建议 {state.host.recommended} 并发
             </Text>
           </Space>
         </div>

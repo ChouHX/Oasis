@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Card, Table, Button, Typography, Tag, App as AntApp } from "antd";
 import { ReloadOutlined } from "@ant-design/icons";
-import { api, STATUS } from "../api.js";
+import { api } from "../api.js";
 
-const { Text } = Typography;
+const { Text, Paragraph } = Typography;
 
 export default function Registrations() {
   const { message } = AntApp.useApp();
@@ -24,20 +24,15 @@ export default function Registrations() {
 
   useEffect(() => { load(); }, [load]);
 
-  // `shows` is translated server-side from the stored poll uuids, so the page
-  // never has to know them.
+  // 这一页是上一版程序留下的只读记录：检测程序不再写它。它的价值在于
+  // 「这个账号当年预约了哪一场」—— 中签本身是场次级的事，没有它，中签名单
+  // 就只剩邮箱地址。
   const columns = [
     { title: "账号", dataIndex: "email", ellipsis: true },
+    { title: "当时的方式", dataIndex: "mode", width: 120 },
     {
-      title: "场次（按偏好顺序）", dataIndex: "shows", width: 360,
-      render: (v) => v || <Text type="secondary">—</Text>,
-    },
-    { title: "模式", dataIndex: "mode", width: 100 },
-    {
-      title: "状态", dataIndex: "status", width: 120,
-      render: (v) => <Tag color={v === "submitted" ? "cyan" : "default"}>
-        {STATUS[v]?.label || v}
-      </Tag>,
+      title: "记录状态", dataIndex: "status", width: 130,
+      render: (v) => <Tag color={v === "submitted" ? "cyan" : "default"}>{v}</Tag>,
     },
     {
       title: "时间", dataIndex: "created_at", width: 180,
@@ -47,19 +42,21 @@ export default function Registrations() {
 
   return (
     <Card
-      title="预约记录"
+      title={`旧预约记录（${rows.length}）`}
       size="small"
-      extra={
-        <Button icon={<ReloadOutlined />} onClick={load}>刷新</Button>
-      }
+      extra={<Button icon={<ReloadOutlined />} onClick={load}>刷新</Button>}
     >
+      <Paragraph type="secondary" style={{ fontSize: 12 }}>
+        上一版程序提交注册时留下的记录，只读。中签判定不看这张表 ——
+        账号能不能读、中没中签，都由检测结果决定。
+      </Paragraph>
       <Table
         rowKey="id"
         size="small"
         loading={loading}
         columns={columns}
         dataSource={rows}
-        scroll={{ x: 900 }}
+        scroll={{ x: 760 }}
         pagination={{ pageSize: 20, showSizeChanger: true }}
         locale={{ emptyText: "还没有记录" }}
       />

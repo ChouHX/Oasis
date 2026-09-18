@@ -9,7 +9,7 @@ const { Text, Paragraph } = Typography;
 
 export default function Database({ refresh }) {
   const { message } = AntApp.useApp();
-  const [target, setTarget] = useState("failed");
+  const [target, setTarget] = useState("pending");
   const [busy, setBusy] = useState(false);
 
   const guard = async (fn, ok) => {
@@ -32,7 +32,7 @@ export default function Database({ refresh }) {
         showIcon
         style={{ marginBottom: 12 }}
         message="清理不可撤销"
-        description="账号被删除时，它的预约记录会一并删除（外键级联）。"
+        description="账号被删除时，它的旧预约记录会一并删除（外键级联）。"
       />
 
       <Space wrap size={12}>
@@ -45,6 +45,17 @@ export default function Database({ refresh }) {
         </Button>
         <Button
           icon={<DownloadOutlined />}
+          onClick={() => { window.location.href = api.exportUrl("hits"); }}
+        >
+          导出中签 CSV
+        </Button>
+        <Button
+          onClick={() => { window.location.href = api.exportUrl("hit_creds"); }}
+        >
+          导出中签凭据
+        </Button>
+        <Button
+          icon={<DownloadOutlined />}
           onClick={() => { window.location.href = api.exportUrl("accounts"); }}
         >
           导出账号 JSON
@@ -52,23 +63,21 @@ export default function Database({ refresh }) {
       </Space>
 
       <Paragraph type="secondary" style={{ fontSize: 12, margin: "16px 0 8px" }}>
-        按状态批量清理：
+        按类批量清理（「未中签」= 还没中签的账号，检测记录会随账号一起删掉）：
       </Paragraph>
       <Space wrap>
         <Select
           value={target}
           onChange={setTarget}
-          style={{ width: 170 }}
+          style={{ width: 190 }}
           options={[
-            { value: "failed", label: "失败" },
-            { value: "submitted", label: "页面确认" },
-            { value: "registered", label: "邮件确认" },
-            { value: "pending", label: "待注册" },
+            { value: "pending", label: "未中签" },
+            { value: "hit", label: "已中签" },
           ]}
         />
         <Popconfirm
           title={`永久删除所有「${STATUS[target]?.label || target}」账号？`}
-          description="不可撤销，预约记录会一并删除。"
+          description="不可撤销，旧的预约记录会一并删除。"
           okText="确认删除"
           okButtonProps={{ danger: true }}
           cancelText="取消"
@@ -78,8 +87,7 @@ export default function Database({ refresh }) {
           <Button danger icon={<DeleteOutlined />} loading={busy}>清理该状态</Button>
         </Popconfirm>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          当前 {STATUS[target]?.label || target}：
-          <Text strong> {0} </Text>
+          账号池与中签数请见仪表盘 —— 这里的计数以服务端为准。
         </Text>
       </Space>
     </Card>

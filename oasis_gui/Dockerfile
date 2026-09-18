@@ -1,8 +1,14 @@
-# Headless Oasis console - built for a small box (2 vCPU / 3GB).
+# Headless Oasis hit monitor - built for a small box (2 vCPU / 3GB).
 #
 # Two stages on purpose: the admin UI is React + Ant Design, which needs Node to
 # build. Doing that here means the deployed image never has to: the server just
 # pulls the finished image. The runtime stage stays Python-only.
+#
+# The runtime base is python:slim rather than the Playwright image it used to
+# be. Nothing here drives a browser any more - the monitor only reads mailboxes
+# over IMAP and Graph - so chromium, its fonts, libnss and mesa are ~1.3GB of
+# image that can never be used. Same reason the 512MB /dev/shm and the 2.5GB
+# memory limit are gone from docker-compose.yml.
 
 # ---------------------------------------------------------------- frontend ---
 FROM node:22-alpine AS frontend
@@ -14,10 +20,7 @@ COPY webui/ ./
 RUN npm run build
 
 # ----------------------------------------------------------------- runtime ---
-# The official Playwright image already carries chromium and every system
-# library it needs (fonts, libnss, mesa for WebGL). Building those by hand is
-# where headless-browser images usually go wrong.
-FROM mcr.microsoft.com/playwright/python:v1.62.0-noble
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -45,7 +48,7 @@ RUN chmod +x entrypoint.sh \
 VOLUME ["/data"]
 EXPOSE 8080
 
-HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD python3 -c "import json,urllib.request; \
 print(json.load(urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5))['ok'])" \
     || exit 1

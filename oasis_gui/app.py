@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Oasis Live '27 registration console.
+"""Oasis Live '27 中签检测台。
 
-A Fluent desktop front-end over the curl_cffi registration core:
+A Fluent desktop front-end over the hit monitor:
 
-  * proxy pool configuration and health testing
-  * configurable worker threads
+  * 账号池导入与凭据校验
+  * 定时把每个账号的收件箱翻一遍，看 Oasis 有没有来信
+  * 中签名单：邮件证据与「站点已确认但成功邮件没来」的旧记录合并成同一张表
   * live log with per-level colouring, plus a log file
-  * SQLite persistence of every mailbox, identity and registration, with the
-    de-duplication rules enforced in the schema
+  * SQLite persistence, with the de-duplication rules enforced in the schema
+
+程序不再向站点提交任何东西 —— 活动结束、注册环节已整体移除（见 README）。
+这里唯一的动作是读邮箱。
 
 Layout notes: HeaderCardWidget.viewLayout is a QHBoxLayout, so stacking content
 directly into it puts everything side by side and blows the minimum width past
@@ -27,10 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFontMetrics, QTextCursor
 from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout,
-                             QHBoxLayout, QLabel, QTableWidgetItem, QTextEdit,
+                             QHBoxLayout, QTableWidgetItem, QTextEdit,
                              QVBoxLayout, QWidget)
 
-from qfluentwidgets import (BodyLabel, CaptionLabel, CompactDoubleSpinBox,
+from qfluentwidgets import (BodyLabel, CaptionLabel,
                             CompactSpinBox, ComboBox, FluentIcon as FIF,
                             FluentWindow, HeaderCardWidget, InfoBar,
                             InfoBarPosition, LineEdit, MenuAnimationType,
@@ -40,11 +43,11 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CompactDoubleSpinBox,
                             SwitchButton, TableWidget, TextEdit, TitleLabel,
                             setTheme, setThemeColor, Theme)
 
+from core import hitcheck
 from core import mailbox
-from core import registrar
+from core import sysinfo
 from core.config import Config
-from core.engine import Engine
-from core.proxy_pool import ProxyPool
+from core.monitor import HitMonitor
 from core.store import Store
 
 def app_dir():
@@ -62,15 +65,8 @@ def app_dir():
 
 BASE = app_dir()
 
-# Keep Playwright's browsers beside the app instead of in the user profile, so a
-# copied folder stays self-contained. Only set when the operator has not already
-# pointed it somewhere else.
-if getattr(sys, "frozen", False):
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(BASE, "browsers"))
-
 PAD = 14          # page content margin
 GAP = 9           # spacing between cards
-CHIP_COLS = 6
 # Rows rendered in the table views. Exports deliberately ignore this.
 DISPLAY_LIMIT = 500
 
@@ -144,35 +140,27 @@ LEVEL_COLOR = {
     "info": "#8a8f98", "ok": "#1f9d55", "warn": "#c8871a",
     "error": "#d64545", "debug": "#7a6ad8", "time": "#5a8fd8",
 }
-CHIP_ON = ("QLabel{border-radius:6px;padding:3px 7px;font-size:12px;"
-           "background:rgba(217,130,43,0.16);color:#9c5a0c;"
-           "border:1px solid rgba(217,130,43,0.5);font-weight:600;}")
-CHIP_OFF = ("QLabel{border-radius:6px;padding:3px 7px;font-size:12px;"
-            "background:rgba(0,0,0,0.030);color:#6b7280;"
-            "border:1px solid rgba(0,0,0,0.055);}")
-BADGE = ["①", "②", "③"]
 
-# Registration transports. There is deliberately no captcha-less path: the
-# server answers {"status":"OK"} without a token, but that is the request most
-# likely to get an account flagged later, and a token now costs ~0.6s.
-#   browser - the whole flow runs inside a real Chromium page, driving the
-#             official form. hybrid (curl_cffi submission) was removed: measured
-#             to be caught by the site's risk control.
-MODES = ("browser",)
-MODE_LABEL = {"browser": "浏览器 (驱动官方 SPA 全流程)"}
+# 中签检测没有「模式」可选：唯一的动作是读邮箱，通道由账号自己的
+# protocol 决定（graph / imap / alias-imap / hme），不需要操作者选。
+HIT_COLORS = {
+    hitcheck.SOURCE_SUCCESS_MAIL: "#1f9d55",
+    hitcheck.SOURCE_OASIS_MAIL: "#3fa88a",
+    hitcheck.SOURCE_SITE_OK: "#c8871a",
+}
 
 
 class Bridge(QObject):
-    """Marshals engine callbacks from worker threads onto the UI thread.
+    """Marshals monitor callbacks from worker threads onto the UI thread.
 
     Every widget touched from a worker must come through here: creating an
-    InfoBar off the GUI thread (as an earlier build did from the proxy test)
-    produces an unowned top-level window that cannot be dismissed.
+    InfoBar off the GUI thread produces an unowned top-level window that cannot
+    be dismissed.
     """
     log = pyqtSignal(str, str)
     stats = pyqtSignal(dict)
-    registered = pyqtSignal(dict)
-    failed = pyqtSignal(dict)
+    hit = pyqtSignal(dict)
+    sweep = pyqtSignal(dict)
     started = pyqtSignal(dict)
     stopped = pyqtSignal(dict)
     toast = pyqtSignal(str, str)
@@ -242,6 +230,14 @@ def full_name(row):
     return " ".join(p for p in (row.get("first_name"), row.get("last_name")) if p)
 
 
+def _when(value):
+    """epoch -> 本地时间字符串。空值给空串，别把时间列填成 1970。"""
+    try:
+        return datetime.fromtimestamp(float(value)).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return ""
+
+
 def fill_row(table, rows):
     table.setRowCount(len(rows))
     for i, vals in enumerate(rows):
@@ -290,9 +286,9 @@ class Banner(QFrame):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 10, 20, 10)
         lay.setSpacing(2)
-        title = SubtitleLabel("Oasis Live '27  注册控制台")
+        title = SubtitleLabel("Oasis Live '27  中签检测台")
         title.setStyleSheet("color:#fff8f0;")
-        sub = CaptionLabel("浏览器真实 captcha · curl_cffi 提交 · SQLite 去重落库")
+        sub = CaptionLabel("定时巡检已导入账号的收件箱 · 邮件证据与站点记录合并判定")
         sub.setStyleSheet("color:rgba(255,248,240,0.9);")
         lay.addWidget(title)
         lay.addWidget(sub)
@@ -317,53 +313,60 @@ class DashboardPage(ScrollArea):
         row.setSpacing(GAP)
         self.cards = {
             "total": StatCard("账号总数", "#3b7dd8"),
-            "pending": StatCard("待注册", "#8a8f98"),
-            "running": StatCard("进行中", "#c8871a"),
-            "registered": StatCard("邮件确认注册", "#1f9d55"),
-            "submitted": StatCard("页面确认提交", "#3fa88a"),
-            "failed": StatCard("失败", "#d64545"),
-            "registrations": StatCard("预约记录", "#7a6ad8"),
+            "hits": StatCard("已中签", "#1f9d55"),
+            "unchecked": StatCard("还没查过", "#8a8f98"),
+            "checked": StatCard("查过未中签", "#3fa88a"),
+            "check_errors": StatCard("读信失败", "#d64545"),
+            "registrations": StatCard("旧预约记录", "#7a6ad8"),
         }
         for c in self.cards.values():
             row.addWidget(c, 1)
         root.addLayout(row)
 
-        ctrl, body = make_card("运行控制")
+        ctrl, body = make_card("检测控制")
         cl = QHBoxLayout()
         cl.setSpacing(8)
-        cl.addWidget(BodyLabel("线程"))
+        cl.addWidget(BodyLabel("并发"))
         self.threads = CompactSpinBox()
-        self.threads.setRange(1, 64)
-        self.threads.setValue(int(win.cfg.get("threads", 4)))
+        self.threads.setRange(1, 32)
+        self.threads.setValue(int(win.cfg.get("threads", 2)))
         self.threads.setFixedWidth(84)
+        self.threads.setToolTip(
+            "同时打开几条收件箱连接。同一个 Gmail 收件箱下的 iCloud 别名共用一条\n"
+            "连接，所以这个数字是并发数，不是「同时读几封信」。")
         cl.addWidget(self.threads)
         cl.addWidget(BodyLabel("间隔s"))
-        self.delay = CompactDoubleSpinBox()
-        self.delay.setRange(0.0, 30.0)
-        self.delay.setSingleStep(0.5)
-        self.delay.setValue(float(win.cfg.get("delay_between", 0.0)))
-        self.delay.setFixedWidth(92)
-        cl.addWidget(self.delay)
-        cl.addWidget(BodyLabel("方式"))
-        # Only one flow is carried: driving the real SPA form. A plain curl
-        # submission is caught by the site's risk control, so the picker is a
-        # label now rather than a choice that would quietly lose accounts.
-        self.mode_label = BodyLabel("浏览器（驱动官方 SPA 全流程）")
-        self.mode_label.setToolTip(
-            "填官方表单、逐页点 Continue、由页面自己提交。\n"
-            "captcha 由页面签发、location.county / ip 由 SPA 自己填，"
-            "三者自洽；这是我们能复现真人行为的最接近方式。")
-        self.mode_label.setFixedWidth(196)
-        cl.addWidget(self.mode_label)
-        self.btn_start = PrimaryPushButton(FIF.PLAY, "开始注册")
+        self.interval = CompactSpinBox()
+        self.interval.setRange(30, 86400)
+        self.interval.setSingleStep(30)
+        self.interval.setValue(int(win.cfg.get("interval", 300)))
+        self.interval.setFixedWidth(96)
+        self.interval.setToolTip(
+            "一轮跑完到下一轮开始之间的等待。中签通知不是秒级事件，\n"
+            "频率再高只是把对方的收件箱打成请求尖峰。")
+        cl.addWidget(self.interval)
+        cl.addWidget(BodyLabel("回看天"))
+        self.lookback = CompactSpinBox()
+        self.lookback.setRange(0, 3650)
+        self.lookback.setValue(int(win.cfg.get("lookback_days", 30)))
+        self.lookback.setFixedWidth(96)
+        self.lookback.setToolTip(
+            "首次检测回看多少天。活动已经结束，中签结果很可能早就发出去了，\n"
+            "这个窗口要覆盖「结果可能已发」的那段时间；0 = 不设基线，\n"
+            "邮箱里所有 Oasis 来信都算数。")
+        cl.addWidget(self.lookback)
+        self.btn_start = PrimaryPushButton(FIF.PLAY, "开始检测")
         self.btn_start.clicked.connect(self.on_start)
         cl.addWidget(self.btn_start)
+        self.btn_check = PushButton(FIF.SYNC, "立即检查一轮")
+        self.btn_check.clicked.connect(self.on_check_now)
+        cl.addWidget(self.btn_check)
         self.btn_stop = PushButton(FIF.CANCEL, "停止")
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_stop.setEnabled(False)
         cl.addWidget(self.btn_stop)
         self.progress = ProgressBar()
-        self.progress.setFixedWidth(220)
+        self.progress.setFixedWidth(200)
         cl.addWidget(self.progress)
         cl.addStretch(1)
         body.addLayout(cl)
@@ -376,7 +379,7 @@ class DashboardPage(ScrollArea):
         hrow.setSpacing(10)
         self.host_label = BodyLabel("读取中…")
         hrow.addWidget(self.host_label, 1)
-        self.btn_apply_rec = PushButton(FIF.SYNC, "应用推荐线程")
+        self.btn_apply_rec = PushButton(FIF.SYNC, "应用推荐并发")
         self.btn_apply_rec.clicked.connect(self.on_apply_recommended)
         hrow.addWidget(self.btn_apply_rec)
         hbody.addLayout(hrow)
@@ -384,105 +387,39 @@ class DashboardPage(ScrollArea):
         hbody.addWidget(self.host_hint)
         root.addWidget(host)
 
-        shows, sbody = make_card("场次偏好（全部场次，前三名按顺序提交）")
-        prow = QHBoxLayout()
-        prow.setSpacing(8)
-        order = win.cfg.get("shows", registrar.DEFAULT_ORDER)
-        for i, tag in enumerate(["第一", "第二", "第三"]):
-            prow.addWidget(BodyLabel(tag))
-            cb = Combo()
-            for key in registrar.SHOW_ORDER:
-                cb.addItem(registrar.SHOW_LABEL[key])
-            want = order[i] if i < len(order) and order[i] in registrar.SHOWS else None
-            cb.setCurrentIndex(registrar.SHOW_ORDER.index(want) if want else i)
-            cb.setFixedWidth(186)
-            cb.currentIndexChanged.connect(self.on_shows_changed)
-            setattr(self, f"show{i}", cb)
-            prow.addWidget(cb)
-            if i < 2:
-                prow.addWidget(QLabel(">"))
-        prow.addStretch(1)
-        sbody.addLayout(prow)
-
-        grid = QGridLayout()
-        grid.setSpacing(5)
-        self.chips = {}
-        for i, key in enumerate(registrar.SHOW_ORDER):
-            chip = QLabel()
-            chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.chips[key] = chip
-            grid.addWidget(chip, i // CHIP_COLS, i % CHIP_COLS)
-        sbody.addLayout(grid)
-        root.addWidget(shows)
-        self.on_shows_changed()
-
-        recent, rbody = make_card("最近成功")
-        self.recent = make_table(["时间", "邮箱", "方式", "姓名", "电话", "城市",
-                                  "场次", "耗时"])
-        self.recent.setFixedHeight(170)
+        recent, rbody = make_card("最近中签")
+        self.recent = make_table(["中签时间", "邮箱", "证据来源", "说明",
+                                  "最近来信"])
+        self.recent.setFixedHeight(190)
         rbody.addWidget(self.recent)
         root.addWidget(recent)
         root.addStretch(1)
 
-    # ---------------------------------------------------------------- shows
-    def current_order(self):
-        idx = [getattr(self, f"show{i}").currentIndex() for i in range(3)]
-        if len(set(idx)) != 3:
-            return None
-        return [registrar.SHOW_ORDER[i] for i in idx]
-
-    def on_shows_changed(self):
-        order = self.current_order()
-        for key, chip in self.chips.items():
-            date, venue, country = registrar.SHOW_META[key]
-            text = f"{date}  {venue}  {country}"
-            if order and key in order:
-                chip.setText(f"{BADGE[order.index(key)]} {text}")
-                chip.setStyleSheet(CHIP_ON)
-            else:
-                chip.setText(text)
-                chip.setStyleSheet(CHIP_OFF)
-        if order is None:
-            self.run_hint.setText("三个偏好不能重复。")
-        else:
-            self.win.cfg.set("shows", order)
-            self.win.cfg.save()
-            self.run_hint.setText("偏好已保存：" +
-                                  " > ".join(registrar.SHOW_LABEL[k] for k in order))
-
     def idle_hint(self):
-        mode = "browser"
         """Readiness line: says what is still missing rather than 'ready'."""
         s = self.win.store.stats()
-        pending = s.get("pending", 0)
-        proxies = len(self.win.pool)
-        if not pending and not proxies:
-            return "先做两步：到「邮箱池」导入账号，到「代理池」填代理（每行一个）。"
-        if not pending:
-            return (f"代理 {proxies} 个已就绪，但队列里没有待注册账号 —— "
-                    f"到「邮箱池」导入，或点「重置失败与卡住项」把旧账号放回队列。")
-        if not proxies:
-            return (f"待注册 {pending} 条已就绪，但还没有代理 —— "
-                    f"到「代理池」填一行 http://user:pass@host:port 并保存。")
-        return (f"就绪：待注册 {pending} 条 · 代理 {proxies} 个 · "
-                f"方式 {MODE_LABEL[mode]} · 线程 {self.threads.value()}")
+        if not s.get("total", 0):
+            return "先到「邮箱池」导入账号，然后点「开始检测」。"
+        if s.get("hits"):
+            return (f"就绪：{s['total']} 个账号 · 已中签 {s['hits']} · "
+                    f"未检测 {s.get('unchecked', 0)} · "
+                    f"并发 {self.threads.value()} · 每 {self.interval.value()}s 一轮")
+        return (f"就绪：{s['total']} 个账号全部待检 · "
+                f"并发 {self.threads.value()} · 每 {self.interval.value()}s 一轮")
 
     def refresh_host(self):
-        mode = "browser"
-        """内存 + 推荐线程数。浏览器模式每线程约 250MB，超了会一起变慢。"""
-        from core import sysinfo
-        info = sysinfo.summary(mode)
+        """内存 + 推荐并发数。检测程序不吃内存，瓶颈在上游并发限制。"""
+        info = sysinfo.summary("mail")
         if info["total_mb"] is None:
             self.host_label.setText("本机内存：读不到")
-            self.host_hint.setText("按 CPU 核数估计：建议 %d 线程" % info["recommended"])
+            self.host_hint.setText(f"按 CPU 核数估计：建议 {info['recommended']} 并发")
         else:
             used = info["total_mb"] - info["available_mb"]
             self.host_label.setText(
                 f"内存 {used} / {info['total_mb']} MB 在用 · "
                 f"可用 {info['available_mb']} MB · {info['cores']} 核")
             self.host_hint.setText(
-                f"当前模式（{MODE_LABEL.get(mode, mode)[:6]}）建议 "
-                f"{info['recommended']} 线程 —— {info['reason']}")
+                f"建议 {info['recommended']} 并发 —— {info['reason']}")
         self._recommended = info["recommended"]
 
     def on_apply_recommended(self):
@@ -493,22 +430,26 @@ class DashboardPage(ScrollArea):
         self.win.cfg.set("threads", int(n))
         self.win.cfg.save()
         self.threads.setValue(int(n))
-        self.win.notify("success", f"线程数已设为 {n}")
+        self.win.notify("success", f"并发已设为 {n}")
 
-
+    # ----------------------------------------------------------------- control
     def on_start(self):
-        self.win.start_engine(self.threads.value(), self.delay.value(),
-                              "browser")
+        self.win.start_monitor(self.threads.value(), self.interval.value(),
+                               self.lookback.value())
+
+    def on_check_now(self):
+        self.win.check_now()
 
     def on_stop(self):
-        self.win.stop_engine()
+        self.win.stop_monitor()
 
     def add_recent(self, d):
         t = self.recent
         t.insertRow(0)
-        vals = [datetime.now().strftime("%H:%M:%S"), d.get("email", ""),
-                d.get("mode") or "-", d.get("name", ""), d.get("phone", ""),
-                d.get("city", ""), d.get("show", ""), str(d.get("elapsed", ""))]
+        when = datetime.now().strftime("%H:%M:%S")
+        vals = [d.get("at") or when, d.get("email", ""),
+                hitcheck.SOURCE_LABEL.get(d.get("source"), d.get("source") or ""),
+                d.get("note", ""), d.get("subject", "")]
         for i, v in enumerate(vals):
             t.setItem(0, i, QTableWidgetItem(v))
         while t.rowCount() > 200:
@@ -577,31 +518,27 @@ class MailboxPage(QWidget):
 
         lst, lbody = make_card("账号列表")
         self.list_card = lst
-        self.table = make_table(["ID", "邮箱", "协议", "姓名", "电话", "生日",
-                                 "状态", "错误", "更新时间"])
+        self.table = make_table(["ID", "邮箱", "协议", "中签", "证据来源",
+                                 "最近来信", "检查次数", "检测错误", "更新时间"])
         lbody.addWidget(self.table, 1)
         rrow = QHBoxLayout()
         rrow.setSpacing(8)
         self.btn_refresh = PushButton(FIF.SYNC, "刷新")
         self.btn_refresh.clicked.connect(self.refresh)
-        self.btn_reset = PushButton(FIF.UPDATE, "重置失败与卡住项")
+        self.btn_reset = PushButton(FIF.UPDATE, "重置检测记录")
         self.btn_reset.clicked.connect(self.on_reset)
         rrow.addWidget(self.btn_refresh)
         rrow.addWidget(self.btn_reset)
         rrow.addStretch(1)
         rrow.addWidget(CaptionLabel("清理："))
-        self.btn_clean_reg = PushButton(FIF.DELETE, "邮件确认")
-        self.btn_clean_reg.clicked.connect(lambda: self.on_clean("registered"))
-        self.btn_clean_sub = PushButton(FIF.DELETE, "页面确认")
-        self.btn_clean_sub.clicked.connect(lambda: self.on_clean("submitted"))
-        self.btn_clean_fail = PushButton(FIF.DELETE, "失败")
-        self.btn_clean_fail.clicked.connect(lambda: self.on_clean("failed"))
-        self.btn_clean_pending = PushButton(FIF.DELETE, "待注册")
+        self.btn_clean_hit = PushButton(FIF.DELETE, "已中签")
+        self.btn_clean_hit.clicked.connect(lambda: self.on_clean("hit"))
+        self.btn_clean_pending = PushButton(FIF.DELETE, "未中签")
         self.btn_clean_pending.clicked.connect(lambda: self.on_clean("pending"))
         self.btn_clean_all = PushButton(FIF.DELETE, "全部")
         self.btn_clean_all.clicked.connect(lambda: self.on_clean(None))
-        for b in (self.btn_clean_reg, self.btn_clean_sub, self.btn_clean_fail,
-                  self.btn_clean_pending, self.btn_clean_all):
+        for b in (self.btn_clean_hit, self.btn_clean_pending,
+                  self.btn_clean_all):
             rrow.addWidget(b)
         lbody.addLayout(rrow)
         root.addWidget(lst, 1)
@@ -618,23 +555,33 @@ class MailboxPage(QWidget):
         }
         self.proto_hint.setText(hints.get(proto, ""))
 
-    def on_clean(self, status):
-        """Delete a bucket of accounts; registrations follow via CASCADE."""
+    def on_clean(self, bucket):
+        """Delete a bucket of accounts; their registrations follow by CASCADE.
+
+        「未中签」按 status='pending' 删 —— 检测程序从不改这个字段，中签是写
+        hit_at 而不是换状态，所以 pending 就是「还没中签」的那一堆。
+        """
         stats = self.win.store.stats()
-        label = {"registered": "已注册（邮件确认）", "submitted": "页面确认提交",
-                 "failed": "失败", "pending": "待注册"}.get(
-            status, "全部")
-        n = stats.get(status, 0) if status else stats.get("total", 0)
+        label = {"hit": "已中签", "pending": "未中签"}.get(bucket, "全部")
+        if bucket == "hit":
+            n = stats.get("hits", 0)
+        elif bucket:
+            n = stats.get(bucket, 0)
+        else:
+            n = stats.get("total", 0)
         if not n:
             self.win.notify("warning", f"没有{label}的账号可清理")
             return
-        extra = ("\n\n注意：已注册账号的记录会一并删除（预约表通过外键级联）。"
-                 if status in (None, "registered", "submitted") else "")
+        extra = ("\n\n注意：这些账号的旧预约记录会一并删除（外键级联）。"
+                 if bucket else "")
         if not MessageBox("确认清理",
                           f"将永久删除 {n} 条「{label}」账号，不可撤销。{extra}\n\n继续吗？",
                           self).exec():
             return
-        removed = self.win.store.delete_accounts(status)
+        if bucket == "hit":
+            removed = self.win.store.delete_hits()
+        else:
+            removed = self.win.store.delete_accounts(bucket)
         self.win.store.vacuum()
         self.refresh()
         self.win.notify("success", f"已清理 {removed} 条「{label}」账号")
@@ -704,94 +651,23 @@ class MailboxPage(QWidget):
         self.win.notify("success", f"已导出 {len(lines)} 条")
 
     def on_reset(self):
-        n = self.win.store.reset_failed()
+        n = self.win.store.reset_checks()
         self.refresh()
-        self.win.notify("success", f"{n} 条（失败 + 卡住）已重置为待注册")
-        self.win.log("warn", f"重置 {n} 条为待注册")
+        self.win.notify("success", f"{n} 条未中签账号已重置，下轮重新检测")
+        self.win.log("warn", f"重置 {n} 条检测记录（已中签的不动）")
 
     def refresh(self):
         s = self.win.store.stats()
         rows = self.win.store.accounts(DISPLAY_LIMIT)
         self.list_card.setTitle(
-            f"账号列表（共 {s.get('total', 0)} 条，显示最近 {len(rows)}）")
+            f"账号列表（共 {s.get('total', 0)} 条，中签 {s.get('hits', 0)}，"
+            f"显示最近 {len(rows)}）")
         fill_row(self.table, [
             [r["id"], r["email"], r.get("protocol") or "graph",
-             full_name(r), r["phone"], r["date_of_birth"], r["status"],
-             (r["error"] or "")[:60], r["updated_at"]] for r in rows])
-
-
-class ProxyPage(QWidget):
-    def __init__(self, win):
-        super().__init__()
-        self.win = win
-        self.setObjectName("ProxyPage")
-        root = tight(QVBoxLayout(self), PAD, GAP)
-
-        head = QHBoxLayout()
-        head.addWidget(TitleLabel("代理池"))
-        head.addWidget(CaptionLabel(
-            "一行一个代理，支持 http://user:pass@host:port、socks5://…、host:port、"
-            "host:port:user:pass。浏览器/混合方式需要 http(s) 上游。"))
-        head.addStretch(1)
-        root.addLayout(head)
-
-        box, bbody = make_card("代理列表")
-        self.text = TextEdit()
-        self.text.setPlaceholderText("每行一个，例如 http://user:pass@HOST:PORT 或 socks5://user:pass@HOST:PORT")
-        self.text.setFixedHeight(92)
-        self.text.setPlainText("\n".join(win.cfg.get("proxies", [])))
-        bbody.addWidget(self.text)
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self.btn_save = PrimaryPushButton(FIF.SAVE, "保存代理池")
-        self.btn_save.clicked.connect(self.on_save)
-        self.btn_test = PushButton(FIF.SPEED_HIGH, "测试全部")
-        self.btn_test.clicked.connect(self.on_test)
-        self.btn_clear = PushButton(FIF.DELETE, "清空")
-        self.btn_clear.clicked.connect(lambda: self.text.clear())
-        for b in (self.btn_save, self.btn_test, self.btn_clear):
-            row.addWidget(b)
-        row.addStretch(1)
-        bbody.addLayout(row)
-        root.addWidget(box)
-
-        health, hbody = make_card("健康状态")
-        self.table = make_table(["代理", "成功", "失败", "冷却", "最近错误"])
-        hbody.addWidget(self.table, 1)
-        root.addWidget(health, 1)
-
-    def on_save(self):
-        lines = [l for l in self.text.toPlainText().splitlines() if l.strip()]
-        n = self.win.pool.load(lines)
-        self.win.cfg.set("proxies", lines)
-        self.win.cfg.save()
-        self.win.notify("success", f"已保存 {n} 个可用代理")
-        self.win.log("ok", f"代理池已更新，{n} 个条目")
-
-    def on_test(self):
-        urls = self.win.pool.urls()
-        if not urls:
-            self.win.notify("warning", "代理池为空")
-            return
-        self.win.log("info", f"测试 {len(urls)} 个代理…")
-
-        def work():
-            for u in urls:
-                ok, info, cost = registrar.probe_proxy(u)
-                self.win.pool.report(u, ok, "" if ok else info)
-                self.win.log("ok" if ok else "error",
-                             f"  {u.split('@')[-1]} -> "
-                             f"{'OK ' + info if ok else info} ({cost}s)")
-            # back to the GUI thread for anything that touches a widget
-            self.win.bridge.refreshAll.emit()
-            self.win.bridge.toast.emit("success", "代理测试完成")
-        threading.Thread(target=work, daemon=True).start()
-
-    def refresh(self):
-        fill_row(self.table, [
-            [r["url"].split("@")[-1], r["ok"], r["fail"],
-             "是" if r["cooling"] else "否", r["last_error"][:60]]
-            for r in self.win.pool.snapshot()])
+             _when(r.get("hit_at")), hitcheck.SOURCE_LABEL.get(
+                 r.get("hit_source"), r.get("hit_source") or ""),
+             _when(r.get("last_mail_at")), r.get("check_count") or 0,
+             (r.get("check_error") or "")[:56], r["updated_at"]] for r in rows])
 
 
 class SettingsPage(ScrollArea):
@@ -807,28 +683,67 @@ class SettingsPage(ScrollArea):
         root = tight(QVBoxLayout(self.view), PAD, GAP)
         root.addWidget(TitleLabel("设置"))
 
-        adv, abody = make_card("请求参数")
+        adv, abody = make_card("检测节奏")
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(8)
 
-        self.link_timeout = CompactSpinBox()
-        self.link_timeout.setRange(30, 3600)
-        self.link_timeout.setValue(int(win.cfg.get("link_timeout", 300)))
-        self.link_timeout.setFixedWidth(110)
-        self.db_path = LineEdit()
-        self.db_path.setText(str(win.cfg.get("db_path", "oasis.db")))
-        self.log_file = LineEdit()
-        self.log_file.setText(str(win.cfg.get("log_file", "oasis_run.log")))
+        self.interval = CompactSpinBox()
+        self.interval.setRange(30, 86400)
+        self.interval.setSingleStep(30)
+        self.interval.setValue(int(win.cfg.get("interval", 300)))
+        self.interval.setFixedWidth(110)
+        self.interval.setToolTip(
+            "一轮跑完到下一轮开始之间的等待（秒）。中签通知不是秒级事件，\n"
+            "频率再高只是把对方的收件箱打成请求尖峰。")
+        self.threads = CompactSpinBox()
+        self.threads.setRange(1, 32)
+        self.threads.setValue(int(win.cfg.get("threads", 2)))
+        self.threads.setFixedWidth(110)
+        self.threads.setToolTip(
+            "同时打开几条收件箱连接。同一 Gmail 收件箱下的 iCloud 别名共用一条，\n"
+            "所以这是并发连接数，不是「同时读几封信」。")
+        self.lookback_days = CompactSpinBox()
+        self.lookback_days.setRange(0, 3650)
+        self.lookback_days.setValue(int(win.cfg.get("lookback_days", 30)))
+        self.lookback_days.setFixedWidth(110)
+        self.lookback_days.setToolTip(
+            "首次检测回看多少天；0 = 不设基线，邮箱里所有 Oasis 来信都算数。\n"
+            "活动已结束，中签结果可能早就发过了，这个窗口决定那些信算不算新信。")
+        self.per_page = CompactSpinBox()
+        self.per_page.setRange(1, 200)
+        self.per_page.setValue(int(win.cfg.get("per_page", 20)))
+        self.per_page.setFixedWidth(110)
+        self.per_page.setToolTip("每个邮箱取最近多少封信来判。")
+        self.skip_hits = SwitchButton()
+        self.skip_hits.setChecked(bool(win.cfg.get("skip_hits", True)))
+        self.skip_hits.setToolTip(
+            "开启后已中签的账号不再重复检测 —— 同一个答案重复搜索没有意义。\n"
+            "若想连后续的付款/取票通知一起盯，把它关掉。")
+        self.debug = SwitchButton()
+        self.debug.setChecked(bool(win.cfg.get("debug", False)))
+
+        rows = [("检测间隔(秒)", self.interval),
+                ("并发连接数", self.threads),
+                ("首次回看(天)", self.lookback_days),
+                ("每箱取信(封)", self.per_page),
+                ("跳过已中签", self.skip_hits),
+                ("调试堆栈", self.debug)]
+        for i, (label, w) in enumerate(rows):
+            grid.addWidget(BodyLabel(label), i, 0)
+            grid.addWidget(w, i, 1)
+        grid.setColumnStretch(1, 1)
+        abody.addLayout(grid)
+        root.addWidget(adv)
+
+        mail, mbody = make_card("取件通道")
+        mgrid = QGridLayout()
+        mgrid.setHorizontalSpacing(12)
+        mgrid.setVerticalSpacing(8)
         self.mail_proxy = LineEdit()
         self.mail_proxy.setPlaceholderText(
             "留空 = 直连（推荐）。仅在网络必须走代理时才填，例如 socks5://127.0.0.1:1080")
         self.mail_proxy.setText(str(win.cfg.get("mail_proxy", "")))
-        self.google_proxy = LineEdit()
-        self.google_proxy.setPlaceholderText(
-            "留空 = 不分流，Google 与注册流量走同一个上游。"
-            "仅当上游屏蔽 Google（reCAPTCHA 加载不了）时才填一个能访问 Google 的代理")
-        self.google_proxy.setText(str(win.cfg.get("google_proxy", "")))
         self.hme_base = LineEdit()
         self.hme_base.setPlaceholderText(
             "本地 iCloud 隐藏邮箱服务地址，默认 http://127.0.0.1:8081")
@@ -838,51 +753,43 @@ class SettingsPage(ScrollArea):
         self.hme_password.setPlaceholderText(
             "该服务的管理员密码（启动时的 ICLOUD_HME_ADMIN_PASSWORD）")
         self.hme_password.setText(str(win.cfg.get("hme_password", "")))
-        self.front_proxy = LineEdit()
-        self.front_proxy.setPlaceholderText(
-            "留空 = 直连上游。短效住宅代理在国内常无法直连时填，例如 socks5://127.0.0.1:10808。"
-            "填了之后所有上游都经它拨号（自动链式），HTTP 模式也会改走本地 relay")
-        self.front_proxy.setText(str(win.cfg.get("front_proxy", "")))
-        self.success_timeout = CompactSpinBox()
-        self.success_timeout.setRange(0, 900)
-        self.success_timeout.setValue(int(win.cfg.get("success_timeout", 180)))
-        self.success_timeout.setFixedWidth(110)
-        self.success_timeout.setToolTip(
-            "只在页面没确认注册时才等满这个时长（那时邮件是唯一证据）。\n"
-            "页面已经确认的情况下最多再看 30 秒——浏览器模式实测不发成功邮件。")
-        self.delay_between = CompactDoubleSpinBox()
-        self.delay_between.setRange(0.0, 30.0)
-        self.delay_between.setSingleStep(0.5)
-        self.delay_between.setValue(float(win.cfg.get("delay_between", 0.0)))
-        self.delay_between.setFixedWidth(110)
-        self.delay_between.setToolTip("每个账号跑完后的停顿，0 = 不停顿。")
-        self.verify_success = SwitchButton()
-        self.verify_success.setChecked(bool(win.cfg.get("verify_success", False)))
-        self.verify_success.setToolTip(
-            "开启后，confirm 返回 OK 之后还会等「Registration Complete」邮件确认。\n"
-            "必须知道：confirm 对「被拒绝的地址」同样返回 OK，不看邮件就会把失败记成成功。\n"
-            "代价是每个账号多等最多 180 秒。")
-        self.debug = SwitchButton()
-        self.debug.setChecked(bool(win.cfg.get("debug", False)))
+        self.alias_inbox = LineEdit()
+        self.alias_inbox.setPlaceholderText(
+            "承载 iCloud 别名的 Gmail 地址；导入裸别名时用它补全凭据行")
+        self.alias_inbox.setText(str(win.cfg.get("alias_inbox", "")))
+        self.alias_inbox_password = LineEdit()
+        self.alias_inbox_password.setEchoMode(LineEdit.EchoMode.Password)
+        self.alias_inbox_password.setPlaceholderText(
+            "该 Gmail 的应用专用密码（不是账号密码）")
+        self.alias_inbox_password.setText(
+            str(win.cfg.get("alias_inbox_password", "")))
+        mrows = [("取件代理", self.mail_proxy),
+                 ("iCloud 服务", self.hme_base),
+                 ("iCloud 密码", self.hme_password),
+                 ("别名收件箱", self.alias_inbox),
+                 ("收件箱密码", self.alias_inbox_password)]
+        for i, (label, w) in enumerate(mrows):
+            mgrid.addWidget(BodyLabel(label), i, 0)
+            mgrid.addWidget(w, i, 1)
+        mgrid.setColumnStretch(1, 1)
+        mbody.addLayout(mgrid)
+        root.addWidget(mail)
 
-        rows = [                ("等邮件超时(秒)", self.link_timeout),
-                ("成功后校验邮件", self.verify_success),
-                ("成功邮件超时(秒)", self.success_timeout),
-                ("账号间停顿(秒)", self.delay_between),
-                ("取件代理", self.mail_proxy),
-                ("iCloud 服务", self.hme_base),
-                ("iCloud 密码", self.hme_password),
-                ("前置代理(链路)", self.front_proxy),
-                ("Google 分流代理", self.google_proxy),
-                ("数据库路径", self.db_path),
-                ("日志文件", self.log_file),
-                ("调试堆栈", self.debug)]
-        for i, (label, w) in enumerate(rows):
-            grid.addWidget(BodyLabel(label), i, 0)
-            grid.addWidget(w, i, 1)
-        grid.setColumnStretch(1, 1)
-        abody.addLayout(grid)
-        root.addWidget(adv)
+        store, sbody = make_card("存储与日志")
+        sgrid = QGridLayout()
+        sgrid.setHorizontalSpacing(12)
+        sgrid.setVerticalSpacing(8)
+        self.db_path = LineEdit()
+        self.db_path.setText(str(win.cfg.get("db_path", "oasis.db")))
+        self.log_file = LineEdit()
+        self.log_file.setText(str(win.cfg.get("log_file", "oasis_run.log")))
+        for i, (label, w) in enumerate((("数据库路径", self.db_path),
+                                        ("日志文件", self.log_file))):
+            sgrid.addWidget(BodyLabel(label), i, 0)
+            sgrid.addWidget(w, i, 1)
+        sgrid.setColumnStretch(1, 1)
+        sbody.addLayout(sgrid)
+        root.addWidget(store)
 
         theme, tbody = make_card("外观")
         trow = QHBoxLayout()
@@ -906,20 +813,21 @@ class SettingsPage(ScrollArea):
 
     def on_save(self):
         self.win.cfg.update({
-            "link_timeout": self.link_timeout.value(),
-            "verify_success": self.verify_success.isChecked(),
-            "success_timeout": self.success_timeout.value(),
-            "delay_between": self.delay_between.value(),
+            "interval": self.interval.value(),
+            "threads": self.threads.value(),
+            "lookback_days": self.lookback_days.value(),
+            "per_page": self.per_page.value(),
+            "skip_hits": self.skip_hits.isChecked(),
             "mail_proxy": self.mail_proxy.text().strip(),
             "hme_base": self.hme_base.text().strip(),
             "hme_password": self.hme_password.text().strip(),
-            "google_proxy": self.google_proxy.text().strip(),
-            "front_proxy": self.front_proxy.text().strip(),
+            "alias_inbox": self.alias_inbox.text().strip(),
+            "alias_inbox_password": self.alias_inbox_password.text().strip(),
             "db_path": self.db_path.text().strip() or "oasis.db",
             "log_file": self.log_file.text().strip() or "oasis_run.log",
             "debug": self.debug.isChecked()})
         self.win.cfg.save()
-        self.win.notify("success", "设置已保存")
+        self.win.notify("success", "设置已保存（下一轮生效）")
 
 
 class LogPage(QWidget):
@@ -993,16 +901,17 @@ class DataPage(QWidget):
         head.addWidget(b_csv)
         root.addLayout(head)
 
-        reg, rbody = make_card("预约记录（account + artist 唯一）")
+        reg, rbody = make_card("旧预约记录（上一版程序留下，只读）")
         self.reg_card = reg
-        self.reg_table = make_table(["ID", "邮箱", "方式", "场次答案", "状态", "时间"])
+        self.reg_table = make_table(["ID", "邮箱", "方式", "状态", "时间"])
         rbody.addWidget(self.reg_table, 1)
         root.addWidget(reg, 1)
 
-        acc, abody = make_card("账号与身份")
+        acc, abody = make_card("账号与检测结果")
         self.acc_card = acc
-        self.acc_table = make_table(["ID", "邮箱", "协议", "姓名", "电话", "生日",
-                                     "状态", "更新时间"])
+        self.acc_table = make_table(["ID", "邮箱", "协议", "姓名", "中签",
+                                     "证据来源", "最近来信", "检查次数",
+                                     "检测错误"])
         abody.addWidget(self.acc_table, 1)
         root.addWidget(acc, 1)
 
@@ -1011,35 +920,45 @@ class DataPage(QWidget):
         regs = self.win.store.registrations(DISPLAY_LIMIT)
         accs = self.win.store.accounts(DISPLAY_LIMIT)
         self.reg_card.setTitle(
-            f"预约记录（共 {s.get('registrations', 0)} 条，显示最近 {len(regs)}）")
+            f"旧预约记录（共 {s.get('registrations', 0)} 条，显示最近 {len(regs)}）")
         self.acc_card.setTitle(
-            f"账号与身份（共 {s.get('total', 0)} 条，显示最近 {len(accs)}）")
+            f"账号与检测结果（共 {s.get('total', 0)} 条，中签 "
+            f"{s.get('hits', 0)}，显示最近 {len(accs)}）")
         fill_row(self.reg_table, [
-            [r["id"], r["email"], r.get("mode") or "-", r["poll_answer_ids"],
-             r["status"], r["created_at"]] for r in regs])
+            [r["id"], r["email"], r.get("mode") or "-", r["status"],
+             r["created_at"]] for r in regs])
         fill_row(self.acc_table, [
             [r["id"], r["email"], r.get("protocol") or "graph", full_name(r),
-             r["phone"], r["date_of_birth"], r["status"], r["updated_at"]]
+             _when(r.get("hit_at")),
+             hitcheck.SOURCE_LABEL.get(r.get("hit_source"),
+                                       r.get("hit_source") or ""),
+             _when(r.get("last_mail_at")), r.get("check_count") or 0,
+             (r.get("check_error") or "")[:50]]
             for r in accs])
 
     def on_csv(self):
-        """Export every registration - the table view is capped, this is not."""
+        """导出中签名单全量（表格显示有上限，导出没有）。"""
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出 CSV（全量）", os.path.join(BASE, "oasis_data.csv"),
+            self, "导出中签名单（全量）", os.path.join(BASE, "oasis_hits.csv"),
             "CSV (*.csv)")
         if not path:
             return
-        regs = self.win.store.registrations()
+        hits = self.win.store.hits()
         with open(path, "w", newline="", encoding="utf-8-sig") as fh:
             w = csv.writer(fh)
-            w.writerow(["id", "email", "mode", "poll_answer_ids", "status",
-                        "created_at"])
-            for r in regs:
-                w.writerow([r["id"], r["email"], r.get("mode") or "-",
-                            r["poll_answer_ids"], r["status"], r["created_at"]])
+            w.writerow(["id", "email", "中签时间", "证据来源", "说明",
+                        "最近来信", "来信标题", "协议"])
+            for h in hits:
+                w.writerow([h["id"], h["email"], _when(h.get("hit_at")),
+                            hitcheck.SOURCE_LABEL.get(h.get("hit_source"),
+                                                      h.get("hit_source") or ""),
+                            h.get("hit_note") or "",
+                            _when(h.get("last_mail_at")),
+                            h.get("last_mail_subject") or "",
+                            h.get("protocol") or ""])
         self.win.notify("success",
-                        f"已导出全部 {len(regs)} 条预约记录（不受表格显示上限影响）")
-        self.win.log("ok", f"导出 CSV：{len(regs)} 条 -> {os.path.basename(path)}")
+                        f"已导出 {len(hits)} 条中签记录（不受表格显示上限影响）")
+        self.win.log("ok", f"导出 CSV：{len(hits)} 条 -> {os.path.basename(path)}")
 
 
 # ----------------------------------------------------------------- main window
@@ -1049,22 +968,20 @@ class MainWindow(FluentWindow):
         setThemeColor("#d9822b")
         self.cfg = Config(os.path.join(BASE, "oasis_config.json"))
         self.store = Store(self.cfg.db_path)
-        self.pool = ProxyPool(self.cfg.get("proxies", []))
         self.bridge = Bridge()
-        self.engine = Engine(self.store, self.pool, self._engine_log,
-                             self._engine_event, self.cfg.data)
+        self.monitor = HitMonitor(self.store, self._monitor_log,
+                                  self._monitor_event, self.cfg.data)
 
         self.dash = DashboardPage(self)
         self.mail = MailboxPage(self)
-        self.proxy = ProxyPage(self)
         self.data = DataPage(self)
         self.logs = LogPage(self)
         self.settings = SettingsPage(self)
 
         self.addSubInterface(self.dash, FIF.HOME, "仪表盘")
         self.addSubInterface(self.mail, FIF.MAIL, "邮箱池")
-        self.addSubInterface(self.proxy, FIF.GLOBE, "代理池")
         self.addSubInterface(self.data, FIF.DOCUMENT, "数据库")
+
         self.addSubInterface(self.logs, FIF.VIEW, "日志")
         self.addSubInterface(self.settings, FIF.SETTING, "设置",
                              NavigationItemPosition.BOTTOM)
@@ -1075,13 +992,13 @@ class MainWindow(FluentWindow):
 
         self.resize(1320, 840)
         self.setMinimumSize(1080, 680)
-        self.setWindowTitle("Oasis Live '27 注册控制台")
+        self.setWindowTitle("Oasis Live '27 中签检测台")
         self._log_fh = None
 
         self.bridge.log.connect(self._on_log)
         self.bridge.stats.connect(self._on_stats)
-        self.bridge.registered.connect(self._on_registered)
-        self.bridge.failed.connect(self._on_failed)
+        self.bridge.hit.connect(self._on_hit)
+        self.bridge.sweep.connect(self._on_sweep)
         self.bridge.stopped.connect(self._on_stopped)
         self.bridge.toast.connect(self.notify)
         self.bridge.refreshAll.connect(self._refresh_all)
@@ -1090,18 +1007,23 @@ class MainWindow(FluentWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(2000)
         self._refresh_all()
-        self.log("info", "控制台就绪。浏览器模式：驱动官方 SPA 表单，"
-                         "captcha 由页面自己签，提交也由 SPA 发出。")
+        s = self.store.stats()
+        self.log("info", f"检测台就绪：{s.get('total', 0)} 个账号 · "
+                         f"已中签 {s.get('hits', 0)}"
+                         + ("（含上一版程序并入的记录）"
+                            if s.get("hits") else ""))
+        if not s.get("total"):
+            self.log("warn", "账号池是空的 —— 到「邮箱池」导入账号后再开始检测")
 
     # ---------------------------------------------------------------- plumbing
-    def _engine_log(self, level, msg):
+    def _monitor_log(self, level, msg):
         self.bridge.log.emit(level, msg)
 
-    def _engine_event(self, kind, payload):
+    def _monitor_event(self, kind, payload):
         payload = payload or {}
-        signal = {"stats": self.bridge.stats,
-                  "registered": self.bridge.registered,
-                  "failed": self.bridge.failed,
+        signal = {"hit": self.bridge.hit,
+                  "sweep": self.bridge.sweep,
+                  "stats": self.bridge.stats,
                   "stopped": self.bridge.stopped,
                   "started": self.bridge.started}.get(kind)
         if signal is not None:
@@ -1137,81 +1059,87 @@ class MainWindow(FluentWindow):
     def _on_stats(self, s):
         self._apply_stats(s)
 
-    def _on_registered(self, d):
+    def _on_hit(self, d):
         self.dash.add_recent(d)
-        self.notify("success", f"{d.get('email')} 注册成功")
+        self.notify("success", f"{d.get('email')} 中签 —— "
+                               f"{hitcheck.SOURCE_LABEL.get(d.get('source'), '')}")
         self.data.refresh()
 
-    def _on_failed(self, d):
-        self.notify("error", f"{d.get('email')} 失败：{d.get('error', '')[:60]}")
+    def _on_sweep(self, payload):
+        self._apply_stats(payload.get("stats") or self.store.stats())
+        self.data.refresh()
 
     def _on_stopped(self, payload):
         self.dash.btn_start.setEnabled(True)
         self.dash.btn_stop.setEnabled(False)
-        self.log("warn", "引擎已停止")
+        self.log("warn", "检测已停止")
         self._refresh_all()
 
     def _apply_stats(self, s):
         for k, card in self.dash.cards.items():
             card.set_value(s.get(k, 0))
         total = s.get("total", 0)
-        done = s.get("registered", 0) + s.get("failed", 0)
-        self.dash.progress.setValue(int(done / total * 100) if total else 0)
+        # 进度按「已经查过」算，不按中签算：检测的目标是看完整个池子，
+        # 中签数是结果而不是进度。
+        seen = s.get("checked", 0) + s.get("hits", 0)
+        self.dash.progress.setValue(min(100, int(seen / total * 100))
+                                    if total else 0)
 
     def _tick(self):
-        if self.engine.running:
+        if self.monitor.running:
             self._apply_stats(self.store.stats())
 
     def _refresh_all(self):
         self._apply_stats(self.store.stats())
         self.mail.refresh()
-        self.proxy.refresh()
         self.data.refresh()
-        if not self.engine.running:
+        if not self.monitor.running:
             self.dash.run_hint.setText(self.dash.idle_hint())
 
     # ----------------------------------------------------------------- control
-    def start_engine(self, threads, delay, mode="browser"):
-        self.cfg.set("threads", threads)
-        self.cfg.set("delay_between", delay)
-        self.cfg.set("mode", mode)
-        self.cfg.save()
-        self.engine.config = self.cfg.data
-        order = [s for s in self.cfg.get("shows", registrar.DEFAULT_ORDER)
-                 if s in registrar.SHOWS]
-        if len(order) != 3 or len(set(order)) != 3:
-            self.notify("error", "场次偏好必须是三个不重复的场次")
+    def start_monitor(self, threads, interval, lookback_days):
+        s = self.store.stats()
+        if not s.get("total", 0):
+            self.notify("warning", "账号池是空的 —— 先到「邮箱池」导入账号")
             return
+        self.cfg.update({"threads": int(threads),
+                         "interval": int(interval),
+                         "lookback_days": int(lookback_days)})
+        self.cfg.save()
+        self.monitor.config = self.cfg.data
         self.dash.btn_start.setEnabled(False)
         self.dash.btn_stop.setEnabled(True)
         self.dash.run_hint.setText(
-            f"运行中：{MODE_LABEL.get(mode, mode)} · {threads} 线程 · " +
-            " > ".join(registrar.SHOW_LABEL[s] for s in order))
-        self.engine.start(threads=threads, order=order,
-                          link_timeout=int(self.cfg.get("link_timeout", 300)),
-                          delay_between=delay, mode=mode)
-        threading.Thread(target=self._wait_done, daemon=True).start()
+            f"检测中：并发 {threads} · 每 {interval}s 一轮 · "
+            f"首次回看 {lookback_days} 天")
+        self.monitor.start(threads=int(threads), interval=int(interval),
+                           lookback_days=float(lookback_days),
+                           per_page=int(self.cfg.get("per_page", 20)),
+                           skip_hits=bool(self.cfg.get("skip_hits", True)))
 
-    def _wait_done(self):
-        self.engine.join()
-        self.engine.finish()
+    def check_now(self):
+        """不等下一个间隔，立刻跑一轮。"""
+        if not self.store.stats().get("total", 0):
+            self.notify("warning", "账号池是空的 —— 先到「邮箱池」导入账号")
+            return
+        if self.monitor.running:
+            self.monitor.wake()
+            self.notify("info", "已排队：当前轮结束后立刻再查一轮")
+            return
+        self.start_monitor(self.dash.threads.value(), self.dash.interval.value(),
+                           self.dash.lookback.value())
 
-    def stop_engine(self):
-        self.engine.stop()
-        self.dash.run_hint.setText("正在停止（等待当前账号完成）…")
+    def stop_monitor(self):
+        self.monitor.stop()
+        self.dash.run_hint.setText("正在停止（等当前这批账号读完）…")
 
     def closeEvent(self, e):
-        if self.engine.running:
-            if not MessageBox("确认退出", "引擎仍在运行，确定退出吗？", self).exec():
+        if self.monitor.running:
+            if not MessageBox("确认退出", "检测仍在运行，确定退出吗？", self).exec():
                 e.ignore()
                 return
-            self.engine.stop()
-        # browser mode keeps one shared chromium alive between accounts; nothing
-        # else shuts it down, so an exited console would leave it running.
-        try:
-            self.engine.browser.close_warm()
-        except Exception:
-            pass
+            self.monitor.stop()
+            self.monitor.join()
         try:
             if self._log_fh:
                 self._log_fh.close()

@@ -6,7 +6,7 @@ import {
 import {
   ReloadOutlined, DownloadOutlined, UploadOutlined, CloudDownloadOutlined,
 } from "@ant-design/icons";
-import { api, STATUS, STATUS_FILTER } from "../api.js";
+import { api, SOURCE, STATUS_FILTER } from "../api.js";
 
 const { Text, Paragraph } = Typography;
 
@@ -232,23 +232,28 @@ export default function Mailboxes({ refresh }) {
   const columns = [
     { title: "ID", dataIndex: "id", width: 70 },
     { title: "邮箱", dataIndex: "email", ellipsis: true },
-    { title: "协议", dataIndex: "protocol", width: 90 },
+    { title: "协议", dataIndex: "protocol", width: 96 },
     {
-      title: "状态", dataIndex: "status", width: 120,
-      render: (v) => <Tag color={v === "registered" ? "success"
-        : v === "submitted" ? "cyan"
-        : v === "failed" ? "error"
-        : v === "running" ? "processing" : "default"}>
-        {STATUS[v]?.label || v}
-      </Tag>,
+      title: "中签", dataIndex: "hit_at", width: 130,
+      render: (v, r) => (v
+        ? <Tag color={SOURCE[r.hit_source]?.color || "success"}>
+            {r.label || SOURCE[r.hit_source]?.label || "中签"}
+          </Tag>
+        : <Text type="secondary" style={{ fontSize: 12 }}>—</Text>),
     },
     {
-      title: "姓名", width: 140,
-      render: (_, r) => `${r.first_name || ""} ${r.last_name || ""}`.trim() || "—",
+      title: "最近来信", dataIndex: "last_mail_at", width: 130,
+      render: (v, r) => (v
+        ? <Text style={{ fontSize: 12 }}>{v}</Text>
+        : <Text type="secondary" style={{ fontSize: 12 }}>无</Text>),
     },
-    { title: "电话", dataIndex: "phone", width: 130 },
+    { title: "来信标题", dataIndex: "last_mail_subject", ellipsis: true },
     {
-      title: "备注", dataIndex: "error", ellipsis: true,
+      title: "检查", dataIndex: "check_count", width: 70,
+      render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{v || 0}</Text>,
+    },
+    {
+      title: "检测错误", dataIndex: "check_error", ellipsis: true,
       render: (v) => <Text type="secondary" style={{ fontSize: 12 }}>{v || ""}</Text>,
     },
   ];
@@ -267,9 +272,9 @@ export default function Mailboxes({ refresh }) {
             <Select value={status} onChange={setStatus} style={{ width: 150 }}
                     options={STATUS_FILTER} />
             <Button icon={<ReloadOutlined />} onClick={() => load(1)}>刷新</Button>
-            <Popconfirm title="把失败与卡住的账号放回队列？" onConfirm={reset}
-                        okText="确认" cancelText="取消">
-              <Button>重置失败与卡住项</Button>
+            <Popconfirm title="清掉未中签账号的检测记录，下一轮重新查？"
+                        onConfirm={reset} okText="确认" cancelText="取消">
+              <Button>重置检测记录</Button>
             </Popconfirm>
             <Button icon={<DownloadOutlined />}
                     onClick={() => { window.location.href = api.exportUrl("creds"); }}>

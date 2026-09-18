@@ -1,7 +1,9 @@
 name: docker
 
 # Builds the headless service image and publishes it to GHCR, so a small box
-# can `docker pull` instead of compiling the ~2GB Playwright base itself.
+# can `docker pull` instead of building the React bundle itself. The runtime
+# stage is python:slim - the monitor reads mailboxes and nothing else, so there
+# is no browser in this image.
 #
 # Runs on every push that touches the service, and on demand. Pull requests
 # build but do not push.

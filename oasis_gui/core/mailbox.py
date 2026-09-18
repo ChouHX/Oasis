@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Mailbox readers: Microsoft Graph and IMAP, both driven by one credential line.
+"""Mailbox readers: every reader returns the same thing - a page of Mail.
 
-Credential line: email----password----client_id----refresh_token
+The job here is now only to *read* an inbox. Nothing in this module submits
+anything, waits for a link, or decides what a message means: it hands back
+subject / sender / body / timestamp and `core.hitcheck` decides the rest. That
+split is what let the registration half of the program be deleted outright.
 
-The fourth field is a Microsoft refresh token. It can be redeemed for either
-audience, so the same line works for both protocols:
+A reader is one credential line. Five shapes are supported:
+
+    email----password----client_id----refresh_token                    (Outlook)
+    email----password----client_id----client_secret----refresh_token    (Gmail)
+    email----acc_xxxxxxxx----hme                    (iCloud alias, local service)
+    alias@icloud.com----<gmail>----<app password>----gmail-imap
+                                                        (iCloud alias via Gmail)
+
+The fourth field of the Microsoft form is a refresh token. It can be redeemed
+for either audience, so the same line works for both protocols:
 
   * Graph -> scope https://graph.microsoft.com/.default
              GET https://graph.microsoft.com/v1.0/me/messages
@@ -24,6 +35,7 @@ memory and handed back to the caller for persistence - losing it loses the box.
 """
 import base64
 import email
+import email.header
 import imaplib
 import json
 import os
@@ -36,6 +48,7 @@ import http.cookiejar
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 
@@ -55,16 +68,10 @@ GMAIL_HOST = "imap.gmail.com"
 GMAIL_SCOPE = "https://mail.google.com/"
 GMAIL_DOMAINS = ("gmail.com", "googlemail.com")
 
-TOKEN_RE = re.compile(r"https://oasis\.hq\.fan/registration\?token=[A-Za-z0-9._\-]+")
-
 # iCloud Hide-My-Email via a local HME service. Reads need no CSRF, only the
 # session cookie, and one login covers the whole session TTL.
 HME_BASE_DEFAULT = "http://127.0.0.1:8081"
 HME_ICLOUD_DOMAINS = ("icloud.com", "me.com", "mac.com")
-
-# Body text of the "Oasis Live '27 Registration Complete" mail. Verified to
-# appear in 4/4 success mails and 0/15 verification mails.
-SUCCESS_MARK = "successfully registered"
 
 PROTOCOLS = ("graph", "imap", "auto")
 PROTOCOL_LABEL = {
@@ -77,6 +84,26 @@ PROTOCOL_LABEL = {
 # Apple ID. Stored in the accounts.protocol column, so a row says how to read
 # it without needing a new column.
 ALIAS_PROTOCOL = "alias-imap"
+
+
+@dataclass(frozen=True)
+class Mail:
+    """One message, as much of it as a reader could recover.
+
+    `subject` is already header-decoded. The site MIME-encodes it
+    (`=?UTF-8?Q?Oasis_Live_=E2=80=9927_Registration_Complete?=`), and a rule
+    that greps the raw header never matches - a mistake this program already
+    paid for once.
+    """
+
+    subject: str = ""
+    sender: str = ""
+    body: str = ""
+    stamp: float = 0.0
+    folder: str = field(default="")
+
+    def text(self):
+        return f"{self.subject}\n{self.sender}\n{self.body}"
 
 
 def is_gmail(email):
@@ -122,6 +149,16 @@ def parse_cred(line):
                      "(or the 5-field Gmail form)")
 
 
+# 单次网络操作的超时，以及一次读信箱允许的重试次数。
+#
+# 这组数字是给「不可达的邮箱」定的。实测（2026-09-18）：一个直连不通的 Gmail 账号
+# 会把整轮巡检拖住六分钟以上 —— 每次 token 请求 45s、重试 4 次、IMAP 握手再来
+# 3 轮，全都不报错、只是慢。检测程序每一轮要给几十个邮箱轮一遍，单个账号的预算
+# 必须是「几十秒失败」，否则一个坏邮箱就能吃掉整轮。
+NET_TIMEOUT = 20
+NET_ATTEMPTS = 2
+
+
 class MailAuthError(Exception):
     """The mailbox rejected the token. Retrying will not help.
 
@@ -132,7 +169,7 @@ class MailAuthError(Exception):
     """
 
 
-def _retry(fn, attempts=4, delay=1.2):
+def _retry(fn, attempts=NET_ATTEMPTS, delay=1.2):
     last = None
     for i in range(attempts):
         try:
@@ -152,7 +189,7 @@ def _retry(fn, attempts=4, delay=1.2):
     raise last
 
 
-def _open(req, timeout=45, opener=None):
+def _open(req, timeout=NET_TIMEOUT, opener=None):
     op = opener if opener is not None else DIRECT_OPENER
     with op.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
@@ -202,7 +239,7 @@ def _connect_http(host, port, proxy_url, timeout):
     return s
 
 
-def open_tunnel(host, port, timeout=30, proxy_url=""):
+def open_tunnel(host, port, timeout=NET_TIMEOUT, proxy_url=""):
     """Raw TCP socket to host:port.
 
     Empty proxy_url means a direct dial, which is the default for mail: the
@@ -287,60 +324,14 @@ class BaseMailbox:
         """
         return None
 
-    def find_verification_link(self, timeout=300, interval=6, not_before=None,
-                               log=None):
-        raise NotImplementedError
+    def messages(self, limit=12, not_before=None):
+        """Newest-first page of Mail for this mailbox.
 
-    def _candidates(self, not_before=None):
-        """(body, stamp) pairs, whatever shape this backend's messages() has."""
-        raise NotImplementedError
-
-    def _recent(self, stamp, not_before):
-        """Is this message new enough? Graph stamps are ISO strings, IMAP floats,
-        so the comparison cannot live in shared code."""
-        raise NotImplementedError
-
-    def find_success(self, timeout=180, interval=8, not_before=None, log=None):
-        """Wait for the "Registration Complete" mail. Returns (found, when).
-
-        Match on the body, never the subject: the subject arrives MIME-encoded
-
-            =?UTF-8?Q?Oasis_Live_=E2=80=9927_Registration_Complete?=
-
-        where the spaces are underscores, so a naive `"Registration Complete"
-        in subject` test against the raw header never matches and reports every
-        successful registration as a failure. The body of that mail says
-        "successfully registered", which appears in no verification mail at all
-        (checked across 15 verification and 4 success mails).
+        `not_before` is an epoch floor. Readers that can push the filter to the
+        server (Gmail's SEARCH SINCE) do; readers that cannot accept it and
+        filter at the end. Either way the caller sees only what it asked for.
         """
-        started = time.time()
-        deadline = started + timeout
-        polls = 0
-        while time.time() < deadline:
-            polls += 1
-            try:
-                cands = self._candidates(not_before)
-            except MailAuthError:
-                raise
-            except Exception as e:
-                if log:
-                    log(f"    success-mail fetch failed: {type(e).__name__}")
-                time.sleep(interval)
-                continue
-            for body, stamp in cands:
-                if SUCCESS_MARK not in body.lower():
-                    continue
-                if not self._recent(stamp, not_before):
-                    continue
-                return True, stamp
-            if log and polls % 4 == 0:
-                log(f"    waiting for success mail: {int(time.time() - started)}s/"
-                    f"{int(timeout)}s")
-            time.sleep(interval)
-        if log:
-            log(f"    no success mail within {int(timeout)}s - confirm answered OK "
-                f"but the registration did not complete")
-        return False, None
+        raise NotImplementedError
 
 
 GRAPH_SELECT = "subject,receivedDateTime,from,body"
@@ -359,74 +350,28 @@ class GraphMailbox(BaseMailbox):
                           "Accept": "application/json"}), opener=opener))
         return data.get("value", [])
 
-    def messages(self, top=15):
-        """Inbox **and** Junk.
+    def messages(self, limit=15, not_before=None):
+        """Inbox **and** Junk, newest first.
 
         Graph's /me/messages returns the Inbox only - measured on a real
         mailbox: 13 messages, all Inbox, with the Junk folder invisible even
-        though it held mail. A verification mail the server filed as junk is
-        therefore never seen and the caller waits out the whole timeout. The
+        though it held mail. The site's mail is routinely filed as junk, so the
         junk folder is queried separately (well-known name `junkemail`).
         """
-        msgs = self._folder_messages("/me/messages", top)
+        msgs = self._folder_messages("/me/messages", limit)
         try:
-            msgs += self._folder_messages("/me/mailFolders/junkemail/messages", top)
+            msgs += self._folder_messages("/me/mailFolders/junkemail/messages", limit)
         except Exception:
             pass                      # folder missing or not exposed by the API
-        seen, unique = set(), []
+        seen, out = set(), []
         for m in msgs:
             key = m.get("id") or m.get("internetMessageId") or id(m)
             if key in seen:
                 continue
             seen.add(key)
-            unique.append(m)
-        return {"value": unique}
-
-    def _candidates(self, not_before):
-        out = []
-        for m in self.messages().get("value", []):
-            body = (m.get("body") or {}).get("content", "") or ""
-            out.append((body, m.get("receivedDateTime")))
-        return out
-
-    @staticmethod
-    def _recent(stamp, not_before):
-        return _recent_enough_iso(stamp, not_before)
-
-    def find_verification_link(self, timeout=300, interval=6, not_before=None,
-                               log=None):
-        started = time.time()
-        deadline = started + timeout
-        last_error = None
-        polls = 0
-        while time.time() < deadline:
-            polls += 1
-            try:
-                cands = self._candidates(not_before)
-            except MailAuthError:
-                raise                       # no point polling a dead credential
-            except Exception as e:
-                # Never swallow this: "mail never arrived" is a lie when the
-                # real cause is an unreachable mailbox.
-                last_error = e
-                if log:
-                    log(f"    mail fetch failed: {type(e).__name__}: {str(e)[:110]}")
-                time.sleep(interval)
-                continue
-            for body, stamp in cands:
-                hit = TOKEN_RE.search(re.sub(r"=\r?\n", "", body).replace("&amp;", "&"))
-                if hit and _recent_enough_iso(stamp, not_before):
-                    return hit.group(0), stamp
-            if log and (polls == 1 or polls % 5 == 0):
-                log(f"    waiting for mail: {int(time.time() - started)}s/"
-                    f"{int(timeout)}s, {len(cands)} message(s) visible")
-            time.sleep(interval)
-        if log:
-            tail = (f"; last error {type(last_error).__name__}: {str(last_error)[:90]}"
-                    if last_error else "")
-            log(f"    no verification mail within {int(timeout)}s "
-                f"({polls} polls){tail}")
-        return None, None
+            out.append(_graph_mail(m))
+        out.sort(key=lambda x: x.stamp or 0, reverse=True)
+        return out[:limit]
 
 
 def _folder_name(line):
@@ -471,27 +416,37 @@ class ImapMailbox(BaseMailbox):
     scope = IMAP_SCOPE
 
     def __init__(self, cred, host=IMAP_HOST, port=IMAP_PORT, proxy_url="",
-                 timeout=30):
+                 timeout=NET_TIMEOUT):
         super().__init__(cred, proxy_url)
         self.host = host
         self.port = port
         self.timeout = timeout
 
-    def connect(self, attempts=4):
+    def connect(self, attempts=NET_ATTEMPTS):
         """Authenticated IMAP session.
 
         Outlook intermittently answers XOAUTH2 with "User is authenticated but
         not connected" even for a perfectly good token, so the handshake is
         retried with a fresh access token.
+
+        The token fetch itself is deliberately *outside* the retry loop. It used
+        to be inside it, which multiplied the two budgets: measured on a network
+        that cannot reach Google, one Gmail account took 8.5 minutes to fail
+        (3 token attempts × 3 handshakes × 25s), and a sweep that has to visit
+        dozens of mailboxes cannot afford that for one dead address. A token
+        that cannot be fetched is a network or credential problem; retrying the
+        IMAP handshake will not change it.
         """
+        token = self.access_token()
         last = None
         for i in range(attempts):
+            M = None
             try:
                 cls = type("BoundTunnelIMAP4", (TunnelIMAP4,), {
                     "proxy_url": self.proxy_url, "timeout": self.timeout})
                 M = cls(self.host, self.port, timeout=self.timeout)
                 auth = (f"user={self.email}\x01auth=Bearer "
-                        f"{self.access_token(force=i > 0)}\x01\x01")
+                        f"{token}\x01\x01")
                 M.authenticate("XOAUTH2", lambda _: auth.encode())
                 return M
             except Exception as e:
@@ -500,11 +455,16 @@ class ImapMailbox(BaseMailbox):
                     M.logout()
                 except Exception:
                     pass
-                time.sleep(2.0 * (i + 1))
+                if i + 1 < attempts:
+                    # A fresh token is the documented cure for the intermittent
+                    # "not connected" rejection; a network failure will raise
+                    # here instead of burning the rest of the budget.
+                    token = self.access_token(force=True)
+                    time.sleep(1.0)
         raise last
 
     def messages(self, limit=12, not_before=None):
-        """Newest-first (body, received datetime) pairs, INBOX + Junk.
+        """Newest-first page of Mail, INBOX + Junk.
 
         `not_before` is accepted and ignored here: this reader always pulls the
         newest N regardless, which is right for a mailbox that only holds the
@@ -531,63 +491,15 @@ class ImapMailbox(BaseMailbox):
                         continue
                     if not raw or not isinstance(raw[0], tuple):
                         continue
-                    msg = email.message_from_bytes(raw[0][1])
-                    out.append((_message_text(msg), _message_stamp(msg)))
-            out.sort(key=lambda pair: pair[1] or 0, reverse=True)
+                    out.append(_message_mail(
+                        email.message_from_bytes(raw[0][1]), folder))
+            out.sort(key=lambda m: m.stamp or 0, reverse=True)
             return out[:limit]
         finally:
             try:
                 M.logout()
             except Exception:
                 pass
-
-    def _candidates(self, not_before=None):
-        """(body, stamp) pairs. IMAP already returns that shape; Graph wraps
-        its payload in a dict, so both backends expose this instead."""
-        return list(self.messages(not_before=not_before))
-
-    @staticmethod
-    def _recent(stamp, not_before):
-        if not not_before or stamp is None:
-            return True
-        try:
-            return float(stamp) >= not_before - 10
-        except (TypeError, ValueError):
-            return True
-
-    def find_verification_link(self, timeout=300, interval=6, not_before=None,
-                               log=None):
-        started = time.time()
-        deadline = started + timeout
-        last_error = None
-        polls = 0
-        while time.time() < deadline:
-            polls += 1
-            try:
-                cands = self._candidates(not_before)
-            except MailAuthError:
-                raise
-            except Exception as e:
-                last_error = e
-                if log:
-                    log(f"    mail fetch failed: {type(e).__name__}: {str(e)[:110]}")
-                time.sleep(interval)
-                continue
-            for body, stamp in cands:
-                hit = TOKEN_RE.search(body)
-                if hit and (not not_before or stamp is None or stamp >= not_before - 10):
-                    return hit.group(0), (time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp)) if stamp else "")
-            if log and (polls == 1 or polls % 5 == 0):
-                log(f"    waiting for mail: {int(time.time() - started)}s/"
-                    f"{int(timeout)}s, {len(cands)} message(s) visible")
-            time.sleep(interval)
-        if log:
-            tail = (f"; last error {type(last_error).__name__}: {str(last_error)[:90]}"
-                    if last_error else "")
-            log(f"    no verification mail within {int(timeout)}s "
-                f"({polls} polls){tail}")
-        return None, None
 
 
 class HmeMailbox(BaseMailbox):
@@ -606,7 +518,7 @@ class HmeMailbox(BaseMailbox):
     protocol = "hme"
     scope = None
 
-    def __init__(self, cred, proxy_url="", timeout=30):
+    def __init__(self, cred, proxy_url="", timeout=NET_TIMEOUT):
         self.email = cred["email"]
         # client_id is where add_mailbox persists the HME account id
         self.account = cred.get("hme_account") or cred.get("client_id") or ""
@@ -686,7 +598,7 @@ class HmeMailbox(BaseMailbox):
         return f"{self.email}----{self.account}----hme"
 
     # ----------------------------------------------------------------- reading
-    def messages(self, limit=12):
+    def messages(self, limit=12, not_before=None):
         """Newest messages for this alias, link-bearing HTML flattened in.
 
         `preview` is returned by the list endpoint but omits the button URL, so
@@ -694,74 +606,29 @@ class HmeMailbox(BaseMailbox):
         local calls - a handful per poll is cheaper than a miss.
         """
         out = []
+        days = 2
+        if not_before:
+            days = max(1, min(90, int((time.time() - not_before) / 86400) + 1))
         listing = self._call(f"/api/inbox?account_id={urllib.parse.quote(self.account)}"
                              f"&alias={urllib.parse.quote(self.email)}"
-                             f"&limit={max(1, min(int(limit), 100))}&days=2")
+                             f"&limit={max(1, min(int(limit), 100))}&days={days}")
         for m in (listing.get("messages") or [])[:limit]:
             mid = m.get("id")
             if mid is None:
                 continue
-            text = f"{m.get('subject') or ''}\n{m.get('preview') or ''}"
+            body = m.get("preview") or ""
             try:
                 detail = self._call(f"/api/inbox/{urllib.parse.quote(str(mid))}"
                                     f"?account_id={urllib.parse.quote(self.account)}")
-                text += "\n" + (detail.get("body_html") or detail.get("body") or "")
+                body += "\n" + (detail.get("body_html") or detail.get("body") or "")
             except Exception:
                 pass                            # keep the preview-only entry
-            out.append((text, _iso_to_epoch(m.get("date"))))
-        return out
-
-    def _candidates(self, not_before=None):
-        return self.messages()
-
-    @staticmethod
-    def _recent(stamp, not_before):
-        if not not_before or stamp is None:
-            return True
-        try:
-            return float(stamp) >= not_before - 10
-        except (TypeError, ValueError):
-            return True
-
-    def find_verification_link(self, timeout=300, interval=6, not_before=None,
-                               log=None):
-        """Same polling shape as the other readers, over the HME listing.
-
-        Not inherited: BaseMailbox deliberately leaves this abstract, and the
-        Graph/IMAP versions carry their own body-massaging that does not apply
-        here (the link comes out of `body_html` already unescaped).
-        """
-        started = time.time()
-        deadline = started + timeout
-        last_error = None
-        polls = 0
-        while time.time() < deadline:
-            polls += 1
-            try:
-                cands = self.messages()
-            except MailAuthError:
-                raise
-            except Exception as e:
-                last_error = e
-                if log:
-                    log(f"    mail fetch failed: {type(e).__name__}: {str(e)[:110]}")
-                time.sleep(interval)
-                continue
-            for body, stamp in cands:
-                hit = TOKEN_RE.search(body)
-                if hit and self._recent(stamp, not_before):
-                    return hit.group(0), (
-                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
-                        if stamp else "")
-            if log and (polls == 1 or polls % 5 == 0):
-                log(f"    waiting for mail: {int(time.time() - started)}s/"
-                    f"{int(timeout)}s, {len(cands)} message(s) visible")
-            time.sleep(interval)
-        if log:
-            tail = (f"; last error {type(last_error).__name__}: {str(last_error)[:90]}"
-                    if last_error else "")
-            log(f"    no verification mail within {int(timeout)}s ({polls} polls){tail}")
-        return None, None
+            out.append(Mail(subject=_decode_header(m.get("subject") or ""),
+                            sender=_hme_sender(m), body=body,
+                            stamp=_iso_to_epoch(m.get("date")) or 0.0,
+                            folder="inbox"))
+        out.sort(key=lambda m: m.stamp or 0, reverse=True)
+        return out[:limit]
 
 
 def _iso_to_epoch(value):
@@ -802,37 +669,37 @@ class AutoMailbox:
     def cred_line(self):
         return self._current.cred_line()
 
-    def find_verification_link(self, timeout=300, interval=6, not_before=None,
-                               log=None):
-        started = time.time()
-        half = max(30, timeout // 2)
-        try:
-            url, when = self.primary.find_verification_link(
-                half, interval, not_before, log)
-            if url:
-                self._current = self.primary
-                return url, when
-        except MailAuthError as e:
-            # Graph refused the token outright - switch now instead of burning
-            # the rest of the budget polling a channel that cannot work.
-            if log:
-                log(f"    graph unavailable ({str(e)[:70]}), switching to IMAP")
-        except Exception:
-            pass
-        # The primary may have failed in a second (a 401) or used its whole
-        # half; either way the fallback gets whatever time is actually left.
-        remaining = max(30, timeout - (time.time() - started))
-        if log:
-            log(f"    IMAP gets {int(remaining)}s of the budget")
-        self.fallback.refresh_token = (
-            self.primary.refresh_token or self.fallback.refresh_token)
-        self._current = self.fallback
-        return self.fallback.find_verification_link(
-            remaining, interval, not_before, log)
+    def messages(self, limit=12, not_before=None):
+        """Read through whichever channel can actually see this mailbox.
 
-    def find_success(self, timeout=180, interval=8, not_before=None, log=None):
-        """Ask whichever reader already proved it can see this mailbox."""
-        return self._current.find_success(timeout, interval, not_before, log)
+        Graph first. A 401 means this registration has no Graph mail permission
+        - it fails identically every time, so switch instead of retrying. Any
+        other error switches too, and the rotated refresh token travels with
+        the switch because Graph may already have replaced it.
+        """
+        try:
+            out = self.primary.messages(limit, not_before)
+            self._current = self.primary
+            return out
+        except MailAuthError as e:
+            first = str(e)[:90]
+        except Exception as e:
+            first = f"{type(e).__name__}: {str(e)[:90]}"
+        self.fallback.refresh_token = (self.primary.refresh_token
+                                       or self.fallback.refresh_token)
+        self._current = self.fallback
+        try:
+            return self.fallback.messages(limit, not_before)
+        except Exception as e:
+            raise MailAuthError(f"Graph 与 IMAP 都读不到：{first} / "
+                                f"{type(e).__name__}: {str(e)[:90]}") from e
+
+    def close(self):
+        for reader in (self.primary, self.fallback):
+            try:
+                reader.close()
+            except Exception:
+                pass
 
 
 class GmailMailbox(ImapMailbox):
@@ -847,7 +714,7 @@ class GmailMailbox(ImapMailbox):
     provider = "google"
     scope = GMAIL_SCOPE
 
-    def __init__(self, cred, proxy_url="", timeout=30):
+    def __init__(self, cred, proxy_url="", timeout=NET_TIMEOUT):
         BaseMailbox.__init__(self, cred, proxy_url)
         self.client_secret = cred.get("client_secret", "")
         self.host = GMAIL_HOST
@@ -918,7 +785,7 @@ class GmailAliasMailbox(ImapMailbox):
     _SESSION_TTL = 600
     _JUNK_EVERY = 15.0
 
-    def __init__(self, cred, proxy_url="", timeout=30):
+    def __init__(self, cred, proxy_url="", timeout=NET_TIMEOUT):
         BaseMailbox.__init__(self, cred, proxy_url)
         self.inbox = cred.get("client_id") or cred.get("inbox") or ""
         self.password = cred.get("password", "")
@@ -934,7 +801,7 @@ class GmailAliasMailbox(ImapMailbox):
         self._junk_after = 0.0
         self._junk_folders = None
 
-    def connect(self, attempts=3):
+    def connect(self, attempts=NET_ATTEMPTS):
         """Authenticated IMAP session, by app password.
 
         A rejected password fails identically every time, so it raises
@@ -1041,32 +908,32 @@ class GmailAliasMailbox(ImapMailbox):
             if not raw or not isinstance(raw[0], tuple):
                 continue
             msg = email.message_from_bytes(raw[0][1])
-            # _message_text already returns whichever MIME part holds the token,
-            # which matters here: measured, the Oasis verification mail is
-            # multipart/mixed with a text/html part and no text/plain part at
-            # all, so a reader that insists on plain text sees nothing.
-            out.append((_message_text(msg), _message_stamp(msg)))
+            # _message_mail returns whichever MIME part holds the body, which
+            # matters here: measured, the site's mail is multipart/mixed with a
+            # text/html part and no text/plain part at all, so a reader that
+            # insists on plain text sees nothing.
+            out.append(_message_mail(msg, folder))
         return out
 
     def messages(self, limit=12, not_before=None):
-        """Newest-first (body, stamp) pairs, for this alias only."""
+        """Newest-first page of Mail, for this alias only."""
         M = self._live()
         out = self._fetch_folder(M, "INBOX", limit, not_before)
         # Junk is checked on a timer, not "only when the inbox was empty": these
         # aliases receive plenty of unrelated mail - the inbox of one here holds
         # 36 messages, including an LA28 draw confirmation - so an empty inbox
-        # is not the signal. Missing a verification mail that the provider filed
-        # as spam costs a whole account, and the check is one SELECT+SEARCH on a
-        # folder list that is already cached.
+        # is not the signal. Missing the one mail that matters because the
+        # provider filed it as spam costs a whole account, and the check is one
+        # SELECT+SEARCH on a folder list that is already cached.
         if time.time() >= self._junk_after:
             self._junk_after = time.time() + self._JUNK_EVERY
             for folder in self._junk(M):
                 out += self._fetch_folder(M, folder, limit, not_before)
-        out.sort(key=lambda pair: pair[1] or 0, reverse=True)
+        out.sort(key=lambda m: m.stamp or 0, reverse=True)
         return out[:limit]
 
 
-def hme_catalog(base="", password="", timeout=30):
+def hme_catalog(base="", password="", timeout=NET_TIMEOUT):
     """Every alias the iCloud Hide-My-Email service knows about.
 
     Returns [{"email", "account_id", "account_name", "label", "active"}] so a
@@ -1177,13 +1044,33 @@ def make_mailbox(cred, protocol="graph", proxy_url=""):
 
 
 # -------------------------------------------------------------------------- helpers
-def _message_text(msg):
-    """Prefer text/plain, fall back to text/html, decode defensively.
+def _decode_header(value):
+    """Decode a MIME-encoded header into readable text.
 
-    walk() is a generator: it has to be materialised first, otherwise the
-    text/plain pass exhausts it and every multipart mail decodes to "".
+    The site's subject arrives as `=?UTF-8?Q?Oasis_Live_=E2=80=9927_...?=`,
+    where spaces are underscores - a rule that greps the raw header never
+    matches and reports every success as a miss. Decoding is done once, here, so
+    nothing downstream has to know about it.
+    """
+    if not value:
+        return ""
+    try:
+        return str(email.header.make_header(
+            email.header.decode_header(str(value)))).strip()
+    except Exception:
+        return str(value).strip()
+
+
+def _message_body(msg):
+    """Every text part of a message, flattened and decoded.
+
+    Text/plain and text/html are both kept, not just the first match: measured,
+    the site's mail is multipart with an HTML-only second half, and the HME
+    service puts the actionable part in `body_html` alone. Joining them means a
+    keyword written into either half is still found.
     """
     parts = list(msg.walk()) if msg.is_multipart() else [msg]
+    chunks = []
     for want in ("text/plain", "text/html"):
         for part in parts:
             if part.get_content_type() != want:
@@ -1194,18 +1081,19 @@ def _message_text(msg):
                 continue
             text = payload.decode(part.get_content_charset() or "utf-8",
                                   errors="ignore")
-            text = re.sub(r"=\r?\n", "", text).replace("&amp;", "&")
-            if TOKEN_RE.search(text):
-                return text
-    # nothing matched: hand back whatever text exists
-    for part in parts:
-        if part.get_content_maintype() == "text":
+            chunks.append(re.sub(r"=\r?\n", "", text).replace("&amp;", "&"))
+    if not chunks:
+        # No declared text part at all: hand back whatever text exists rather
+        # than an empty body that reads as "nothing arrived".
+        for part in parts:
+            if part.get_content_maintype() != "text":
+                continue
             try:
-                return (part.get_payload(decode=True) or b"").decode(
-                    part.get_content_charset() or "utf-8", errors="ignore")
+                chunks.append((part.get_payload(decode=True) or b"").decode(
+                    part.get_content_charset() or "utf-8", errors="ignore"))
             except Exception:
                 continue
-    return ""
+    return "\n".join(chunks)
 
 
 def _message_stamp(msg):
@@ -1216,16 +1104,33 @@ def _message_stamp(msg):
         return None
 
 
-def _recent_enough_iso(stamp, not_before):
-    if not not_before or not stamp:
-        return True
-    try:
-        from datetime import datetime
-        dt = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(
-            tzinfo=timezone.utc)
-        return dt.timestamp() >= not_before - 10
-    except Exception:
-        return True
+def _message_mail(msg, folder=""):
+    return Mail(subject=_decode_header(msg.get("Subject")),
+                sender=_decode_header(msg.get("From")),
+                body=_message_body(msg),
+                stamp=_message_stamp(msg) or 0.0,
+                folder=folder)
+
+
+def _graph_mail(m):
+    frm = ((m.get("from") or {}).get("emailAddress") or {})
+    return Mail(subject=_decode_header(m.get("subject")),
+                sender=f"{frm.get('name') or ''} "
+                       f"{frm.get('address') or ''}".strip(),
+                body=(m.get("body") or {}).get("content") or "",
+                stamp=_iso_to_epoch(m.get("receivedDateTime")) or 0.0,
+                folder="inbox")
+
+
+def _hme_sender(m):
+    for key in ("from", "sender", "from_email", "fromAddress"):
+        value = m.get(key)
+        if isinstance(value, dict):
+            value = (value.get("address") or value.get("email")
+                     or value.get("name"))
+        if value:
+            return _decode_header(str(value))
+    return ""
 
 
 def check_credentials(line, protocol="graph", proxy_url=""):
@@ -1262,9 +1167,12 @@ Mailbox = GraphMailbox
 
 if __name__ == "__main__":
     import sys
+    from hitcheck import classify
     line = open(sys.argv[1]).read() if len(sys.argv) > 1 else sys.stdin.read()
     proto = sys.argv[2] if len(sys.argv) > 2 else "graph"
     mb = make_mailbox(parse_cred(line), proto)
     print("protocol:", mb.protocol, "| email:", mb.email)
-    url, when = mb.find_verification_link(timeout=20, interval=4)
-    print("link:", (url or "-")[:90], when)
+    for m in mb.messages(limit=15):
+        kind = classify(m) or "-"
+        when = time.strftime("%m-%d %H:%M", time.localtime(m.stamp)) if m.stamp else "?"
+        print(f"[{kind:7}] {when} | {m.subject[:60]} | {m.sender[:40]}")

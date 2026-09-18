@@ -1,53 +1,48 @@
 #!/usr/bin/env python3
-"""Operator settings, persisted as JSON next to the database."""
+"""Operator settings, persisted as JSON next to the database.
+
+The program is a hit monitor: it only ever reads mailboxes. So the settings are
+the rhythm of that reading (how often, how many at once, how far back) and the
+three ways a mailbox can be reached.
+
+An old config file still carries the registration keys it was born with. They
+are dropped on load rather than left in place: a `mode: browser` sitting in the
+file would keep implying that something drives a browser here.
+"""
 import json
 import os
 
-# Modes the engine accepts.
-#
-# A config written by an older build may still say "hybrid"; that flow is gone
-# for good and anything unrecognised is coerced to "browser" rather than letting
-# the engine abort on an unknown mode.
-#
-# "browser" drives the official SPA in Chromium. It is the strong flow: the page
-# builds its own request body (location.county from radar.io, `ip` from
-# Cloudflare's trace) and mints its own reCAPTCHA token, so the request the site
-# sees is the one a real visitor sends. It costs a browser and about 25-75s per
-# account, and it is the only flow that can read the page's own confirmation.
-#
-# "http" issues the same calls with curl_cffi and sends the captcha field EMPTY.
-# Measured 2026-09-16 on this endpoint: empty completes the registration and the
-# success mail arrives, while a real token minted in Chromium and replayed from
-# curl never once did - a reCAPTCHA Enterprise token is bound to the client that
-# minted it, so the empty string is not a shortcut around the captcha, it is the
-# better half of that trade. Cheaper and faster (no browser at all), but nothing
-# renders, so the success mail is the only evidence it worked.
-#
-# The hybrid flow that used to live here - mint a real captcha in a warm browser,
-# then submit with curl_cffi - is gone: pairing the two halves failed every time
-# for the reason above.
-VALID_MODES = ("browser", "http")
+# 上一版程序留下的键，加载时丢掉。留着它们只会让配置文件说谎。
+RETIRED_KEYS = (
+    "mode", "shows", "link_timeout", "verify_success", "success_timeout",
+    "proxies", "front_proxy", "google_proxy",
+)
 
 DEFAULTS = {
     # --- where things live -------------------------------------------------
     "db_path": "oasis.db",
-    # --- what to run -------------------------------------------------------
-    "mode": "browser",
-    "threads": 4,
-    # Cap on how many accounts a round touches; 0 = the whole queue. Meant for
-    # trying a change on one or two accounts before letting it loose on the
-    # pool, where a mistake costs accounts.
+    # --- 检测节奏 ----------------------------------------------------------
+    # 一轮跑完到下一轮开始之间的等待。5 分钟是刻意的：中签通知不是秒级事件，
+    # 而一个账号一轮就是一次 IMAP 登录加一次 SEARCH，频率再高只是把对方的收件箱
+    # 打成请求尖峰。
+    "interval": 300,
+    # 同时打开几条收件箱连接 —— 不是同时读几封信：同一个 Gmail 收件箱下的别名
+    # 共用一条连接，组与组之间才并行。
+    "threads": 2,
+    # 首次检测回看多少天。活动已经结束，中签结果很可能早就发出去了，这个窗口
+    # 必须覆盖「结果可能已发」的那段时间；设为 0 = 不设基线，邮箱里所有 Oasis
+    # 来信都算数。
+    "lookback_days": 30,
+    # 每个邮箱取最近多少封信来判断。
+    "per_page": 20,
+    # 中签后是否继续检测。默认跳过：同一个答案重复搜索没有意义，省下一整轮的
+    # 无用登录；若想连后续的付款/取票通知一起盯，把它关掉。
+    "skip_hits": True,
+    # 一轮最多检测多少个账号；0 = 全部。用于「先拿一两个试」。
     "limit": 0,
-    "shows": ["knebworth", "slane", "glasgow"],
-    "delay_between": 0.0,          # pause after each account; 0 = none
-    # --- proxy pool --------------------------------------------------------
-    "proxies": [],
-    # Optional local proxy every upstream is dialled through, for endpoints
-    # only reachable from outside the local network (e.g. socks5://127.0.0.1:10808)
-    "front_proxy": "",
-    # Second egress for Google. Browser mode needs it: reCAPTCHA lives there,
-    # and an upstream that blocks Google stalls the page on wait_for_function.
-    "google_proxy": "",
+    # 每封信之间的停顿，0 = 不停（monitor 内部另有 PAGE_GAP）。
+    "delay_between": 0.0,
+    # --- 取件通道 ----------------------------------------------------------
     # Mailbox fetches go direct unless this is set.
     "mail_proxy": "",
     # --- iCloud Hide-My-Email service (see core.mailbox.HmeMailbox) --------
@@ -60,22 +55,11 @@ DEFAULTS = {
     # in the rest of the credential line.
     "alias_inbox": "",
     "alias_inbox_password": "",
-    # --- timeouts ----------------------------------------------------------
-    # How long to wait for the verification mail.
-    "link_timeout": 300,
-    # `confirm` answers {"status":"OK"} even for an address it refuses, so when
-    # the page did not confirm, the mail is the only evidence left and this is
-    # how long that search runs. When the page DID confirm it only waits
-    # MAIL_GRACE_AFTER_PAGE (30s) - browser mode is measured not to send the
-    # success mail, so a full wait there is a minute of nothing.
-    "verify_success": False,
-    "success_timeout": 180,
     # --- diagnostics -------------------------------------------------------
     "debug": False,
     # Desktop-only: the console writes its own log file. The service logs to
     # stdout, which is where docker picks it up.
     "log_file": "oasis_run.log",
-    "debug": False,
 }
 
 
@@ -93,14 +77,12 @@ class Config:
                 self.data.update(stored)
         except Exception:
             pass
-        # A config saved before the captcha-less path was removed still says
-        # "http"; coerce it rather than let the engine abort on an unknown mode.
-        if self.data.get("mode") not in VALID_MODES:
-            self.data["mode"] = "browser"
+        for key in RETIRED_KEYS:
+            self.data.pop(key, None)
         return self.data
 
     def save(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, indent=2, ensure_ascii=False)
@@ -113,7 +95,8 @@ class Config:
         self.data[key] = value
 
     def update(self, mapping):
-        self.data.update(mapping)
+        self.data.update({k: v for k, v in mapping.items()
+                          if k not in RETIRED_KEYS})
 
     @property
     def db_path(self):

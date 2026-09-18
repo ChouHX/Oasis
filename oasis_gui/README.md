@@ -1,6 +1,50 @@
-# Oasis Live '27 注册控制台
+# Oasis Live '27 中签检测台
 
-基于 **curl_cffi 纯 HTTP** 的注册上位机（Fluent UI 桌面端），带代理池、线程池、实时日志与 SQLite 去重落库。
+**现在的程序只做一件事：定时把已导入账号的收件箱翻一遍，看 Oasis 有没有来信，
+判定谁中签了。** 桌面端（Fluent UI）与 Web 管理界面都保留，服务端镜像从
+`python:slim` 起，只有 `PySocks` 一个依赖。
+
+## 这一版做了什么（注册功能已整体移除）
+
+活动结束，注册环节连同它依赖的一切被删掉了：`registrar.py`、
+`browser_registrar.py`、`engine.py`、`identity.py`、`relay.py`、`proxy_pool.py`
+全部不存在了。程序不再向站点发出任何请求 —— 这也顺带消灭了旧版最贵的一个陷阱：
+**重复向站点请求验证邮件会作废会话**，而现在没有代码路径会碰站点。
+
+留下的是 `core/monitor.py`（定时巡检）、`core/hitcheck.py`（判定规则）、
+`core/mailbox.py`（只负责读信）、`core/store.py`（结果落库）。镜像因此从
+Playwright 基础镜像（~1.3GB 的 chromium 与它的系统库）换成 `python:3.12-slim`，
+`docker-compose.yml` 里的 `shm_size: 512mb` 与 `mem_limit: 2500m` 也一并撤掉。
+
+### 中签判定合并了两路证据
+
+1. **邮件证据**：账号收件箱里出现 Oasis 的来信。正文含
+   `successfully registered`（实测 4/4 成功信含、0/15 验证信含）或标题是
+   `… Registration Complete` 的，判为 `success-mail`；其他非验证类的 Oasis
+   来信判为 `oasis-mail`。
+2. **站点证据（merge 点）**：账号在上一版程序里已经被站点确认过，只是那封
+   成功邮件没来。这包含两类记录，它们本质是同一件事 —— **站点已经收下**：
+
+   - `submitted` —— 浏览器模式页面渲染出确认页、一条成功邮件都不发
+   - 错误文本里含 `confirm answered OK but the success mail never arrived
+     within 180s` —— `confirm` 对已接受的地址回 `{"status":"OK"}`，紧接着
+     成功邮件始终不来，旧程序把它记成失败
+
+   活动已经结束，那封信不会再来，所以这两类在开局时就被并入中签名单
+   （`store.migrate_legacy_hits()`，幂等、只补不撤），而不是被「没有成功邮件」
+   这个假象吞掉。它们的中签来源标记为 `site-ok`，与 `success-mail` 分得清。
+
+**验证信不算中签。** 实测（真实 Outlook 邮箱、30 天回看窗口）：注册期间每个
+账号都被自己触发过一封 `Verify Your Email`，它同样是「Oasis 的新来信」。若只看
+「有没有新来信」，这些账号会全部被判成中签 —— 那判的是注册动作，不是结果。
+所以验证信（标题命中 `verify your email` 或正文带 `registration?token=`
+一次性链接）只登记为「最近来信」，不计中签。
+
+---
+以下章节是**注册期的开发与实测记录**（captcha、SPA 驱动、代理链、场次偏好等）。
+那些代码已经被移除，这些记录保留下来是因为其中的实测结论仍然可靠、且解释了这个
+程序为什么会是现在这个样子。
+---
 
 ## 注册页完整流程（用 CDP 实驱逆向出来，与官方 SPA 一致）
 
@@ -851,13 +895,15 @@ socks5://127.0.0.1:10808|socks5://用户:密码@PROXY_HOST:PORT
 
 ## Web 管理界面
 
-服务端带一个网页管理界面，**React 18 + Ant Design 5**，六个页面与桌面端一一对应
-（仪表盘 / 邮箱池 / 代理池 / 预约记录 / 数据库 / 设置）。
+服务端带一个网页管理界面，**React 18 + Ant Design 5**，页面与桌面端一一对应
+（仪表盘 / 邮箱池 / 中签名单 / 旧预约 / 数据库 / 设置）。桌面端的「仪表盘」承担
+运行控制与实时日志，网页端把中签名单单独做成一页并每 10 秒自己刷新 —— 盯结果的
+时候不该还要手动点刷新。
 
 ```
 oasis_gui/webui/            React 源码
   src/App.jsx               外壳：左侧菜单 + 顶栏 + 页面切换
-  src/pages/*.jsx           六个页面
+  src/pages/*.jsx           仪表盘 / 邮箱池 / 中签名单 / 旧预约 / 数据库 / 设置
   src/api.js                接口封装 + 状态色板
   dist/                     构建产物（CI 产出，不入库）
 ```
@@ -869,7 +915,7 @@ CI 的多阶段构建里：
 
 ```
 FROM node:22-alpine AS frontend   ← npm ci && npm run build
-FROM playwright/python:...        ← 只 COPY --from=frontend 的 dist/
+FROM python:3.12-slim-bookworm    ← 只 COPY --from=frontend 的 dist/
 ```
 
 所以你服务器上 `docker compose pull` 拿到的镜像里已经有前端产物，
@@ -900,18 +946,18 @@ API 仍然全部受保护，实测未登录时 `/api/*` 一律 401。
 界面里能配的东西**全部落盘到 `<数据库同目录>/oasis_config.json`**，重启不丢。
 `.env` 只留两项：数据库路径和管理密码（密码不能在网页上改，鸡生蛋）。
 
-代理池、线程数、场次偏好、各个超时、Google 出口、iCloud 服务地址与密码、调试
-开关——都在网页上。`OASIS_*` 环境变量仍然可用，但只在配置文件里还没有值时作为
-**首次启动的种子**写入，之后以文件为准，不会每次重启覆盖你在网页上改的东西。
+并发、巡检间隔、回看天数、每箱取信封数、是否跳过已中签、取件代理、iCloud 服务
+地址与密码、别名收件箱、调试开关——都在网页上。`OASIS_*` 环境变量仍然可用，但只
+在配置文件里还没有值时作为**首次启动的种子**写入，之后以文件为准，不会每次重启
+覆盖你在网页上改的东西。
 
 桌面端和网页端**共用同一组配置键、同一套标签**，顺序也一致（桌面端多一个
 `log_file`，那是它自己写日志用的；服务端日志走 stdout 交给 docker 收集）。
-两边的设置页：
+并发 / 间隔 / 回看天数 / 跳过已中签 在两边都放在仪表盘上，设置页放：
 
 ```
-等邮件超时 · 成功后校验邮件 · 成功邮件超时 · 账号间停顿
-取件代理 · iCloud 服务 · iCloud 密码
-前置代理 · Google 分流代理 · 数据库路径 · 调试堆栈
+每箱取信（封） · 取件代理 · iCloud 服务 · iCloud 密码
+别名收件箱 · Gmail 应用专用密码 · 数据库路径 · 调试堆栈
 ```
 
 线程数和场次偏好在两边的**仪表盘**上，代理池和账号各有自己的页面。
@@ -960,8 +1006,11 @@ ssh -L 8080:127.0.0.1:8080 user@服务器
 
 ### 运行时可调项会落盘
 
-网页上改的线程数、模式、场次、超时会写进 `oasis_config.json`（默认在数据库
-同目录，跟着 volume 持久化），**下一轮就生效，不用重启**。
+网页上改的并发、巡检间隔、回看天数、取件代理、iCloud 服务会写进
+`oasis_config.json`（默认在数据库同目录，跟着 volume 持久化），**下一轮就生效，
+不用重启**。上一版程序留下的键（`mode`、`shows`、`link_timeout`、
+`verify_success`、`success_timeout`、`proxies`、`front_proxy`、`google_proxy`）
+在加载时被丢弃 —— 留着它们只会让配置文件说谎。
 
 优先级：`.env` 里**实际设置了**的变量在启动时写入文件；没设的沿用文件里的值。
 也就是 `.env` 描述部署，网页描述这次运行。
@@ -972,34 +1021,31 @@ ssh -L 8080:127.0.0.1:8080 user@服务器
 | --- | --- |
 | `GET /` | 管理页面（未登录时是登录页） |
 | `POST /login`、`/logout` | 会话 |
-| `GET /api/state` | 统计 + 本机信息 + 配置 + 运行状态 |
-| `GET /api/accounts?status=&page=` | 账号列表（每页 50） |
-| `GET /api/registrations` | 预约记录 |
-| `GET /api/proxies` | 代理池 + 健康度（`user:pass` **服务端遮罩**） |
-| `POST /api/proxies` | 整体替换代理池，落盘并立即生效 |
+| `GET /api/state` | 统计 + 本机信息 + 配置 + 巡检状态 |
+| `GET /api/hits` | 中签名单（带证据来源标签） |
+| `GET /api/accounts?status=&page=` | 账号列表（每页 50，`status=hit` 只看中签） |
+| `GET /api/registrations` | 上一版程序留下的旧预约记录（只读） |
 | `POST /api/accounts/import` | 粘贴凭据行导入账号 |
 | `GET /api/icloud/aliases` | 拉取 iCloud 别名列表，标记哪些已导入 |
 | `POST /api/icloud/import` | 只导入勾选的别名 |
 | `GET /api/log?since=` | 增量日志（环形缓冲 2000 行） |
-| `POST /api/start`、`/api/stop` | 启停 |
+| `POST /api/start` | 立刻巡检一轮（并发 / 间隔 / 回看天数一并落地） |
+| `POST /api/stop` | 暂停巡检（读完手上这批账号） |
 | `POST /api/config` | 改配置并落盘 |
-| `POST /api/accounts/reset`、`/api/accounts/delete` | 重置 / 清理 |
+| `POST /api/accounts/reset`、`/api/accounts/delete` | 重置检测记录 / 清理 |
 | `POST /api/vacuum` | SQLite 压缩 |
-| `GET /api/export?what=creds\|accounts` | 导出 |
-| `GET /health`、`/stats` | 给监控用的极简探针 |
+| `GET /api/export?what=creds\|accounts\|hits\|hit_creds` | 导出（`hits` 是给人看的 CSV，`hit_creds` 能再导入回来） |
+| `GET /health` | 给监控用的极简探针（带 build 指纹与中签数） |
 
-### 代理池和邮箱都在网页上配
+### 邮箱在网页上配
 
-不需要改 `.env` 重启。代理池存进 `oasis_config.json`（跟桌面端一样的地方），
-邮箱直接进数据库：
+不需要改 `.env` 重启。检测程序没有代理池 —— 它不向站点发请求，唯一可能需要的
+出口是**取件代理**（设置页），而大多数网络直连 IMAP / Graph 就够了。
 
-- **代理池页**：一个多行输入框，粘贴后「保存并生效」——`pool.load()` 原地替换，
-  引擎持有的引用不用动，**下一轮就生效**
-- **邮箱池页**：粘贴凭据行导入，支持 Outlook / Gmail / iCloud 三种格式，
-  自动去重（重复的行计入 `duplicate`）
-
-`OASIS_PROXIES` 只在配置文件里还没有代理时做**种子**。一旦你在网页上改过，
-就以文件为准——否则每次重启都会把你改的覆盖回环境变量。
+- **邮箱池页**：粘贴凭据行导入，支持 Outlook / Gmail / iCloud 别名 / iCloud HME
+  四种格式，自动去重（重复的行计入 `duplicate`）
+- 裸的 iCloud 别名地址会用设置页里填的「别名收件箱 + 应用专用密码」补全成完整
+  凭据行，所以粘贴整份别名清单是一个动作，不用手工拼
 
 ### 预约记录里的场次是翻译过的
 
@@ -1298,9 +1344,9 @@ build_windows.bat
 
 ### 清理
 
-「邮箱池」右下角四个按钮按状态删除：已注册 / 失败 / 待注册 / 全部。删除前弹确认框并显示条数，删除后自动 `VACUUM` 回收文件空间。账号删除时预约记录通过外键 `ON DELETE CASCADE` 一并删除。
+「邮箱池」右下角三个按钮按类删除：已中签 / 未中签 / 全部。删除前弹确认框并显示条数，删除后自动 `VACUUM` 回收文件空间。账号删除时旧预约记录通过外键 `ON DELETE CASCADE` 一并删除。
 
-「重置失败与卡住项」把 `failed` 和 `running` 一起放回 `pending`——`running` 是中断的运行留下的残留，不会被自动回收。
+「重置检测记录」把未中签账号的 `checked_at` / `check_error` 清掉（已中签的不动），下一轮会重新从队首开始查。
 
 ### 字体
 
@@ -1311,23 +1357,38 @@ build_windows.bat
 
 ```
 oasis_gui/
-  app.py                  Fluent UI 主程序（六个页面 + 线程信号桥）
+  app.py                  Fluent UI 主程序（检测台：仪表盘 / 邮箱池 / 数据库 / 日志 / 设置）
+  service.py              无界面服务：定时巡检 + 管理 HTTP
   run.sh                  源码方式启动
   build_windows_wine.sh   Linux 下用 Wine 交叉打包 exe
   build_windows.bat       Windows 下打包
   OasisConsole.spec       PyInstaller 配置
   core/
-    registrar.py          curl_cffi 注册核心（三步流程、场次常量、指纹池）
-    engine.py             线程池调度、身份唯一性、代理租约、落库
-    browser_registrar.py  Playwright：常驻共享浏览器、captcha、浏览器模式
-    relay.py              本地 HTTP relay：链式代理、SOCKS5 上游、Google 分流
-    store.py              SQLite，去重约束与写事务安全
-    mailbox.py            Graph / IMAP / Gmail 收信，token 轮换持久化
-    proxy_pool.py         代理解析、健康计数、失败冷却
-    identity.py           随机身份生成（美/德/法）
+    monitor.py            定时巡检引擎：分组复用收件箱连接、轮次预算、事件
+    hitcheck.py           中签判定（邮件证据 + 站点记录 merge）
+    mailbox.py            只读信：Graph / IMAP / Gmail 别名 / iCloud HME
+    store.py              SQLite：中签列、旧记录合并、写事务安全
     config.py             配置持久化
+    webui.py              Web 管理界面（路由 + 认证 + 静态资源）
+    sysinfo.py            本机容量与 build 指纹
+  webui/                  React + Ant Design 管理界面源码
   oasis_config.json       运行时生成
 ```
+
+## 回归测试
+
+`tests/` 下四个探针，都跑真实代码路径（不是「能 import 就算数」）：
+
+```bash
+cd oasis_gui
+python3 tests/test_hitcheck.py        # 判定链路：假收件箱，逐条断言结论
+python3 tests/test_merge.py           # 旧记录并入中签名单（含那条 confirm OK）
+QT_QPA_PLATFORM=offscreen python3 tests/test_desktop.py   # 桌面版真的建窗、填表
+python3 tests/test_live_sweep.py      # 轮次预算：读不通的邮箱不再拖住整轮
+```
+
+前三个离线，最后一个连两个真实账号。验收这一版改造时它们的输出分别是
+`RESULT: PASS`；细节见 `tests/README.md`。
 
 ## 注意事项
 

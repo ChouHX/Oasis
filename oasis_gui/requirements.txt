@@ -1,12 +1,14 @@
 # Runtime dependencies for the headless service (service.py).
 #
+# The service reads mailboxes over IMAP / Microsoft Graph / a local iCloud
+# service, using only the standard library - there is no HTTP client, no
+# browser and no site traffic in this program any more.
+#
+# PySocks is the one dependency: IMAP needs a raw TLS socket, so it cannot
+# honour urllib's proxy environment, and a SOCKS5 mail proxy has to be dialled
+# by hand (see core.mailbox.open_tunnel).
+#
 # The desktop console additionally needs PyQt6 + PyQt6-Fluent-Widgets; the
 # service path deliberately does not, which keeps the image small and lets it
 # run without any X server.
-#
-# playwright is pinned to match the browser baked into the base image
-# (mcr.microsoft.com/playwright/python:v1.62.0-noble). Bumping one without the
-# other makes launch() look for a browser revision that is not installed.
-playwright==1.62.0
-curl_cffi==0.16.3
 PySocks==1.7.1

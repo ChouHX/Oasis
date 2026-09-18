@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Web admin for the headless console.
+"""Web admin for the headless hit monitor.
 
-Mirrors the six pages of the desktop console, over plain `http.server` - no
-extra dependency, so the image does not grow and nothing has to be installed on
-the box.
+Mirrors the pages of the desktop console, over plain `http.server` - no extra
+dependency, so the image does not grow and nothing has to be installed on the
+box.
 
-Access control is not optional: this can start/stop the engine and read the
+Access control is not optional: this can start/stop the sweep and read the
 account pool, so without a password the server refuses to start rather than
 serving that to whoever reaches the port. A session cookie carries the login;
 the password is compared in constant time and logins are rate limited.
@@ -14,16 +14,13 @@ import hmac
 import json
 import mimetypes
 import os
-import re
 import secrets
 import threading
 import time
 import urllib.parse
 from http.cookies import SimpleCookie
-from core import mailbox, registrar
-from core.browser_registrar import _build_stamp
 
-from http.server import BaseHTTPRequestHandler
+from core import hitcheck, mailbox, sysinfo
 
 SESSION_COOKIE = "oasis_session"
 
@@ -58,12 +55,10 @@ LOGIN_MAX = 6
 
 
 def _shows_label(raw):
-    """Turn the stored poll-answer uuids into the venue names they stand for.
+    """上一版程序把场次写在 registrations.poll_answer_ids 里，这里是它的读法。
 
-    `registrations.poll_answer_ids` holds the show *poll* ids, which mean
-    nothing to a human. The page previously showed "undefined" here because it
-    read fields the query never selected; translating server-side keeps the
-    page from having to hard-code uuids that would drift from registrar.SHOWS.
+    注册已经移除，这个函数只为了让老库的预约记录在「数据库」页里仍显示成人能
+    看懂的名字，而不是一串 uuid。
     """
     if raw in (None, "", "[]"):
         return ""
@@ -71,18 +66,11 @@ def _shows_label(raw):
         ids = json.loads(raw) if isinstance(raw, str) else list(raw)
     except Exception:
         return str(raw)[:60]
-    by_poll = {poll: venue for venue, (poll, _answers)
-               in registrar.SHOWS.items()}
-    out = []
-    for pid in ids:
-        venue = by_poll.get(str(pid))
-        out.append(registrar.SHOW_LABEL.get(venue, str(pid)[:8]) if venue
-                   else str(pid)[:8])
-    return " > ".join(out)
+    return " > ".join(str(i)[:8] for i in ids)
 
 
 def split_lines(raw):
-    """Proxy/credential lines: newline or comma separated, # comments dropped."""
+    """Credential lines: newline or comma separated, # comments dropped."""
     out = []
     for chunk in str(raw).replace(",", "\n").splitlines():
         line = chunk.strip()
@@ -91,9 +79,23 @@ def split_lines(raw):
     return out
 
 
-def mask_url(url):
-    """Hide user:pass inside a proxy URL before it reaches the page."""
-    return re.sub(r"//[^@/]+@", "//***:***@", str(url or ""))
+def _stamp(value):
+    """epoch -> 'YYYY-MM-DD HH:MM'（本地时区），空值给空串。
+
+    服务端做这件事而不是页面：页面上显示的时间要是人所在时区的时间，而
+    epoch 在浏览器里被 new Date() 一过就成了 UTC 的兄弟时区。
+    """
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(value)))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _csv_cell(value):
+    text = "" if value is None else str(value)
+    if any(c in text for c in ',"\n'):
+        return '"' + text.replace('"', '""') + '"'
+    return text
 
 
 class LogRing:
@@ -124,14 +126,13 @@ class LogRing:
 
 
 class WebAdmin:
-    """Routes for the admin UI. `controller` owns the engine lifecycle."""
+    """Routes for the admin UI. `controller` owns the monitor lifecycle."""
 
-    def __init__(self, store, config, status, proxies, logs, controller,
+    def __init__(self, store, config, status, logs, controller,
                  password="", static_dir="", log=None):
         self.store = store
         self.config = config
         self.status = status
-        self.proxies = proxies
         self.logs = logs
         self.controller = controller
         self.password = password or ""
@@ -198,7 +199,8 @@ class WebAdmin:
         # build stamp. It used to fall through to the login page, so the
         # healthcheck was parsing HTML as JSON and failing forever.
         if path == "/health":
-            return self._json(200, {"ok": True, "build": _build_stamp()})
+            return self._json(200, {"ok": True, "build": sysinfo.build_stamp(),
+                                    "hits": self.store.stats().get("hits", 0)})
 
         if path == "/login" and method == "POST":
             return self._login(body)
@@ -234,16 +236,23 @@ class WebAdmin:
 
         if path == "/api/state":
             info = self.status.snapshot()
-            # The config carries the proxy list, credentials and all. The state
-            # endpoint only exists to render the dashboard, so it gets the
-            # count; the full (masked) list comes from /api/proxies.
-            cfg = dict(self.config.data)
-            if cfg.get("proxies"):
-                cfg["proxies"] = f"{len(cfg['proxies'])} 个（见代理池页）"
-            info["config"] = cfg
+            # The config carries credentials (mail proxy, iCloud password). The
+            # state endpoint only exists to render the dashboard, and the
+            # settings page has its own read; so nothing secret travels here
+            # beyond what the operator already typed into that page.
+            info["config"] = dict(self.config.data)
             info["running"] = self.controller.running()
-            info["version"] = 1
+            info["version"] = 2
             return self._json(200, info)
+
+        if path == "/api/hits":
+            rows = self.store.hits()
+            for r in rows:
+                r["hit_at"] = _stamp(r.get("hit_at"))
+                r["last_mail_at"] = _stamp(r.get("last_mail_at"))
+                r["label"] = hitcheck.SOURCE_LABEL.get(r.get("hit_source"),
+                                                       r.get("hit_source") or "")
+            return self._json(200, {"total": len(rows), "rows": rows})
 
         if path == "/api/icloud/aliases":
             return self._icloud_catalog()
@@ -275,7 +284,15 @@ class WebAdmin:
             page = max(1, int(query.get("page", ["1"])[0] or 1))
             per = 50
             rows = self.store.accounts()
-            if status:
+            for r in rows:
+                r["checked_at"] = _stamp(r.get("checked_at"))
+                r["hit_at"] = _stamp(r.get("hit_at"))
+                r["last_mail_at"] = _stamp(r.get("last_mail_at"))
+                r["label"] = hitcheck.SOURCE_LABEL.get(r.get("hit_source"),
+                                                       r.get("hit_source") or "")
+            if status == "hit":
+                rows = [r for r in rows if r.get("hit_at")]
+            elif status:
                 rows = [r for r in rows if r["status"] == status]
             total = len(rows)
             return self._json(200, {
@@ -283,38 +300,12 @@ class WebAdmin:
                 "rows": rows[(page - 1) * per: page * per]})
 
         if path == "/api/registrations":
+            # 上一版程序留下的预约记录，只读展示：账号能不能读、中没中签，
+            # 都不再依赖这张表，但它记录了当时提交了什么。
             rows = self.store.registrations()
             for r in rows:
                 r["shows"] = _shows_label(r.get("poll_answer_ids"))
             return self._json(200, {"rows": rows})
-
-        if path == "/api/proxies":
-            if method == "POST":
-                lines = split_lines((body or {}).get("lines") or "")
-                # The page only ever saw masked urls, so a line that still
-                # reads //***:***@ means "leave this one alone" - restore the
-                # real credential from the current pool instead of overwriting
-                # the password with asterisks.
-                known = {mask_url(e["url"]): e["url"]
-                         for e in self.proxies.snapshot()}
-                resolved = [known.get(mask_url(ln), ln) for ln in lines]
-                # Persist first: the file is the source of truth, so a restart
-                # does not silently revert to whatever OASIS_PROXIES seeded.
-                self.config.data["proxies"] = resolved
-                self.config.save()
-                self.proxies.load(resolved)
-                self.log("info", f"web: proxy pool replaced with "
-                                 f"{len(resolved)} line(s)")
-                return self._json(200, {"ok": True, "total": len(resolved)})
-            snap = self.proxies.snapshot()
-            return self._json(200, {
-                "total": len(snap),
-                # Masked here, not just in the page: the password would
-                # otherwise travel over the wire on every page load, and show
-                # up in any access log or proxy in between.
-                "rows": [dict(e, url=mask_url(e["url"])) for e in snap[:500]],
-                "lines": [mask_url(e["url"]) for e in snap],
-            })
 
         if path == "/api/accounts/import" and method == "POST":
             lines = split_lines((body or {}).get("lines") or "")
@@ -338,19 +329,21 @@ class WebAdmin:
                                               "msg": m} for n, at, lv, m in rows]})
 
         if path == "/api/start" and method == "POST":
-            threads = int((body or {}).get("threads") or 0)
-            mode = (body or {}).get("mode") or self.config.get("mode", "browser")
-            if threads <= 0:
-                return self._json(400, {"error": "threads must be > 0"})
-            if self.controller.running():
-                return self._json(409, {"error": "engine already running"})
-            limit = int((body or {}).get("limit") or 0)
-            self.config.data["threads"] = threads
-            self.config.data["mode"] = mode
-            self.config.data["limit"] = max(0, limit)
+            # 「立即巡检一轮」。间隔与并发都在这儿落地，所以改完就能生效，
+            # 不必等下一轮或重启。
+            body = body or {}
+            for key in ("interval", "threads", "lookback_days", "per_page",
+                        "skip_hits", "limit"):
+                if body.get(key) in (None, ""):
+                    continue
+                self.config.data[key] = (body[key] if key == "skip_hits"
+                                         else int(body[key]))
             self.config.save()
-            self.controller.start(threads, mode)
-            return self._json(200, {"ok": True})
+            if self.controller.running():
+                self.controller.stop()
+            self.controller.start()
+            return self._json(200, {"ok": True,
+                                    "config": dict(self.config.data)})
 
         if path == "/api/stop" and method == "POST":
             self.controller.stop()
@@ -364,7 +357,8 @@ class WebAdmin:
             return self._json(200, {"ok": True, "config": dict(self.config.data)})
 
         if path == "/api/accounts/reset" and method == "POST":
-            return self._json(200, {"changed": self.store.reset_failed()})
+            # 重新排队 = 清掉检测记录重来（不触碰已成立的中签）。
+            return self._json(200, {"changed": self.store.reset_checks()})
 
         if path == "/api/accounts/delete" and method == "POST":
             status = (body or {}).get("status") or None
@@ -378,6 +372,13 @@ class WebAdmin:
             what = query.get("what", ["creds"])[0]
             if what == "creds":
                 data = "\n".join(self.store.cred_lines()) + "\n"
+            elif what == "hits" or what == "hit_creds":
+                # 中签名单要能被直接拿去用：一份给人看的 CSV，一份能再导入回来的
+                # 凭据行，后者只含中签的地址。
+                if what == "hits":
+                    data = self._hits_csv()
+                else:
+                    data = "\n".join(self._hit_cred_lines()) + "\n"
             else:
                 data = json.dumps(self.store.accounts(), ensure_ascii=False,
                                   indent=1)
@@ -391,6 +392,35 @@ class WebAdmin:
         if not path.startswith("/api/"):
             return self._page()
         return self._json(404, {"error": "not found"})
+
+    def _hits_csv(self):
+        """中签名单，人读的 CSV。来源单独一列，因为「站点已确认、邮件没来」
+        与「收到成功邮件」不是同一件事，事后要能分得清。"""
+        rows = [["email", "中签时间", "证据来源", "说明", "最近来信", "来信标题",
+                 "协议", "检查次数"]]
+        for h in self.store.hits():
+            note = h.get("hit_note") or ""
+            if h.get("hit_source") == hitcheck.SOURCE_SUCCESS_MAIL:
+                # 旧记录里 note 存的是结论，不该再重复一遍来源标签。
+                note = note.replace("旧记录：成功邮件已到", "成功邮件已到")
+            rows.append([
+                h.get("email", ""), _stamp(h.get("hit_at")),
+                hitcheck.SOURCE_LABEL.get(h.get("hit_source"),
+                                          h.get("hit_source") or ""),
+                note, _stamp(h.get("last_mail_at")),
+                h.get("last_mail_subject") or "", h.get("protocol") or "",
+                h.get("check_count") or 0])
+        return "\n".join(",".join(_csv_cell(c) for c in row)
+                         for row in rows) + "\n"
+
+    def _hit_cred_lines(self):
+        """中签账号的凭据行，格式与导入一致，能再导回来。"""
+        out = []
+        for h in self.store.hits():
+            line = self.store.cred_line_for(h["id"])
+            if line:
+                out.append(line)
+        return out
 
     def _expand_aliases(self, lines):
         """Complete bare iCloud alias addresses into full credential lines.

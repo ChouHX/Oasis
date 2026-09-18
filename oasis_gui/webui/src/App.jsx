@@ -1,14 +1,14 @@
 import { useEffect, useState, useCallback } from "react";
 import { Layout, Menu, Button, Space, Typography, Tag, App as AntApp } from "antd";
 import {
-  DashboardOutlined, MailOutlined, GlobalOutlined, ScheduleOutlined,
+  DashboardOutlined, MailOutlined, TrophyOutlined, ScheduleOutlined,
   DatabaseOutlined, SettingOutlined, LogoutOutlined,
 } from "@ant-design/icons";
 import { api, AuthError } from "./api.js";
 import Login from "./Login.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import Mailboxes from "./pages/Mailboxes.jsx";
-import Proxies from "./pages/Proxies.jsx";
+import Hits from "./pages/Hits.jsx";
 import Registrations from "./pages/Registrations.jsx";
 import Database from "./pages/Database.jsx";
 import Settings from "./pages/Settings.jsx";
@@ -19,8 +19,8 @@ const { Text } = Typography;
 const PAGES = [
   { key: "dash", icon: <DashboardOutlined />, label: "仪表盘" },
   { key: "mail", icon: <MailOutlined />, label: "邮箱池" },
-  { key: "proxy", icon: <GlobalOutlined />, label: "代理池" },
-  { key: "reg", icon: <ScheduleOutlined />, label: "预约记录" },
+  { key: "hits", icon: <TrophyOutlined />, label: "中签名单" },
+  { key: "reg", icon: <ScheduleOutlined />, label: "旧预约" },
   { key: "data", icon: <DatabaseOutlined />, label: "数据库" },
 ];
 
@@ -95,19 +95,20 @@ export default function App() {
           background: "#fff", borderBottom: "1px solid #f0f0f0",
           padding: "0 20px", display: "flex", alignItems: "center", gap: 12,
         }}>
-          <Text strong style={{ fontSize: 15 }}>Oasis Live &apos;27 注册控制台</Text>
+          <Text strong style={{ fontSize: 15 }}>Oasis Live &apos;27 中签检测台</Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            浏览器真实 captcha · 官方表单驱动 · SQLite 去重落库
+            定时巡检已导入账号的收件箱 · 邮件证据与站点记录合并判定
           </Text>
           <div style={{ flex: 1 }} />
           {state && (
             <Space size={8}>
               <Tag color={state.running ? "processing" : "default"}>
-                {state.running ? "运行中" : "空闲"}
+                {state.running ? "巡检中" : "空闲"}
               </Tag>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                {state.state} · 线程 {state.threads ?? "-"}
-                {state.rounds ? ` · 第 ${state.rounds} 轮` : ""}
+                {state.state} · 并发 {state.threads ?? "-"} · 间隔 {state.interval ?? "-"}s
+                {state.sweeps ? ` · 第 ${state.sweeps} 轮` : ""}
+                {state.stats?.hits !== undefined ? ` · 中签 ${state.stats.hits}` : ""}
               </Text>
             </Space>
           )}
@@ -116,7 +117,7 @@ export default function App() {
         <Content style={{ padding: 16, background: "#f5f5f5" }}>
           {tab === "dash" && <Dashboard state={state} refresh={refresh} />}
           {tab === "mail" && <Mailboxes state={state} refresh={refresh} />}
-          {tab === "proxy" && <Proxies />}
+          {tab === "hits" && <Hits refresh={refresh} />}
           {tab === "reg" && <Registrations />}
           {tab === "data" && <Database refresh={refresh} />}
           {tab === "set" && <Settings state={state} refresh={refresh} />}

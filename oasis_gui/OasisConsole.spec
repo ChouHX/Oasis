@@ -9,8 +9,9 @@ Notes that matter:
     resolves its data directory from sys.executable (see app.app_dir()), because
     __file__ points into the temporary extraction folder under onefile.
   * qfluentwidgets carries Qt style sheets, SVG icons and a compiled Qt resource
-    module; curl_cffi carries its own libcurl. Both need collect_all or the exe
-    starts with a missing-resource or missing-DLL error.
+    module and needs collect_all, or the exe starts with a missing-resource
+    error. There is no HTTP client or browser to bundle any more: the monitor
+    reads mailboxes over IMAP/Graph with the standard library.
   * socks is imported lazily inside mailbox.open_tunnel(), so PyInstaller's
     static analysis cannot see it.
   * Qt 6.6.x is the target. Newer Qt builds (6.11) require Windows APIs that the
@@ -22,11 +23,9 @@ from PyInstaller.utils.hooks import collect_all
 datas, binaries, hiddenimports = [], [], []
 
 # qfluentwidgets: Qt style sheets, SVG icons, compiled Qt resource module.
-# curl_cffi: its own libcurl.
-# playwright: the node driver + cli.js, so browser mode works from the exe
-#            (the browser binary itself is fetched on first use, see
-#            browser_registrar.resolve_channel).
-for package in ("qfluentwidgets", "curl_cffi", "playwright"):
+# Nothing else needs collecting - the mail readers (imaplib, email, urllib) ship
+# with CPython, and PySocks is a pure-python module imported by name below.
+for package in ("qfluentwidgets",):
     d, b, h = collect_all(package)
     datas += d
     binaries += b

@@ -49,7 +49,7 @@ echo "[3/4] installing build dependencies"
 wine_py -m pip install -q --upgrade pip
 wine_py -m pip install -q \
     "PyQt6==6.6.1" "PyQt6-Qt6==6.6.1" \
-    PyQt6-Fluent-Widgets curl_cffi PySocks pyinstaller
+    PyQt6-Fluent-Widgets PySocks pyinstaller
 
 # ------------------------------------------------------------------- 4. build
 echo "[4/4] staging source and building"

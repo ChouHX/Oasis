@@ -13,10 +13,11 @@ set -euo pipefail
 DATA_DIR="$(dirname "${OASIS_DB:-/data/oasis.db}")"
 
 # ---------------------------------------------------------------- HOME -------
-# Chromium writes its profile, its crash database and its first-run state under
-# $HOME. With a read-only $HOME the full chromium dies during startup with
-# SIGTRAP - reported as "exited immediately (code -5)" - before it ever opens
-# its debug port, which reads like a broken image rather than a bad HOME.
+# The image's user needs a writable HOME for its own bookkeeping. This used to
+# be load-bearing for chromium, which died with SIGTRAP ("exited immediately
+# (code -5)") whenever HOME was read-only; the browser is gone, but a writable
+# HOME is still worth guaranteeing - Python's user cache and any mail library
+# that keeps state will otherwise fail in confusing ways.
 #
 # Docker leaves HOME=/root in the environment even after we drop to uid 10001,
 # and /root is not writable by runner, so this is the default case and not an

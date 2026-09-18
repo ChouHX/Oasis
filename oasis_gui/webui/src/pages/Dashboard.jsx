@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Card, Row, Col, Statistic, Button, InputNumber, Select, Space, Typography,
-  Tag, Tooltip, App as AntApp, Checkbox,
+  Card, Row, Col, Statistic, Button, InputNumber, Space, Typography,
+  Tag, Tooltip, App as AntApp, Checkbox, Switch,
 } from "antd";
 import {
   CaretRightOutlined, PauseOutlined, ClearOutlined, QuestionCircleOutlined,
+  SyncOutlined,
 } from "@ant-design/icons";
-import { api, STATUS, SHOW_LABEL } from "../api.js";
+import { api, STATUS } from "../api.js";
 
 const { Text } = Typography;
 
@@ -86,47 +87,40 @@ function LogPanel() {
   );
 }
 
-const SHOW_ORDER = ["glasgow", "manchester", "paris", "munich", "barcelona",
-                    "amsterdam", "rome", "boston", "lasvegas", "slane",
-                    "knebworth"];
-
 export default function Dashboard({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [threads, setThreads] = useState(2);
-  const [mode, setMode] = useState("browser");
-  const [limit, setLimit] = useState(0);
-  const [shows, setShows] = useState(["glasgow", "manchester", "paris"]);
+  const [interval, setInterval] = useState(300);
+  const [lookback, setLookback] = useState(30);
+  const [skipHits, setSkipHits] = useState(true);
   const [busy, setBusy] = useState(false);
 
   // Seed the run controls once per visit, and never again.
   //
   // /api/state is polled every three seconds and each reply is a brand new
-  // object - `shows` in particular is a new array every time, so an effect
-  // keyed on it re-ran on every poll and put the server's stored values back
-  // over whatever had just been typed. That is how a thread count quietly
-  // reverted to its old value before "开始注册" read it. Seeding once leaves the
-  // controls alone while someone is editing them; leaving the page and coming
-  // back reseeds from the server.
+  // object, so an effect keyed on it re-ran on every poll and put the server's
+  // stored values back over whatever had just been typed. That is how a control
+  // quietly reverted to its old value before "开始检测" read it. Seeding once
+  // leaves the controls alone while someone is editing them; leaving the page
+  // and coming back reseeds from the server.
   const seeded = useRef(false);
   useEffect(() => {
     const c = state?.config;
     if (!c || seeded.current) return;
     seeded.current = true;
     if (c.threads) setThreads(c.threads);
-    if (c.mode) setMode(c.mode);
-    if (c.limit !== undefined) setLimit(c.limit || 0);
-    if (Array.isArray(c.shows) && c.shows.length) setShows(c.shows);
+    if (c.interval) setInterval(c.interval);
+    if (c.lookback_days !== undefined) setLookback(c.lookback_days);
+    if (c.skip_hits !== undefined) setSkipHits(!!c.skip_hits);
   }, [state?.config]);
 
   const stats = state?.stats || {};
   const host = state?.host || {};
+  const monitor = state?.monitor || {};
 
-  // Persist the run controls as they are changed, not only when a run starts.
-  //
-  // They are settings, and they used to be written to the server only by
-  // 开始注册. So changing the thread count and reloading the page brought back
-  // the old number: the edit had never left the browser. Debounced, because a
-  // number field fires on every keystroke and each write goes to disk.
+  // Persist the controls as they are changed, not only when a sweep starts.
+  // They are settings, and a number field fires on every keystroke while each
+  // write goes to disk - hence the debounce.
   const saveTimer = useRef(null);
   const persist = (patch) => {
     clearTimeout(saveTimer.current);
@@ -135,33 +129,14 @@ export default function Dashboard({ state, refresh }) {
     }, 700);
   };
 
-  const changeThreads = (v) => {
-    setThreads(v);
-    if (v) persist({ threads: v });
-  };
-
-  const changeMode = (v) => {
-    setMode(v);
-    persist({ mode: v });
-  };
-
-  const changeLimit = (v) => {
+  const changeThreads = (v) => { setThreads(v); if (v) persist({ threads: v }); };
+  const changeInterval = (v) => { setInterval(v); if (v) persist({ interval: v }); };
+  const changeLookback = (v) => {
     const n = Math.max(0, v || 0);
-    setLimit(n);
-    persist({ limit: n });
+    setLookback(n);
+    persist({ lookback_days: n });
   };
-
-  const saveShows = async () => {
-    if (new Set(shows).size !== shows.length) {
-      message.warning("三个偏好不能重复");
-      return;
-    }
-    try {
-      await api.saveConfig({ shows });
-      message.success("偏好已保存");
-      refresh();
-    } catch (e) { message.error(String(e.message || e)); }
-  };
+  const changeSkipHits = (v) => { setSkipHits(v); persist({ skip_hits: v }); };
 
   const run = async (fn, ok) => {
     setBusy(true);
@@ -194,97 +169,89 @@ export default function Dashboard({ state, refresh }) {
         ))}
       </Row>
 
-      <Card title="场次偏好" size="small" style={{ marginBottom: 12 }}
-            extra={<Button size="small" onClick={saveShows}>保存偏好</Button>}>
-        <Space wrap size={12}>
-          {["第一", "第二", "第三"].map((tag, i) => (
-            <Space key={tag} size={6}>
-              <Text type="secondary">{tag}</Text>
-              <Select
-                value={shows[i]}
-                style={{ width: 150 }}
-                onChange={(v) => {
-                  const next = [...shows];
-                  next[i] = v;
-                  setShows(next);
-                }}
-                options={SHOW_ORDER
-                  .filter((k) => k === shows[i] || !shows.includes(k))
-                  .map((k) => ({ value: k, label: SHOW_LABEL[k] || k }))}
-              />
-            </Space>
-          ))}
-        </Space>
-        <div style={{ marginTop: 8 }}>
+      <Card
+        title="检测控制"
+        size="small"
+        style={{ marginBottom: 12 }}
+        extra={
           <Text type="secondary" style={{ fontSize: 12 }}>
-            三个不能重复；提交时按这个顺序作为城市偏好。
+            {state?.running
+              ? `巡检中 · 第 ${monitor.round || 0} 轮 · 本轮已读 ${monitor.checked || 0}`
+              : "空闲"}
           </Text>
-        </div>
-      </Card>
-
-      <Card title="运行控制" size="small" style={{ marginBottom: 12 }}>
+        }
+      >
         <Space wrap size={12}>
           <Space size={6}>
-            <Text type="secondary">线程</Text>
-            <InputNumber min={1} max={64} value={threads}
-                         onChange={changeThreads}
-                         disabled={state?.running} />
-          </Space>
-          <Space size={6}>
-            <Text type="secondary">上限</Text>
-            <InputNumber min={0} max={100000} value={limit}
-                         onChange={changeLimit}
-                         disabled={state?.running}
-                         style={{ width: 104 }} />
-            <Tooltip title="本轮最多处理几个账号，0 表示不限。想先拿一两条试手时用它。">
+            <Text type="secondary">并发</Text>
+            <InputNumber min={1} max={32} value={threads}
+                         onChange={changeThreads} />
+            <Tooltip title="同时打开几条收件箱连接。同一个 Gmail 收件箱下的 iCloud 别名共用一条连接，所以这是并发连接数，不是「同时读几封信」。">
               <QuestionCircleOutlined style={{ color: "#8c8c8c" }} />
             </Tooltip>
           </Space>
           <Space size={6}>
-            <Text type="secondary">模式</Text>
-            <Select
-              value={mode}
-              onChange={changeMode}
-              disabled={state?.running}
-              style={{ width: 220 }}
-              options={[
-                { value: "browser", label: "浏览器（SPA 全流程）" },
-                { value: "http", label: "纯 HTTP（curl，captcha 留空）" },
-              ]}
-            />
+            <Text type="secondary">间隔（秒）</Text>
+            <InputNumber min={30} max={86400} step={30} value={interval}
+                         onChange={changeInterval} style={{ width: 108 }} />
+            <Tooltip title="一轮跑完到下一轮开始之间的等待。中签通知不是秒级事件，频率再高只是把对方的收件箱打成请求尖峰。">
+              <QuestionCircleOutlined style={{ color: "#8c8c8c" }} />
+            </Tooltip>
+          </Space>
+          <Space size={6}>
+            <Text type="secondary">首次回看（天）</Text>
+            <InputNumber min={0} max={3650} value={lookback}
+                         onChange={changeLookback} style={{ width: 104 }} />
+            <Tooltip title="首次检测回看多少天。活动已经结束，中签结果很可能早就发出去了，这个窗口要覆盖「结果可能已发」的那段时间；0 = 不设基线，邮箱里所有 Oasis 来信都算数。">
+              <QuestionCircleOutlined style={{ color: "#8c8c8c" }} />
+            </Tooltip>
+          </Space>
+          <Space size={6}>
+            <Text type="secondary">跳过已中签</Text>
+            <Switch size="small" checked={skipHits} onChange={changeSkipHits} />
           </Space>
           <Button
             type="primary"
             icon={<CaretRightOutlined />}
             loading={busy}
             disabled={state?.running}
-            onClick={() => run(() => api.start(threads, mode, limit), "已启动")}
+            onClick={() => run(
+              () => api.start({ threads, interval, lookback_days: lookback,
+                                skip_hits: skipHits }),
+              "已开始检测")}
           >
-            开始注册
+            开始检测
+          </Button>
+          <Button
+            icon={<SyncOutlined />}
+            loading={busy}
+            onClick={() => run(() => api.start({ threads, interval }), "已排队再查一轮")}
+          >
+            立即检查一轮
           </Button>
           <Button
             danger
             icon={<PauseOutlined />}
             disabled={!state?.running}
-            onClick={() => run(api.stop, "已请求停止（跑完当前账号后停下）")}
+            onClick={() => run(api.stop, "已请求停止（读完当前这批账号后停下）")}
           >
             停止
           </Button>
           {recommended && (
             <Tag color="blue" style={{ cursor: "pointer" }}
                  onClick={() => changeThreads(recommended)}>
-              建议 {recommended} 线程
+              建议 {recommended} 并发
             </Tag>
           )}
         </Space>
-        {host.total_mb && (
-          <div style={{ marginTop: 10 }}>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              内存 {(host.total_mb - host.available_mb)} / {host.total_mb} MB 在用 ·
-              可用 {host.available_mb} MB · {host.cores} 核 —— {host.reason}
-            </Text>
-          </div>
-        )}
+        <div style={{ marginTop: 10 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            检测只读邮箱，不向站点发任何请求。
+            {host.total_mb
+              ? ` 内存 ${host.total_mb - host.available_mb} / ${host.total_mb} MB 在用 · 可用 ${host.available_mb} MB · ${host.cores} 核 —— ${host.reason}`
+              : ""}
+          </Text>
+        </div>
       </Card>
 
       <LogPanel />

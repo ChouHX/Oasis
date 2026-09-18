@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Host capacity, so the console can suggest a sane thread count.
+"""Host capacity, so the console can suggest a sane concurrency.
 
-Browser mode is the expensive one: every worker gets its own browser context
-inside the shared chromium process. Measured on this project: ~250MB per worker,
-on top of the shared browser itself (~250MB) and the Qt UI (~150MB). Recommending more than the machine can hold is
-worse than recommending too little: the OS starts swapping and every worker
-slows down together.
+检测程序的开销是「同时打开几条 IMAP 连接」，不是「同时开几个浏览器」：一条
+连接读信时驻留约 5-10MB，瓶颈在 CPU 与上游的并发限制上，不在内存。所以这里
+按内存留够余量、再按核数收敛，推荐值偏低 —— 并发开太多只会让几个邮箱同时
+报超时。
 """
+import hashlib
 import os
+import platform
 import sys
+import time
 
-# Reserved so the desktop, the console itself and any other browser keep
-# working; a run that eats all free memory is slower than a smaller one.
-HEADROOM_MB = 1024
-MB_PER_WORKER = {"browser": 250}
-MAX_WORKERS = 16
+# Reserved so the console itself and the system keep working.
+HEADROOM_MB = 512
+MB_PER_WORKER = {"mail": 16}
+MAX_WORKERS = 8
 
 
 def memory():
@@ -70,27 +71,55 @@ def cpu_count():
         return os.cpu_count() or 4
 
 
-def recommend_threads(mode="browser", running_now=0):
-    """A worker count this machine can actually sustain.
+def recommend_threads(mode="mail", running_now=0):
+    """A concurrency this machine can actually sustain.
 
     Bounded by both memory and cores, and never below 1. `running_now` is
     subtracted so the advice reflects what is left, not the idle machine.
     """
     total, avail = memory()
     cores = cpu_count()
-    per = MB_PER_WORKER.get(mode, 200)
+    per = MB_PER_WORKER.get(mode, MB_PER_WORKER["mail"])
     if avail is None:
-        return max(1, min(cores, 4)), "内存信息不可读，按 CPU 核数保守估计"
+        return max(1, min(cores, 2)), "内存信息不可读，按 CPU 核数保守估计"
     usable = max(0, avail - HEADROOM_MB - running_now * per)
     by_mem = usable // per
     n = max(1, min(cores, MAX_WORKERS, by_mem))
     reason = (f"可用 {avail} MB / {total} MB · {cores} 核 · "
-              f"按 {per} MB/线程预留 {HEADROOM_MB} MB")
+              f"按 {per} MB/连接预留 {HEADROOM_MB} MB")
     return n, reason
 
 
-def summary(mode="browser"):
+def summary(mode="mail"):
     total, avail = memory()
     n, why = recommend_threads(mode)
     return {"total_mb": total, "available_mb": avail,
             "cores": cpu_count(), "recommended": n, "reason": why}
+
+
+def build_stamp():
+    """Which build of this program is running, and on what.
+
+    A report is only actionable if it says which code produced it - a stale
+    image and a genuinely broken host need opposite fixes, and the log lines
+    around a failure look identical either way. The digest covers every module
+    in core/, so "did the container actually pick up my change" is one line of
+    log instead of a guess.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        digest = hashlib.sha256()
+        newest = 0.0
+        for name in sorted(os.listdir(here)):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(here, name)
+            with open(path, "rb") as fh:
+                digest.update(fh.read())
+            newest = max(newest, os.path.getmtime(path))
+        tag = digest.hexdigest()[:12]
+        when = time.strftime("%m-%d %H:%M", time.localtime(newest))
+    except Exception:
+        tag, when = "?", "?"
+    return (f"core@{tag} ({when}) · py{platform.python_version()} · "
+            f"{cpu_count()} cores")
