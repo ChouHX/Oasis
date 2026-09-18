@@ -25,6 +25,7 @@ from core.mailbox import (ImapMailbox, Mail, MailSearchUnsupported,  # noqa: E40
                           parse_cred)
 
 NOW = time.time()
+CUTOFF = hitcheck.parse_cutoff(hitcheck.DEFAULT_CUTOFF)
 from core.store import Store                    # noqa: E402
 
 RAW = (b"From: Oasis <oasis@openstageit.com>\r\n"
@@ -104,7 +105,7 @@ LOGS = []
 
 
 class RefusingReader:
-    """读信永远拒绝粗筛，但全量读得到那封成功邮件。"""
+    """读信永远拒绝粗筛，但全量读得到那封结果信。"""
 
     def __init__(self, email):
         self.email = email
@@ -114,10 +115,12 @@ class RefusingReader:
         self.asked.append(only_oasis)
         if only_oasis:
             raise MailSearchUnsupported("服务端不接受这次 SEARCH（BAD）")
-        return [Mail(subject="Oasis Live '27 Registration Complete",
+        # 一封**注册截止之后**的结果信 —— 只有这种信算中签（stamp=0 会被判成
+        # 注册期的回声，那是另一个测试在管的事）。
+        return [Mail(subject="Oasis Live \u201927 \u2014 your ballot result",
                      sender="Oasis <oasis@openstageit.com>",
-                     body="You have successfully registered.", stamp=0.0,
-                     folder="inbox")]
+                     body="You have been successful in the ballot.",
+                     stamp=CUTOFF + 3600, folder="inbox")]
 
     def close(self):
         pass
@@ -129,17 +132,17 @@ monitor_mod.make_mailbox = lambda cred, protocol="graph", proxy_url="": (
 mon = monitor_mod.HitMonitor(store, lambda lvl, msg: LOGS.append((lvl, msg)),
                              lambda kind, payload=None: None,
                              {"threads": 1, "per_page": 5})
+mon.cutoff = CUTOFF
 mon.sweep()
 
 row = [a for a in store.accounts() if a["email"] == "fallback@outlook.com"][0]
 asked = readers[0].asked if readers else []
-ok3 = (row["hit_source"] == hitcheck.SOURCE_SUCCESS_MAIL
+ok3 = (row["hit_source"] == hitcheck.SOURCE_OASIS_MAIL
        and asked == [True, False])
 print(f"[{'OK ' if ok3 else 'FAIL'}] 中签来源 {row['hit_source']!r}，"
       f"读取顺序 {asked}（先粗筛、被拒后全量）")
 for lvl, msg in LOGS:
-    if lvl == "warn":
-        print(f"       日志：[{lvl}] {msg}")
+    print(f"       日志：[{lvl}] {msg}")
 
 print("\n== 4. SEARCH 条件串的形状（IMAP 前缀 OR 只能吃紧随其后的两个条件）==")
 # 这一条是语法级的：账号池里没有能走 IMAP 的邮箱（Outlook 对这些 OAuth 号回
@@ -149,15 +152,16 @@ print("\n== 4. SEARCH 条件串的形状（IMAP 前缀 OR 只能吃紧随其后�
 # 会变成 `(SINCE d OR FROM a) AND SUBJECT b`，直接把验证信筛掉。
 from core.mailbox import GmailAliasMailbox, ImapMailbox   # noqa: E402
 
-days = 30
-since = time.strftime("%d-%b-%Y", time.gmtime(NOW - days * 86400 - 86400))
+# monitor 现在拿**注册截止时间**当基线，所以 SINCE 也从它算（放宽一天，SINCE 只有
+# 日期粒度）。
+since = time.strftime("%d-%b-%Y", time.gmtime(CUTOFF - 86400))
 want_terms = ["SINCE", since, "OR", "FROM", '"openstage"',
               "SUBJECT", '"Oasis"']
 plain_terms = ImapMailbox(CRED).search_terms(only_oasis=True,
-                                             not_before=NOW - days * 86400)
+                                             not_before=CUTOFF)
 alias = GmailAliasMailbox({"email": "a@icloud.com", "client_id": "owner@gmail.com",
                            "password": "pw", "refresh_token": ""})
-alias_terms = alias._search_args(not_before=NOW - days * 86400, only_oasis=True)
+alias_terms = alias._search_args(not_before=CUTOFF, only_oasis=True)
 want_alias = ["TO", "a@icloud.com"] + want_terms
 ok4 = plain_terms == want_terms and alias_terms == want_alias
 print(f"[{'OK ' if ok4 else 'FAIL'}] IMAP        {plain_terms}")

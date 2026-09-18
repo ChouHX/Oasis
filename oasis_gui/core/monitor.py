@@ -27,7 +27,6 @@ from .mailbox import (ALIAS_PROTOCOL, MailAuthError,
 # 默认值。都可由 config 覆盖，改一处就能在 Web UI 上调。
 DEFAULT_INTERVAL = 300          # 秒；一轮跑完到下一轮开始之间的等待
 DEFAULT_THREADS = 2             # 同时打开的 IMAP/收件箱分组数
-DEFAULT_LOOKBACK_DAYS = 30      # 首次检测回看多少天（0 = 不设基线，看全部历史）
 DEFAULT_PER_PAGE = 20           # 每个邮箱取最近多少封信来判
 # 一条线程超过这么久还没读完一个账号，就当作它已经不在了（TTL 兜底）。
 INFLIGHT_TTL = 900
@@ -58,8 +57,9 @@ class HitMonitor:
         # 脚本和 oneshot 都直接跑一轮，不经过 start() 的调度线程。
         self.threads = max(1, int(self.setting("threads", None, DEFAULT_THREADS)))
         self.interval = max(5, int(self.setting("interval", None, DEFAULT_INTERVAL)))
-        self.lookback_days = float(self.setting("lookback_days", None,
-                                                DEFAULT_LOOKBACK_DAYS) or 0)
+        self.cutoff = hitcheck.parse_cutoff(
+            self.config.get("ballot_cutoff") or hitcheck.DEFAULT_CUTOFF,
+            default=hitcheck.parse_cutoff(hitcheck.DEFAULT_CUTOFF))
         self.per_page = max(1, int(self.setting("per_page", None,
                                                 DEFAULT_PER_PAGE)))
         self.skip_hits = bool(self.setting("skip_hits", None, True))
@@ -123,13 +123,15 @@ class HitMonitor:
             pass
 
     # ------------------------------------------------------------------- control
-    def start(self, threads=None, interval=None, lookback_days=None,
+    def start(self, threads=None, interval=None,
               per_page=None, skip_hits=None, limit=None, mail_filter=None,
-              only_opted=None, rounds=0):
+              only_opted=None, cutoff=None, rounds=0):
         """开始巡检。
 
         `rounds=0` 是常驻（一直跑，每轮之间等 interval）；`rounds=1` 只跑一轮
         就退出，用于 OASIS_ONESHOT 那种一次性检查。
+
+        `cutoff` 是注册截止时间（原始文本，见 core.hitcheck.parse_cutoff）。
         """
         if self._running:
             self._log("warn", "检测已在运行")
@@ -137,14 +139,18 @@ class HitMonitor:
         self.threads = max(1, int(self.setting("threads", threads, DEFAULT_THREADS)))
         self.interval = max(5, int(self.setting("interval", interval,
                                                 DEFAULT_INTERVAL)))
-        self.lookback_days = float(self.setting(
-            "lookback_days", lookback_days, DEFAULT_LOOKBACK_DAYS) or 0)
+        self.cutoff = hitcheck.parse_cutoff(
+            self.config.get("ballot_cutoff") or hitcheck.DEFAULT_CUTOFF,
+            default=self.cutoff)
         self.per_page = max(1, int(self.setting("per_page", per_page,
                                                 DEFAULT_PER_PAGE)))
         self.skip_hits = bool(self.setting("skip_hits",
                                            True if skip_hits is None
                                            else skip_hits, True))
         self.limit = max(0, int(self.setting("limit", limit, 0) or 0))
+        if cutoff:
+            self.cutoff = hitcheck.parse_cutoff(cutoff, default=self.cutoff) or \
+                self.cutoff
         self.only_opted = bool(self.setting("only_opted", only_opted, True))
         self.mail_filter = bool(self.setting("mail_filter", mail_filter, True))
         self.mail_filter_broken = False
@@ -157,8 +163,9 @@ class HitMonitor:
         scope = (f"{stats.get('opted', 0)}/{stats.get('total', 0)} 个已预约账号"
                  if self.only_opted else f"{stats.get('total', 0)} 个账号（含未标记）")
         self._log("info", f"中签检测启动：{scope} · {self.threads} 并发 · "
-                          f"每 {self.interval}s 一轮 · 回看 "
-                          f"{int(self.lookback_days)} 天 · "
+                          f"每 {self.interval}s 一轮 · 注册截止 "
+                          f"{hitcheck.format_cutoff(self.cutoff)}（此前的来信只算"
+                          f"预约）· "
                           f"{'跳过已中签' if self.skip_hits else '重复检查已中签'}")
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="hit-monitor")
@@ -395,13 +402,10 @@ class HitMonitor:
 
     def _read_and_judge(self, acct, mailbox):
         account_id = acct["id"]
-        baseline = acct.get("baseline_at")
-        if baseline is None:
-            # 首次检测：基线 = 回看窗口的起点。活动已经结束，回看窗口内的
-            # Oasis 来信必须算数 —— 中签结果很可能早就发出去了，若把基线设成
-            # 「现在」，那些信会被当成历史而白白漏掉。
-            baseline = (time.time() - self.lookback_days * 86400
-                        if self.lookback_days > 0 else 0.0)
+        # 基线就是注册截止时间：结果信只可能出现在它之后，而它之前的每一封信都
+        # 只是预约期的回声。存进库（baseline_at）只为在界面上能看见「从什么时候
+        # 开始算」，判定用的是这里的 cutoff。
+        baseline = self.cutoff
         # 粗筛还是全量，取决于这个账号查过几次。
         #
         # 首次检测走全量：那一次要把邮箱里**已经存在**的信看全 —— 活动结束、结果
@@ -444,21 +448,13 @@ class HitMonitor:
             self._log("debug", f"{acct['email']}：首次检测，取全量 "
                                f"{len(mails)} 封做基准")
 
-        verdict = hitcheck.pick_oasis(mails, baseline_at=baseline)
+        verdict = hitcheck.pick_result(mails, cutoff_at=baseline)
         latest_at, latest_subject = verdict["latest"] or (None, "")
 
         source, note = None, ""
-        if verdict["success"]:
-            source = hitcheck.SOURCE_SUCCESS_MAIL
-            note = f"成功邮件：{verdict['success'][1]}"
-        elif verdict["first_new"]:
+        if verdict["result"]:
             source = hitcheck.SOURCE_OASIS_MAIL
-            note = f"Oasis 来信：{verdict['subject']}"
-        elif hitcheck.legacy_site_ok(acct.get("status"), acct.get("error") or ""):
-            # merge 点：站点已经确认过的旧记录。运行中兜底再判一次，因为
-            # 这个结论只依赖库里已有的字段，不花任何网络代价。
-            source = hitcheck.SOURCE_SITE_OK
-            note = "站点已确认（无成功邮件）"
+            note = f"结果信：{verdict['result'][1]}"
 
         # 本轮被放弃的账号：结论照写，但不推进进度（见 _mark_overdue）。
         overdue = account_id in self._abandoned
@@ -485,12 +481,13 @@ class HitMonitor:
                                "protocol": acct.get("protocol")})
         else:
             seen = (f"{len(mails)} 封信，Oasis {verdict['n_oasis']} 封"
-                    + (f"（其中验证信 {verdict['n_verify']} 封）"
-                       if verdict["n_verify"] else ""))
-            self._log("info", f"{acct['email']}：未中签（{seen}）")
+                    + (f"，其中注册期的 {verdict['n_early']} 封"
+                       if verdict["n_early"] else ""))
+            self._log("info", f"{acct['email']}：暂无结果（{seen}）")
             self._emit("checked", {"email": acct["email"],
                                    "n_oasis": verdict["n_oasis"],
                                    "n_verify": verdict["n_verify"],
+                                   "n_early": verdict["n_early"],
                                    "latest_at": latest_at,
                                    "subject": latest_subject})
 

@@ -62,7 +62,7 @@ print("导航项   :", routes)
 print("统计卡   :", cards)
 print("检测控制 :", f"并发 {win.dash.threads.value()} · "
                    f"间隔 {win.dash.interval.value()}s · "
-                   f"回看 {win.dash.lookback.value()} 天")
+                   f"注册截止 {win.dash.cutoff_label.text()}")
 print("按钮     :", win.dash.btn_start.text(), "/", win.dash.btn_check.text())
 print("运行提示 :", win.dash.run_hint.text())
 print("本机状态 :", win.dash.host_label.text())
@@ -86,6 +86,10 @@ checks = [
                 win.dash.host_label.text() + "中签"),
      "提示文案已中签化"),
     (win.dash.recent.columnCount() == 5, "最近中签表 5 列"),
+    (bool(win.dash.cutoff_label.text()), f"截止时间显示了"
+     f"（{win.dash.cutoff_label.text()}）"),
+    (win.settings.ballot_cutoff.text().endswith("Z"),
+     f"设置页有截止时间输入（{win.settings.ballot_cutoff.text()}）"),
 ]
 ok = True
 for good, why in checks:

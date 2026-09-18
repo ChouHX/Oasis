@@ -71,9 +71,7 @@ export default function Hits({ refresh }) {
             onChange={setFilter}
             options={[
               { value: "all", label: "全部" },
-              { value: "success-mail", label: "成功邮件" },
-              { value: "oasis-mail", label: "Oasis 来信" },
-              { value: "site-ok", label: "站点已确认" },
+              { value: "oasis-mail", label: "结果信" },
             ]}
           />
           <Button icon={<ReloadOutlined />} onClick={() => load()}>刷新</Button>
@@ -92,9 +90,9 @@ export default function Hits({ refresh }) {
       }
     >
       <Paragraph type="secondary" style={{ fontSize: 12 }}>
-        「站点已确认」这一类来自上一版程序的记录 —— confirm 回了 OK 却没发成功邮件
-        （以及浏览器模式里页面确认即成功、从不发信）。活动已经结束，那封信不会再来，
-        所以它们与收到成功邮件的账号进同一张名单，而不是被「没有成功邮件」吞掉。
+        名单里只会有<Text strong>注册截止之后</Text>收到的 Oasis 来信 —— 也就是结果
+        通知。截止之前的信（验证信、Registration Complete）一律不算：它们证明的是
+        「预约成功」，不是「中签」。所以名单空着是正常的，直到 Oasis 发结果。
       </Paragraph>
       <Table
         rowKey="id"

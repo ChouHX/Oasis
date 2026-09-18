@@ -25,7 +25,8 @@ a mailbox that was already read is not re-read from scratch.
 
     OASIS_INTERVAL      seconds between sweeps (default 300)
     OASIS_THREADS       seed the concurrency (unset = sized to the machine)
-    OASIS_LOOKBACK_DAYS how far back the first sweep looks (default 30, 0 = all)
+    OASIS_BALLOT_CUTOFF when registration closed; mail older than this only
+                        proves the entry was made, never that it won
     OASIS_PER_PAGE      messages read per mailbox (default 20)
     OASIS_SKIP_HITS     "0" keeps checking mailboxes that already hit
     OASIS_DEBUG         "1" logs tracebacks on failure
@@ -106,7 +107,7 @@ def log(level, msg):
 ENV_KEYS = {
     "OASIS_INTERVAL": "interval",
     "OASIS_THREADS": "threads",
-    "OASIS_LOOKBACK_DAYS": "lookback_days",
+    "OASIS_BALLOT_CUTOFF": "ballot_cutoff",
     "OASIS_PER_PAGE": "per_page",
     "OASIS_LIMIT": "limit",
     "OASIS_MAIL_FILTER": "mail_filter",
@@ -118,7 +119,7 @@ ENV_KEYS = {
     "OASIS_ALIAS_INBOX": "alias_inbox",
     "OASIS_ALIAS_PASSWORD": "alias_inbox_password",
 }
-_INT_KEYS = ("interval", "threads", "lookback_days", "per_page", "limit")
+_INT_KEYS = ("interval", "threads", "per_page", "limit")
 _BOOL_KEYS = ("debug", "skip_hits", "mail_filter", "only_opted")
 
 
@@ -382,7 +383,7 @@ def main():
                  else f"全部 {st.get('total', 0)}")
         log("info", f"巡检 {sweeps}：范围 {scope}/{st.get('total', 0)} · "
                     f"并发 {conf.get('threads')} · 间隔 {interval}s · "
-                    f"回看 {conf.get('lookback_days')} 天"
+                    f"注册截止 {conf.get('ballot_cutoff')}"
                     + (f" · 本轮上限 {conf.get('limit')} 个"
                        if conf.get("limit") else ""))
         try:
@@ -390,8 +391,7 @@ def main():
             # 都没做，而日志上看起来跑过了 —— 上一轮卡住的线程正是这种情况。
             if not monitor.start(threads=int(conf.get("threads") or 2),
                                  interval=interval,
-                                 lookback_days=float(
-                                     conf.get("lookback_days") or 0),
+                                 cutoff=conf.get("ballot_cutoff"),
                                  per_page=int(conf.get("per_page") or 20),
                                  skip_hits=bool(conf.get("skip_hits", True)),
                                  limit=int(conf.get("limit") or 0),

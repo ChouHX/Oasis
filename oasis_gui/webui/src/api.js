@@ -77,9 +77,9 @@ export const STATUS_FILTER = [
   { value: "error", label: "读信失败" },
 ];
 
-// 中签证据。后端每个中签行都带 label，这份映射只用于筛选与图例。
+// 中签证据。只剩一个来源：注册截止之后的 Oasis 来信。曾经还有「成功邮件」与
+// 「站点已确认」，那两个描述的其实是**预约成功** —— 把它们当中签，会让名单上
+// 出现几百个「已中签」而它们一张票都没有。
 export const SOURCE = {
-  "success-mail": { label: "成功邮件", color: "#52c41a" },
-  "oasis-mail": { label: "Oasis 来信", color: "#13c2c2" },
-  "site-ok": { label: "站点已确认（无成功邮件）", color: "#fa8c16" },
+  "oasis-mail": { label: "结果信", color: "#52c41a" },
 };

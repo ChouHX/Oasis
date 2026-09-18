@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """判定链路回归：拿假收件箱跑真实的 monitor，逐条断言结论。
 
-离线，不碰网络，也不需要凭据。改判定规则后先跑它。
+重点在「预约」与「中签」的分界：注册截止（2026-09-17 16:00 BST）之前收到的每一
+封信只说明预约成功，之后收到的 Oasis 来信才是结果。离线，不碰网络。
 
     python3 tests/test_hitcheck.py
 """
@@ -25,43 +26,92 @@ for suffix in ("", "-wal", "-shm"):
     except OSError:
         pass
 
-NOW = time.time()
+CUTOFF = hitcheck.parse_cutoff(hitcheck.DEFAULT_CUTOFF)
+assert CUTOFF, "截止时间必须解析得出来"
 
 
-def mail(subject, body, sender="Oasis <oasis_at_openstageit_com_9f2@icloud.com>",
-         age_days=0.0):
-    return Mail(subject=subject, sender=sender, body=body,
-                stamp=NOW - age_days * 86400, folder="inbox")
+def before(days=1.0):
+    return CUTOFF - days * 86400
 
 
+def after(days=1.0):
+    return CUTOFF + days * 86400
+
+
+def mail(subject, body, stamp,
+         sender="Oasis <oasis@openstageit.com>"):
+    return Mail(subject=subject, sender=sender, body=body, stamp=stamp,
+                folder="inbox")
+
+
+# --- 注册期的信：三封都在截止之前 -------------------------------------------
 SUCCESS = mail("=?UTF-8?Q?Oasis_Live_=E2=80=9927_Registration_Complete?=",
-               "<p>You have successfully registered for Oasis Live '27.</p>")
+               "<p>You have successfully registered for Oasis Live '27.</p>",
+               before(1))
 VERIFY = mail("=?UTF-8?Q?Verify_Your_Email?=",
               '<a href="https://oasis.hq.fan/registration?token=abc.def-123">'
-              "click the button</a>")
+              "click the button</a>", before(1))
 OLD_VERIFY = mail("Verify Your Email",
-                  'https://oasis.hq.fan/registration?token=old.1', age_days=120)
-FOREIGN = mail("Your LA28 draw result", "You were not selected.",
+                  "https://oasis.hq.fan/registration?token=old.1", before(120))
+FOREIGN = mail("Your LA28 draw result", "You were not selected.", before(0.5),
                sender="LA28 <no-reply@la28.org>")
+# 一封「结果信」造型的信，但时间戳在截止之前 —— 它仍然不算中签。
+EARLY_RESULT = mail("Oasis Live '27 — your ballot result",
+                    "<p>Details about your entry are below.</p>", before(0.5))
+# 真正的结果信：截止之后到达。
 RESULT = mail("Oasis Live '27 — your ballot result",
-              "<p>Thanks for taking part in the Oasis Live '27 ballot. "
-              "Details about your entry are below.</p>")
+              "<p>You have been successful in the Oasis Live '27 ballot.</p>",
+              after(1))
+
+store = Store(DB)
+lines = [
+    "a-registered@outlook.com----p----cid----rt",     # 只有注册成功邮件
+    "b-verify@outlook.com----p----cid----rt",         # 只有验证信
+    "c-old@outlook.com----p----cid----rt",            # 只有很久以前的验证信
+    "d-foreign@outlook.com----p----cid----rt",        # 只有别家邮件
+    "e-nomail@outlook.com----p----cid----rt",         # confirm OK 无邮件
+    "f-page@outlook.com----p----cid----rt",           # 页面确认
+    "g-broken@outlook.com----p----cid----rt",         # 读信失败
+    "h-result@outlook.com----p----cid----rt",         # 截止后的结果信
+    "i-early@outlook.com----p----cid----rt",          # 截止前的「结果信」
+]
+added, dup = store.add_mailboxes(lines, "graph", opted_in=True)
+assert added == 9, (added, dup)
+
+by_email = {r["email"]: r for r in store.accounts()}
+store._write(lambda c: c.execute(
+    "UPDATE accounts SET status='failed', error=? WHERE id=?",
+    ("confirm answered OK but the success mail never arrived within 180s",
+     by_email["e-nomail@outlook.com"]["id"])))
+store._write(lambda c: c.execute(
+    "UPDATE accounts SET status='submitted', error='页面确认注册成功' WHERE id=?",
+    (by_email["f-page@outlook.com"]["id"],)))
+
+INBOX = {
+    "a-registered@outlook.com": [SUCCESS],
+    "b-verify@outlook.com": [VERIFY],
+    "c-old@outlook.com": [OLD_VERIFY],
+    "d-foreign@outlook.com": [FOREIGN],
+    "e-nomail@outlook.com": [],
+    "f-page@outlook.com": [],
+    "g-broken@outlook.com": [],
+    "h-result@outlook.com": [RESULT],
+    "i-early@outlook.com": [EARLY_RESULT],
+}
+built = []
 
 
 class FakeMailbox:
-    """Reader stand-in: hands back whatever the case says is in the inbox.
+    """Reader stand-in：按当前 self.email 现查现取（别名共享连接时靠换 email 复用）。
 
-    按 self.email 现查现取，而不是构造时固定 —— 真实的 GmailAliasMailbox 就是
-    每次用 self.email 去 SEARCH TO <alias>，共享连接的别名靠换 email 复用。
+    `not_before` 照服务端 SINCE 的语义过滤 —— 真实 reader 会把它下推给服务端，
+    所以这里也必须这么做，否则测不出「截止前的信根本不会被拉回来」。
     """
 
-    def __init__(self, email, mails, boom=False):
+    def __init__(self, email):
         self.email = email
-        self._boom = boom
-        self.closed = False
-        self.calls = 0
-        # 每次读都记下「有没有要求服务端只回 Oasis 的信」，用来断言粗筛的下推。
         self.filters = []
+        self.calls = 0
 
     def messages(self, limit=12, not_before=None, only_oasis=False):
         self.calls += 1
@@ -75,103 +125,65 @@ class FakeMailbox:
         return out[:limit]
 
     def close(self):
-        self.closed = True
-
-
-store = Store(DB)
-lines = [
-    "a-success@outlook.com----p----cid----rt",          # A 成功邮件
-    "b-oasis@outlook.com----p----cid----rt",            # B Oasis 新来信
-    "c-old@outlook.com----p----cid----rt",              # C 只有基线前的旧信
-    "d-foreign@outlook.com----p----cid----rt",          # D 只有别家邮件
-    "g-broken@outlook.com----p----cid----rt",           # G 读信失败
-    "h-result@outlook.com----p----cid----rt",           # H 结果信（无成功标记）
-]
-added, dup = store.add_mailboxes(lines, "graph", opted_in=True)
-assert added == 6, (added, dup)
-
-# E: 那条被旧程序写成失败的记录 —— 用户点名要 merge 的一类
-store.add_mailboxes(["e-nomail@outlook.com----p----cid----rt"], "graph", opted_in=True)
-e_id = [r for r in store.accounts() if r["email"] == "e-nomail@outlook.com"][0]["id"]
-store._write(lambda c: c.execute(
-    "UPDATE accounts SET status='failed', error=? WHERE id=?",
-    ("confirm answered OK but the success mail never arrived within 180s",
-     e_id)))
-
-# F: 浏览器模式留下的「页面确认」记录
-store.add_mailboxes(["f-page@outlook.com----p----cid----rt"], "graph", opted_in=True)
-f_id = [r for r in store.accounts() if r["email"] == "f-page@outlook.com"][0]["id"]
-store._write(lambda c: c.execute(
-    "UPDATE accounts SET status='submitted', error='页面确认注册成功' WHERE id=?",
-    (f_id,)))
-
-# 同收件箱的三条 iCloud 别名：必须共用一个 reader（分组复用）
-alias_lines = [f"alias{i}@icloud.com----owner@gmail.com----app-pass----gmail-imap"
-               for i in range(3)]
-store.add_mailboxes(alias_lines, "auto", opted_in=True)
-first_alias = [r for r in store.accounts() if r["email"] == "alias0@icloud.com"][0]
-store._write(lambda c: c.execute(
-    "UPDATE accounts SET baseline_at=? WHERE email LIKE '%@icloud.com'",
-    (0.0,)))
-
-INBOX = {
-    "a-success@outlook.com": [SUCCESS],
-    "b-oasis@outlook.com": [VERIFY],
-    "c-old@outlook.com": [OLD_VERIFY],
-    "d-foreign@outlook.com": [FOREIGN],
-    "g-broken@outlook.com": [],
-    "e-nomail@outlook.com": [],
-    "f-page@outlook.com": [],
-    "alias0@icloud.com": [SUCCESS],
-    "alias1@icloud.com": [FOREIGN],
-    "alias2@icloud.com": [VERIFY],
-    "h-result@outlook.com": [RESULT],
-}
-built = []
+        pass
 
 
 def fake_make_mailbox(cred, protocol="graph", proxy_url=""):
-    mb = FakeMailbox(cred["email"], INBOX.get(cred["email"], []),
-                     boom=cred["email"] == "g-broken@outlook.com")
+    mb = FakeMailbox(cred["email"])
     built.append(mb)
     return mb
 
 
 monitor_mod.make_mailbox = fake_make_mailbox
-logs = []
-mon = monitor_mod.HitMonitor(store, lambda lvl, msg: logs.append((lvl, msg)),
-                             lambda kind, payload=None: None, {})
+LOGS = []
+mon = monitor_mod.HitMonitor(store, lambda lvl, msg: LOGS.append((lvl, msg)),
+                             lambda kind, payload=None: None,
+                             {"threads": 2, "per_page": 20})
+mon.cutoff = CUTOFF
 mon.sweep()
 
 results = {r["email"]: r for r in store.accounts()}
 checks = [
-    ("a-success@outlook.com", hitcheck.SOURCE_SUCCESS_MAIL, "成功邮件"),
-    ("b-oasis@outlook.com", None, "注册期验证信不算中签"),
-    ("c-old@outlook.com", None, "基线前的旧信不算"),
+    ("h-result@outlook.com", hitcheck.SOURCE_OASIS_MAIL, "截止后收到结果信"),
+    ("i-early@outlook.com", None, "截止前收到的「结果信」不算"),
+    ("a-registered@outlook.com", None, "Registration Complete 只是预约成功"),
+    ("b-verify@outlook.com", None, "验证信不算"),
+    ("c-old@outlook.com", None, "很久以前的验证信不算"),
     ("d-foreign@outlook.com", None, "别家邮件不算"),
-    ("e-nomail@outlook.com", hitcheck.SOURCE_SITE_OK, "confirm OK 无邮件也判成功"),
-    ("f-page@outlook.com", hitcheck.SOURCE_SITE_OK, "页面确认也判成功"),
-    ("alias0@icloud.com", hitcheck.SOURCE_SUCCESS_MAIL, "别名成功邮件"),
-    ("alias2@icloud.com", None, "别名验证信不算中签"),
-    ("h-result@outlook.com", hitcheck.SOURCE_OASIS_MAIL, "无成功标记的结果信仍算中签"),
+    ("e-nomail@outlook.com", None, "confirm OK 无邮件只是预约成功"),
+    ("f-page@outlook.com", None, "页面确认只是预约成功"),
 ]
 ok = True
 for email, want, why in checks:
     got = results[email].get("hit_source")
-    mark = "OK " if got == want else "FAIL"
-    if got != want:
-        ok = False
-    print(f"[{mark}] {email:26} want={str(want):14} got={str(got):14} ({why})")
+    good = got == want
+    ok = ok and good
+    print(f"[{'OK ' if good else 'FAIL'}] {email:24} want={str(want):14} "
+          f"got={str(got):14} ({why})")
 
 broken = results["g-broken@outlook.com"]
-print(f"[{'OK ' if broken['check_error'] and not broken['hit_at'] else 'FAIL'}] "
-      f"读信失败只记错误、不判中签：{broken['check_error']}")
-if not (broken["check_error"] and not broken["hit_at"]):
-    ok = False
+err_ok = bool(broken["check_error"]) and not broken["hit_at"]
+print(f"[{'OK ' if err_ok else 'FAIL'}] 读信失败只记错误、不判中签："
+      f"{broken['check_error']}")
+ok = ok and err_ok
 
-# 分组：承载收件箱的是 client_id，所以只有 client_id 相同的别名才共用连接。
-# 缺 client_id 的行（老格式、手工粘贴少字段）必须各自一组 —— 拼在一起等于拿
-# A 的收件箱密码去登 B 的别名，读到的要么是别人的邮箱要么是登录失败。
+# 「预约过」的推断：三类旧痕迹都要落成 opted_in，且都不是中签
+legacy = store.mark_unmarked(on=False)          # 先把导入时的标记撤掉
+after_off = {r["email"]: bool(r.get("opted_in")) for r in store.accounts()}
+store.migrate_legacy()
+inferred = {r["email"]: bool(r.get("opted_in")) for r in store.accounts()}
+want_inferred = {"e-nomail@outlook.com": True, "f-page@outlook.com": True}
+inf_ok = all(inferred[e] == v for e, v in want_inferred.items())
+print(f"[{'OK ' if inf_ok else 'FAIL'}] 旧痕迹推断为已预约"
+      f"（confirm OK → {inferred['e-nomail@outlook.com']}，页面确认 → "
+      f"{inferred['f-page@outlook.com']}）")
+ok = ok and inf_ok
+hits_now = store.stats()["hits"]
+hit_ok = hits_now == 1          # 只有那封截止后的结果信
+print(f"[{'OK ' if hit_ok else 'FAIL'}] 全库中签数 {hits_now}（应只有结果信那一封）")
+ok = ok and hit_ok
+
+# 别名分组：同一收件箱合一，缺 client_id 的各自成组
 mixed = monitor_mod.HitMonitor._group([
     {"id": 1, "email": "a@icloud.com", "protocol": "alias-imap",
      "client_id": "owner@gmail.com"},
@@ -186,43 +198,27 @@ sizes = [len(g) for g in mixed]
 group_ok = sizes == [2, 1, 1]
 print(f"[{'OK ' if group_ok else 'FAIL'}] 别名分组：同一收件箱合一，缺 client_id 的"
       f"各自成组（{sizes}）")
-if not group_ok:
-    ok = False
+ok = ok and group_ok
 
-# 分组复用：3 条别名共用一个收件箱 -> 只该建 1 个 reader
-alias_readers = [m for m in built if m.email in
-                 ("alias0@icloud.com", "alias1@icloud.com", "alias2@icloud.com")]
-print(f"[{'OK ' if len(alias_readers) == 1 else 'FAIL'}] "
-      f"同收件箱别名复用连接：建了 {len(alias_readers)} 个 reader（应为 1）")
-if len(alias_readers) != 1:
-    ok = False
-
-# 粗筛下推：首次读一个账号要全量（保证不漏掉已经发过的结果信），
-# 之后才让服务端只回 Oasis 的信。
-probe_email = "d-foreign@outlook.com"
-reads = [m.filters for m in built if m.email == probe_email]
-first_pass = reads[0] if reads else []
-
-# 幂等：再扫一轮，中签结论不变、不会被抹掉
+# 幂等：再扫一轮，结论不变
+before_hits = {r["email"]: r.get("hit_source") for r in store.accounts()}
 mon2 = monitor_mod.HitMonitor(store, lambda lvl, msg: None,
                               lambda kind, payload=None: None, {})
+mon2.cutoff = CUTOFF
 mon2.sweep()
-reads = [m.filters for m in built if m.email == probe_email]
-later = reads[1] if len(reads) > 1 else []
-filter_ok = first_pass == [False] and later == [True]
-print(f"[{'OK ' if filter_ok else 'FAIL'}] 首次全量、其后服务端粗筛"
-      f"（首轮 {first_pass}，次轮 {later}）")
-if not filter_ok:
-    ok = False
-
 again = {r["email"]: r.get("hit_source") for r in store.accounts()}
-stable = all(again[e] == w for e, w, _ in checks)
+stable = all(again[e] == before_hits[e] for e in before_hits)
 print(f"[{'OK ' if stable else 'FAIL'}] 第二轮不改变已有结论")
-if not stable:
-    ok = False
+ok = ok and stable
+
+# 粗筛下推：首次读一个账号要全量，之后才让服务端只回 Oasis 的信
+probe = [m.filters for m in built if m.email == "d-foreign@outlook.com"]
+filter_ok = len(probe) >= 2 and probe[0] == [False] and probe[1] == [True]
+print(f"[{'OK ' if filter_ok else 'FAIL'}] 首次全量、其后服务端粗筛（{probe[:2]}）")
+ok = ok and filter_ok
 
 stats = store.stats()
 print(f"\nstats: {stats}")
-print(f"hits (ordered): {[(h['email'], h['hit_source']) for h in store.hits()]}")
+print(f"hits: {[(h['email'], h['hit_source']) for h in store.hits()]}")
 print("RESULT:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

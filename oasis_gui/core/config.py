@@ -18,6 +18,8 @@ RETIRED_KEYS = (
     "proxies", "front_proxy", "google_proxy",
     # 从没接到 monitor 上过：账号之间的停顿由 monitor 的 PAGE_GAP 承担。
     "delay_between",
+    # 被 ballot_cutoff 取代：判定基线现在是「注册截止」，不再是一个回看天数。
+    "lookback_days",
 )
 
 DEFAULTS = {
@@ -31,10 +33,11 @@ DEFAULTS = {
     # 同时打开几条收件箱连接 —— 不是同时读几封信：同一个 Gmail 收件箱下的别名
     # 共用一条连接，组与组之间才并行。
     "threads": 2,
-    # 首次检测回看多少天。活动已经结束，中签结果很可能早就发出去了，这个窗口
-    # 必须覆盖「结果可能已发」的那段时间；设为 0 = 不设基线，邮箱里所有 Oasis
-    # 来信都算数。
-    "lookback_days": 30,
+    # 注册截止时间（UTC）。Oasis 官方：Registration closes on Thursday
+    # 17 September at 4pm BST == 15:00 UTC。中签结果信只可能出现在这之后，
+    # 此前的每一封 Oasis 信都只是「预约成功」的回声 —— 判定把它当作硬门槛。
+    # 格式：2026-09-17T15:00:00Z（也可写成本地时间的 2026-09-17 23:00）。
+    "ballot_cutoff": "2026-09-17T15:00:00Z",
     # 每个邮箱取最近多少封信来判断。
     "per_page": 20,
     # 只检测「预约过」的地址。没预约过的邮箱不会收到中签信，扫它纯属浪费 ——

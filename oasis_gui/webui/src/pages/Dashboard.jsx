@@ -91,7 +91,7 @@ export default function Dashboard({ state, refresh }) {
   const { message } = AntApp.useApp();
   const [threads, setThreads] = useState(2);
   const [interval, setInterval] = useState(300);
-  const [lookback, setLookback] = useState(30);
+
   const [skipHits, setSkipHits] = useState(true);
   const [mailFilter, setMailFilter] = useState(true);
   const [onlyOpted, setOnlyOpted] = useState(true);
@@ -112,7 +112,7 @@ export default function Dashboard({ state, refresh }) {
     seeded.current = true;
     if (c.threads) setThreads(c.threads);
     if (c.interval) setInterval(c.interval);
-    if (c.lookback_days !== undefined) setLookback(c.lookback_days);
+
     if (c.skip_hits !== undefined) setSkipHits(!!c.skip_hits);
     if (c.mail_filter !== undefined) setMailFilter(!!c.mail_filter);
     if (c.only_opted !== undefined) setOnlyOpted(!!c.only_opted);
@@ -135,11 +135,6 @@ export default function Dashboard({ state, refresh }) {
 
   const changeThreads = (v) => { setThreads(v); if (v) persist({ threads: v }); };
   const changeInterval = (v) => { setInterval(v); if (v) persist({ interval: v }); };
-  const changeLookback = (v) => {
-    const n = Math.max(0, v || 0);
-    setLookback(n);
-    persist({ lookback_days: n });
-  };
   const changeSkipHits = (v) => { setSkipHits(v); persist({ skip_hits: v }); };
   const changeMailFilter = (v) => { setMailFilter(v); persist({ mail_filter: v }); };
   const changeOnlyOpted = (v) => { setOnlyOpted(v); persist({ only_opted: v }); };
@@ -205,10 +200,9 @@ export default function Dashboard({ state, refresh }) {
             </Tooltip>
           </Space>
           <Space size={6}>
-            <Text type="secondary">首次回看（天）</Text>
-            <InputNumber min={0} max={3650} value={lookback}
-                         onChange={changeLookback} style={{ width: 104 }} />
-            <Tooltip title="首次检测回看多少天。活动已经结束，中签结果很可能早就发出去了，这个窗口要覆盖「结果可能已发」的那段时间；0 = 不设基线，邮箱里所有 Oasis 来信都算数。">
+            <Text type="secondary">注册截止</Text>
+            <Text code style={{ fontSize: 12 }}>{state?.cutoff || "—"}</Text>
+            <Tooltip title="Oasis 官方：Registration closes on Thursday 17 September at 4pm BST / 5pm CEST / 8am PT / 11am ET。中签结果信只可能出现在这之后 —— 此前的每一封 Oasis 来信都只说明「预约成功了」，一张票都没拿到。在设置页可以改这个时间。">
               <QuestionCircleOutlined style={{ color: "#8c8c8c" }} />
             </Tooltip>
           </Space>
@@ -236,8 +230,8 @@ export default function Dashboard({ state, refresh }) {
             loading={busy}
             disabled={state?.running}
             onClick={() => run(
-              () => api.start({ threads, interval, lookback_days: lookback,
-                                skip_hits: skipHits, mail_filter: mailFilter,
+              () => api.start({ threads, interval, skip_hits: skipHits,
+                                mail_filter: mailFilter,
                                 only_opted: onlyOpted }),
               "已开始检测")}
           >
@@ -267,6 +261,10 @@ export default function Dashboard({ state, refresh }) {
         </Space>
         <div style={{ marginTop: 10 }}>
           <Text type="secondary" style={{ fontSize: 12 }}>
+            只有 <Text strong>注册截止之后</Text> 收到的 Oasis 来信才算中签 ——
+            截止前的信（含那封 Registration Complete）只证明预约成功。
+            「已中签 0」在没有结果信之前是正常值。
+            <br />
             检测只读邮箱，不向站点发任何请求。
             {host.total_mb
               ? ` 内存 ${host.total_mb - host.available_mb} / ${host.total_mb} MB 在用 · 可用 ${host.available_mb} MB · ${host.cores} 核 —— ${host.reason}`

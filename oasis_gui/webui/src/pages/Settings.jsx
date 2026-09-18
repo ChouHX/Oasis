@@ -14,6 +14,11 @@ const FIELDS = [
   { key: "per_page", label: "每箱取信（封）", type: "int",
     hint: "每个邮箱取最近多少封信来判断。判据是「Oasis 来信」本身，" +
           "所以不需要把整箱读完。" },
+  { key: "ballot_cutoff", label: "注册截止时间", type: "text", wide: true,
+    hint: "Oasis 官方：Registration closes on Thursday 17 September at 4pm BST " +
+          "（= 15:00 UTC）。中签结果信只可能出现在这之后，此前的每一封 Oasis " +
+          "来信都只说明「预约成功了」—— 判定把它当硬门槛。格式 " +
+          "2026-09-17T15:00:00Z，也可以写成不带时区的本地时间。" },
   { key: "only_opted", label: "只检测已预约的地址", type: "bool",
     hint: "没预约过的邮箱不会收到中签信，所以默认只检测标记为「已预约」的账号 —— " +
           "判定来自上一版程序留下的成功记录（打开库时自动并入）、导入时的勾选、" +

@@ -141,13 +141,9 @@ LEVEL_COLOR = {
     "error": "#d64545", "debug": "#7a6ad8", "time": "#5a8fd8",
 }
 
-# 中签检测没有「模式」可选：唯一的动作是读邮箱，通道由账号自己的
-# protocol 决定（graph / imap / alias-imap / hme），不需要操作者选。
-HIT_COLORS = {
-    hitcheck.SOURCE_SUCCESS_MAIL: "#1f9d55",
-    hitcheck.SOURCE_OASIS_MAIL: "#3fa88a",
-    hitcheck.SOURCE_SITE_OK: "#c8871a",
-}
+# 中签只有一个来源：注册截止之后收到的 Oasis 结果信。曾经还有「成功邮件」与
+# 「站点已确认」，那两个描述的其实是预约成功 —— 把它们当中签，名单上就会出现
+# 几百个「已中签」而它们一张票都没拿到。
 
 
 class Bridge(QObject):
@@ -349,16 +345,15 @@ class DashboardPage(ScrollArea):
             "一轮跑完到下一轮开始之间的等待。中签通知不是秒级事件，\n"
             "频率再高只是把对方的收件箱打成请求尖峰。")
         cl.addWidget(self.interval)
-        cl.addWidget(BodyLabel("回看天"))
-        self.lookback = CompactSpinBox()
-        self.lookback.setRange(0, 3650)
-        self.lookback.setValue(int(win.cfg.get("lookback_days", 30)))
-        self.lookback.setFixedWidth(96)
-        self.lookback.setToolTip(
-            "首次检测回看多少天。活动已经结束，中签结果很可能早就发出去了，\n"
-            "这个窗口要覆盖「结果可能已发」的那段时间；0 = 不设基线，\n"
-            "邮箱里所有 Oasis 来信都算数。")
-        cl.addWidget(self.lookback)
+        cl.addWidget(BodyLabel("注册截止"))
+        self.cutoff_label = BodyLabel(self.cutoff_text())
+        self.cutoff_label.setFixedWidth(126)
+        self.cutoff_label.setToolTip(
+            "Oasis 官方：Registration closes on Thursday 17 September at 4pm BST\n"
+            "（= 15:00 UTC）。中签结果信只可能出现在这之后 —— 此前的每一封\n"
+            "Oasis 来信都只说明「预约成功了」，一张票都没拿到。\n"
+            "在「设置」页可以改这个时间。")
+        cl.addWidget(self.cutoff_label)
         self.btn_start = PrimaryPushButton(FIF.PLAY, "开始检测")
         self.btn_start.clicked.connect(self.on_start)
         cl.addWidget(self.btn_start)
@@ -399,6 +394,13 @@ class DashboardPage(ScrollArea):
         root.addWidget(recent)
         root.addStretch(1)
 
+    def cutoff_text(self):
+        """配置里的注册截止时间，解析成人能看的本地时间。"""
+        raw = self.win.cfg.get("ballot_cutoff") or hitcheck.DEFAULT_CUTOFF
+        epoch = hitcheck.parse_cutoff(raw, default=hitcheck.parse_cutoff(
+            hitcheck.DEFAULT_CUTOFF))
+        return hitcheck.format_cutoff(epoch) or str(raw)
+
     def idle_hint(self):
         """Readiness line: says what is still missing rather than 'ready'."""
         s = self.win.store.stats()
@@ -409,12 +411,10 @@ class DashboardPage(ScrollArea):
         if not s.get("opted", 0):
             return ("池子里还没有已预约的账号 —— 到「邮箱池」勾上要查的地址点"
                     "「所选标为已预约」，或导入时勾选「标记为已预约」。")
-        if s.get("hits"):
-            return (f"{scope} · 已中签 {s['hits']} · 未检测 "
-                    f"{s.get('unchecked', 0)} · 并发 {self.threads.value()} · "
-                    f"每 {self.interval.value()}s 一轮")
-        return (f"{scope} · 并发 {self.threads.value()} · "
-                f"每 {self.interval.value()}s 一轮")
+        tail = (f" · 已中签 {s['hits']}" if s.get("hits") else "")
+        return (f"{scope} · 未检测 {s.get('unchecked', 0)}{tail} · "
+                f"截止 {self.cutoff_text()}（此前的来信只算预约）· "
+                f"并发 {self.threads.value()} · 每 {self.interval.value()}s 一轮")
 
     def refresh_host(self):
         """内存 + 推荐并发数。检测程序不吃内存，瓶颈在上游并发限制。"""
@@ -443,8 +443,7 @@ class DashboardPage(ScrollArea):
 
     # ----------------------------------------------------------------- control
     def on_start(self):
-        self.win.start_monitor(self.threads.value(), self.interval.value(),
-                               self.lookback.value())
+        self.win.start_monitor(self.threads.value(), self.interval.value())
 
     def on_check_now(self):
         self.win.check_now()
@@ -782,13 +781,15 @@ class SettingsPage(ScrollArea):
         self.threads.setToolTip(
             "同时打开几条收件箱连接。同一 Gmail 收件箱下的 iCloud 别名共用一条，\n"
             "所以这是并发连接数，不是「同时读几封信」。")
-        self.lookback_days = CompactSpinBox()
-        self.lookback_days.setRange(0, 3650)
-        self.lookback_days.setValue(int(win.cfg.get("lookback_days", 30)))
-        self.lookback_days.setFixedWidth(110)
-        self.lookback_days.setToolTip(
-            "首次检测回看多少天；0 = 不设基线，邮箱里所有 Oasis 来信都算数。\n"
-            "活动已结束，中签结果可能早就发过了，这个窗口决定那些信算不算新信。")
+        self.ballot_cutoff = LineEdit()
+        self.ballot_cutoff.setFixedWidth(260)
+        self.ballot_cutoff.setText(str(win.cfg.get("ballot_cutoff")
+                                      or hitcheck.DEFAULT_CUTOFF))
+        self.ballot_cutoff.setToolTip(
+            "Oasis 官方：Registration closes on Thursday 17 September at 4pm BST\n"
+            "（= 15:00 UTC）。中签结果信只可能出现在这之后 —— 此前的每一封 Oasis\n"
+            "来信都只说明「预约成功了」，一张票都没拿到。判定把它当硬门槛。\n"
+            "格式 2026-09-17T15:00:00Z，也可以写成不带时区的本地时间。")
         self.per_page = CompactSpinBox()
         self.per_page.setRange(1, 200)
         self.per_page.setValue(int(win.cfg.get("per_page", 20)))
@@ -817,7 +818,7 @@ class SettingsPage(ScrollArea):
 
         rows = [("检测间隔(秒)", self.interval),
                 ("并发连接数", self.threads),
-                ("首次回看(天)", self.lookback_days),
+                ("注册截止时间", self.ballot_cutoff),
                 ("每箱取信(封)", self.per_page),
                 ("跳过已中签", self.skip_hits),
                 ("只查已预约的", self.only_opted),
@@ -909,7 +910,8 @@ class SettingsPage(ScrollArea):
         self.win.cfg.update({
             "interval": self.interval.value(),
             "threads": self.threads.value(),
-            "lookback_days": self.lookback_days.value(),
+            "ballot_cutoff": self.ballot_cutoff.text().strip()
+                             or hitcheck.DEFAULT_CUTOFF,
             "per_page": self.per_page.value(),
             "skip_hits": self.skip_hits.isChecked(),
             "only_opted": self.only_opted.isChecked(),
@@ -1193,25 +1195,29 @@ class MainWindow(FluentWindow):
             self.dash.run_hint.setText(self.dash.idle_hint())
 
     # ----------------------------------------------------------------- control
-    def start_monitor(self, threads, interval, lookback_days):
+    def start_monitor(self, threads, interval):
         s = self.store.stats()
         if not s.get("total", 0):
             self.notify("warning", "账号池是空的 —— 先到「邮箱池」导入账号")
             return
-        self.cfg.update({"threads": int(threads),
-                         "interval": int(interval),
-                         "lookback_days": int(lookback_days)})
+        if not s.get("opted", 0):
+            self.notify("warning",
+                        "还没有已预约的账号 —— 到「邮箱池」把要查的标进来")
+            return
+        self.cfg.update({"threads": int(threads), "interval": int(interval)})
         self.cfg.save()
         self.monitor.config = self.cfg.data
         self.dash.btn_start.setEnabled(False)
         self.dash.btn_stop.setEnabled(True)
         self.dash.run_hint.setText(
             f"检测中：并发 {threads} · 每 {interval}s 一轮 · "
-            f"首次回看 {lookback_days} 天")
+            f"注册截止 {self.dash.cutoff_text()}（此前的来信只算预约）")
         self.monitor.start(threads=int(threads), interval=int(interval),
-                           lookback_days=float(lookback_days),
                            per_page=int(self.cfg.get("per_page", 20)),
-                           skip_hits=bool(self.cfg.get("skip_hits", True)))
+                           skip_hits=bool(self.cfg.get("skip_hits", True)),
+                           mail_filter=bool(self.cfg.get("mail_filter", True)),
+                           only_opted=bool(self.cfg.get("only_opted", True)),
+                           cutoff=self.cfg.get("ballot_cutoff"))
 
     def check_now(self):
         """不等下一个间隔，立刻跑一轮。"""
@@ -1222,8 +1228,7 @@ class MainWindow(FluentWindow):
             self.monitor.wake()
             self.notify("info", "已排队：当前轮结束后立刻再查一轮")
             return
-        self.start_monitor(self.dash.threads.value(), self.dash.interval.value(),
-                           self.dash.lookback.value())
+        self.start_monitor(self.dash.threads.value(), self.dash.interval.value())
 
     def stop_monitor(self):
         self.monitor.stop()

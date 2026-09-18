@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
-"""中签判定：把「收件箱里的一封信」和「库里的一条旧记录」折算成同一个结论。
+"""中签判定：只有「注册截止之后收到的 Oasis 结果信」才算中签。
 
-活动结束后这套程序只做一件事 —— 盯着已预约账号的收件箱，看 Oasis 有没有来信。
-判定必须合并两路证据，因为现场同时存在这两种已成交的账号：
+预约与中签是两件事，把它们混起来是这个程序犯过的最大一个错：
 
-  1. 邮件证据：Oasis 来信。正文含成功标记的（实测 4/4 成功信含
-     "successfully registered"，0/15 验证信含）是硬证据；其余只要确实是 Oasis
-     发来的新信，也按「新来信」计入 —— 活动结束后 Oasis 不会无缘无故再发信。
+  * **预约（registration）** 在 2026-09-17 16:00 BST 截止。注册期内收到的每一封
+    信 —— 包括那封写着 "successfully registered" 的 Registration Complete ——
+    都只说明「这个地址预约成功了」，一张票都没拿到。
+  * **中签（ballot result）** 是 Oasis 之后发的结果通知，只可能出现在截止之后。
 
-  2. 站点证据（merge 点）：账号在上一版程序里已经被站点确认过，只是它没发成功
-     邮件。实测 `confirm` 对已接受的地址回 {"status":"OK"}，紧接着的成功邮件
-     却始终不来，旧程序把它记成
+上一版把注册成功当成中签，于是名单上出现几百个「已中签」。那不只是数字难看：
+那些账号会被 `skip_hits` 当成已经查过，真正的结果信到了反而不查。
 
-         confirm answered OK but the success mail never arrived within 180s
-
-     并按失败处理；浏览器模式更直接 —— 页面渲染出确认页、根本不发成功邮件，
-     旧程序记成 `submitted`。这两种记录的本质是同一件事：**站点已经收下了**。
-     活动已经结束，不可能再收到那封邮件，所以它们必须和中签信进同一张名单，
-     否则会被「没有成功邮件」这个假象整批吞掉。判定因此把
-     `submitted` 与带 `NO_MAIL_OK_MARK` 的错误文本一起折算成 `site-ok` 命中。
+判据因此只有一条硬的：**信比截止时间晚**。外加两条排除 —— 不是注册期那种带
+token 链接的验证信，也不是明说「注册成功」的信。注册截止之后 Oasis 不会无缘无故
+再发信，所以「截止后的新 Oasis 来信」就是结果。
 """
 import re
 
@@ -55,11 +50,17 @@ OASIS_STRINGS = (
     "oasis_live",
 )
 
-# --- 站点证据（merge 点） ---------------------------------------------------
-# registrar.py 在 confirm 返回 OK 却等不到成功邮件时抛出的原文片段。它字面上是
-# 个错误，语义上却是成功：站点已经接受，只是信没来。
+# --- 注册截止时间 -----------------------------------------------------------
+# Oasis 官方：Registration closes on Thursday 17 September at 4pm BST ——
+# 16:00 BST == 15:00 UTC。中签（结果）信只可能出现在这之后。
+DEFAULT_CUTOFF = "2026-09-17T15:00:00Z"
+
+# 上一版程序留下的、代表「站点已经接受这次预约」的痕迹。
+#
+# 它字面上是个错误（confirm 回了 OK 却等不到成功邮件），语义上却是成功 —— 只不
+# 过那个「成功」是**预约成功**，不是中签。现在它只用来推断「这个地址预约过」，
+# 不再作为中签依据。
 NO_MAIL_OK_MARK = "success mail never arrived"
-# 浏览器模式一条成功邮件都不发，页面确认就是唯一证据，旧程序记在这两句里。
 LEGACY_SITE_NOTES = ("页面确认注册成功", "SUCCESS")
 
 
@@ -116,77 +117,85 @@ def classify(mail):
     return "oasis"
 
 
-def legacy_site_ok(status, error="", response=""):
-    """这条账号记录是否代表「站点已经收下」？
+def parse_cutoff(value, default=None):
+    """把配置里的截止时间解析成 epoch。
 
-    覆盖三种旧记录，都是同一件事的不同写法：
-
-      * `submitted` —— 页面确认，没发成功邮件（浏览器模式一律如此）
-      * 错误文本含 NO_MAIL_OK_MARK —— confirm 回 OK，成功邮件 180s 没到
-      * 上面的错误被写进了 registrations.response
+    接受 `2026-09-17T15:00:00Z`（官方声明用的就是 UTC），也接受不带时区的
+    `2026-09-17 15:00` —— 后者按**本地时间**理解，因为那是操作者在界面上敲进去
+    的形状。解析不出来时退回 default，并且不抛：一个填错的截止时间不该让整个
+    检测停摆。
     """
-    blob = f"{error or ''}\n{response or ''}"
-    if NO_MAIL_OK_MARK in blob:
-        return True
-    if (status or "") == "submitted":
-        return True
-    if (status or "") == "failed":
-        return any(n in blob for n in LEGACY_SITE_NOTES)
-    return False
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        from datetime import datetime, timezone
+        iso = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()          # 无时区 -> 当成本地时间
+        return dt.timestamp()
+    except Exception:
+        return default
 
 
-def pick_oasis(mails, baseline_at=0.0, success_regardless=False):
-    """从一堆信里挑出这一账号的结论。
+def format_cutoff(epoch):
+    """epoch -> 本地时间 + 时区缩写，给人看。
 
-    baseline_at 之前的 Oasis 来信不算「新来信」—— 否则导入的账号会立刻被上一轮
-    活动留下的信糊满。但命中成功标记的信不看基线：那是结果本身，看见就算数。
-    验证信（kind == "verify"）永远不算中签，只登记为「最近来信」：那封信是注册
-    动作的回声，不是结果，把它当结果会让整张名单失去意义。
+    时区必须带上：官方说的是 16:00 BST，同一个时刻在 UTC 里是 15:00。只显示
+    「2026-09-17 15:00」，在一个 UTC 的容器里和在一个 +08:00 的机器上指的是
+    不同时刻 —— 而这个时间决定了哪些信算结果，含糊不得。
+    """
+    import time as _time
+    if not epoch:
+        return ""
+    return _time.strftime("%Y-%m-%d %H:%M %Z", _time.localtime(epoch)).strip()
 
-    `success_regardless` 关掉基线（回看窗口设为 0 时用），把所有历史 Oasis 来信
-    都纳进来。
+
+def pick_result(mails, cutoff_at):
+    """从一堆信里挑出这一账号的中签结论。
+
+    只认截止之后的非验证、非「注册成功」的 Oasis 来信。截止之前的信一律不计 ——
+    这就是「预约成功」与「中签」的分界线。
 
     返回 dict：
-        first_new   最新一封基线之后 Oasis 结果信的 epoch（没有则 None）
-        subject     那封信的标题
-        success     (stamp, subject) 命中成功标记的最早一封信
-        latest      (stamp, subject) 邮箱里最新一封 Oasis 来信（含验证信）
-        n_oasis     Oasis 来信封数（含验证信）
-        n_verify    其中验证信的封数
-        n_total     邮箱里看到的信的总数
+        result      (stamp, subject) 最早那封结果信（没有则 None）
+        latest      (stamp, subject) 邮箱里最新一封 Oasis 来信（含注册期的）
+        n_oasis     Oasis 来信封数
+        n_verify    其中验证信
+        n_early     其中早于截止时间的（预约期的回声）
+        n_total     看到的信的总数
     """
-    out = {"first_new": None, "subject": "", "success": None,
-           "latest": None, "n_oasis": 0, "n_verify": 0, "n_total": len(mails)}
+    out = {"result": None, "latest": None, "n_oasis": 0, "n_verify": 0,
+           "n_early": 0, "n_total": len(mails)}
     for mail in mails:
         kind = classify(mail)
         if not kind:
             continue
         out["n_oasis"] += 1
-        if kind == "verify":
-            out["n_verify"] += 1
         stamp = mail.stamp or 0
         if out["latest"] is None or stamp >= (out["latest"][0] or 0):
             out["latest"] = (stamp, mail.subject)
-        if kind == "success":
-            # 取最早的那封：同一件事重复投递时，最早的才是结果本体。
-            if out["success"] is None or stamp < out["success"][0]:
-                out["success"] = (stamp, mail.subject)
         if kind == "verify":
+            out["n_verify"] += 1
             continue
-        fresh = success_regardless or not baseline_at or stamp > baseline_at
-        if fresh and (out["first_new"] is None or stamp > out["first_new"]):
-            out["first_new"] = stamp
-            out["subject"] = mail.subject
+        if kind == "success":
+            # 明说「注册成功」的信：预约的证据，不是结果。
+            out["n_early"] += 1
+            continue
+        if cutoff_at and stamp <= cutoff_at:
+            out["n_early"] += 1
+            continue
+        if out["result"] is None or stamp < out["result"][0]:
+            out["result"] = (stamp, mail.subject)
     return out
 
 
-# --- 命中的来源标签，UI 与库里都用这三个值 --------------------------------
-SOURCE_SUCCESS_MAIL = "success-mail"   # 收到 Oasis 的成功/结果邮件
-SOURCE_OASIS_MAIL = "oasis-mail"       # 收到 Oasis 的其他新来信
-SOURCE_SITE_OK = "site-ok"             # 站点已确认、活动结束后不可能再收到成功邮件
+# --- 命中的来源标签 ---------------------------------------------------------
+# 只剩一个来源。曾经还有「成功邮件」与「站点已确认」，那两个描述的其实是**预约**
+# 成功 —— 把它们当中签，就是这一版要修的问题。
+SOURCE_OASIS_MAIL = "oasis-mail"
 
 SOURCE_LABEL = {
-    SOURCE_SUCCESS_MAIL: "成功邮件",
-    SOURCE_OASIS_MAIL: "Oasis 来信",
-    SOURCE_SITE_OK: "站点已确认（无成功邮件）",
+    SOURCE_OASIS_MAIL: "结果信（注册截止后的 Oasis 来信）",
 }

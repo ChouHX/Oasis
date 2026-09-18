@@ -284,6 +284,9 @@ class WebAdmin:
             # 页面自己就说了。
             info["running"] = self.controller.running()
             info["build"] = sysinfo.build_stamp()
+            # 截止时间的可读形态：界面上要显示「从什么时候起才算结果」。
+            info["cutoff"] = hitcheck.format_cutoff(hitcheck.parse_cutoff(
+                self.config.get("ballot_cutoff") or hitcheck.DEFAULT_CUTOFF))
             info["version"] = 2
             return self._json(200, info)
 
@@ -387,12 +390,17 @@ class WebAdmin:
             # 「立即巡检一轮」。间隔与并发都在这儿落地，所以改完就能生效，
             # 不必等下一轮或重启。
             body = body or {}
-            for key in ("interval", "threads", "lookback_days", "per_page",
-                        "skip_hits", "limit", "mail_filter"):
+            for key in ("interval", "threads", "per_page", "skip_hits", "limit",
+                        "mail_filter", "only_opted", "ballot_cutoff"):
                 if body.get(key) in (None, ""):
                     continue
-                self.config.data[key] = (body[key] if key in _BOOL_KEYS
-                                         else int(body[key]))
+                if key in _BOOL_KEYS:
+                    self.config.data[key] = body[key]
+                elif key == "ballot_cutoff":
+                    # 时间文本，原样存；解析失败由 monitor 退回默认值。
+                    self.config.data[key] = str(body[key]).strip()
+                else:
+                    self.config.data[key] = int(body[key])
             self.config.save()
             if self.controller.running():
                 self.controller.stop()
@@ -507,9 +515,6 @@ class WebAdmin:
                  "协议", "检查次数"]]
         for h in self.store.hits():
             note = h.get("hit_note") or ""
-            if h.get("hit_source") == hitcheck.SOURCE_SUCCESS_MAIL:
-                # 旧记录里 note 存的是结论，不该再重复一遍来源标签。
-                note = note.replace("旧记录：成功邮件已到", "成功邮件已到")
             rows.append([
                 h.get("email", ""), _stamp(h.get("hit_at")),
                 hitcheck.SOURCE_LABEL.get(h.get("hit_source"),

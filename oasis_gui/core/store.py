@@ -62,12 +62,18 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_mail_at    REAL,
     last_mail_subject TEXT,
     baseline_at     REAL,
-    -- 「这个地址真的预约过」。只有预约过的地址才可能收到中签信，所以检测范围
-    -- 默认就是 opted_in=1 的账号；池子里的其他地址（试过但没成功、或者压根只是
-    -- 存着）不查。见 migrate_legacy_hits 与 mark_opted。
+    -- 「这个地址预约成功过」。只有预约过的地址才可能中签，所以检测范围默认就是
+    -- opted_in=1 的账号；池子里的其他地址（试过但没成功、或者压根只是存着）不查。
+    --
+    -- 注意这里**不是**中签：预约（registration）与中签（ballot result）是两件事，
+    -- 前者在 2026-09-17 16:00 BST 截止，后者要等 Oasis 之后发结果信。把预约成功
+    -- 当成中签，会让名单上出现几百个「已中签」而它们一张票都没有 —— 更糟的是，
+    -- 中了签的账号会被当成已经查过、从此不再检测。
     opted_in        INTEGER NOT NULL DEFAULT 0,
     opted_in_source TEXT,
     opted_in_at     REAL,
+    -- 预约成功的时间（能推断出来时）。来自上一版程序的成功记录或邮件的到达时间。
+    registered_at   REAL,
     UNIQUE (first_name, last_name, phone)
 );
 
@@ -86,6 +92,13 @@ CREATE TABLE IF NOT EXISTS registrations (
     status          TEXT    NOT NULL DEFAULT 'submitted',
     created_at      TEXT    NOT NULL,
     UNIQUE (account_id, artist_id)
+);
+
+-- 一次性的迁移标记。有些修正只该跑一次（比如把误判的中签清掉），而在数据里
+-- 找不到可靠的判据 —— 只能自己记一笔。
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
@@ -109,10 +122,9 @@ class Store:
         c.executescript(SCHEMA)
         self._migrate(c)
         c.commit()
-        merged, opted = self.migrate_legacy_hits()
-        if merged or opted:
-            print(f"store: 旧记录并入中签名单 {merged} 条，"
-                  f"推断出已预约 {opted} 个", flush=True)
+        opted = self.migrate_legacy()
+        if opted:
+            print(f"store: 推断出已预约 {opted} 个（纳入检测范围）", flush=True)
 
     def _migrate(self, c):
         """Additive migrations for databases created by an earlier build."""
@@ -135,7 +147,8 @@ class Store:
                 ("check_error", "TEXT"), ("last_mail_at", "REAL"),
                 ("last_mail_subject", "TEXT"), ("baseline_at", "REAL"),
                 ("opted_in", "INTEGER NOT NULL DEFAULT 0"),
-                ("opted_in_source", "TEXT"), ("opted_in_at", "REAL")):
+                ("opted_in_source", "TEXT"), ("opted_in_at", "REAL"),
+                ("registered_at", "REAL")):
             if name not in cols:
                 c.execute(f"ALTER TABLE accounts ADD COLUMN {name} {decl}")
         rcols = {r["name"] for r in c.execute("PRAGMA table_info(registrations)")}
@@ -143,6 +156,16 @@ class Store:
             c.execute("ALTER TABLE registrations ADD COLUMN mode TEXT "
                       "NOT NULL DEFAULT 'http'")
 
+    def meta_get(self, key, default=None):
+        row = self.conn().execute("SELECT value FROM meta WHERE key=?",
+                                  (key,)).fetchone()
+        return row["value"] if row else default
+
+    def meta_set(self, key, value):
+        return self._write(lambda c: c.execute(
+            "INSERT INTO meta (key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value))))
     def conn(self):
         c = getattr(self._local, "conn", None)
         if c is None:
@@ -360,81 +383,52 @@ class Store:
             return [dict(r) for r in c.execute(sql + " LIMIT ?", (limit,))]
         return [dict(r) for r in c.execute(sql)]
 
-    def migrate_legacy_hits(self):
-        """把上一版程序的结果并入中签名单 —— merge 点。
+    def migrate_legacy(self):
+        """把上一版程序留下的记录翻译成现在这两件事，并纠正一次误判。
 
-        两种旧记录都代表「站点已经收下」：
+        预约（registration）与中签（结果）是两件事：前者 2026-09-17 16:00 BST
+        截止，后者要等 Oasis 发结果信。上一版把「注册成功」直接写成了中签 ——
+        于是名单上出现几百个「已中签」，而它们其实只是预约成功；更糟的是那些
+        账号会被 `skip_hits` 当成已经查过，真正的中签通知来了反而不查。
 
-          * status='registered' —— 成功邮件到过（HTTP 模式实测会发）
-          * status='submitted'  —— 页面确认注册成功，浏览器模式一条成功邮件都
-            不发
-          * 错误里含 `success mail never arrived` —— confirm 回 OK 但成功邮件
-            180s 没到。旧程序把这句写进 error 并按失败处理，它字面上是错误、
-            语义上是成功，这是必须合并的一类，否则它们会被「没有成功邮件」
-            整批吞掉。
+        所以这里做两件事，都是幂等的：
 
-        幂等，而且是**可观测的**幂等：三条语句都带 `hit_at IS NULL`，所以返回的
-        是「这次真正新并入了几条」。少了这个条件，SQLite 的 rowcount 会把「匹配到
-        但值没变」的行也算进去 —— 每次打开库都报一句「并入 2 条」，而实际一条都
-        没变，看日志的人会以为名单在涨。
+          1. **撤销那次误判**（只做一次，靠 meta 表记着）：把每个 `hit_at` 搬到
+             `registered_at` —— 它记录的其实是「预约成功的时间」—— 然后清空
+             `hit_at` / `hit_source` / `hit_note`。此后 `hit_at` 只由检测写，
+             而那意味着「截止时间之后收到了 Oasis 的新来信」。
+          2. **推断「预约成功过」**：状态是 registered/submitted、错误里含那条
+             confirm OK、有 registrations 行的，都算预约过，纳入检测范围。
 
-        时间一律写 epoch 秒（不是 `now()` 那种文本时间）：这一列要和检测流程
-        写进去的值同类型，否则同一列里混着 TEXT 和 REAL，`_stamp()` 转不出
-        人类时间、`ORDER BY hit_at` 也会把文本排在数字后面。
+        「用别的工具或手工预约」的地址推不出来，那部分交给界面的标记功能。
         """
-        stamp = time.time()
+        if not self.meta_get("migration.optin_split"):
+            def split(c):
+                # 旧的 hit_at 是「预约成功」的时刻，搬去它该在的列。
+                c.execute("UPDATE accounts SET registered_at=COALESCE("
+                          "registered_at, hit_at) WHERE hit_at IS NOT NULL")
+                cur = c.execute("UPDATE accounts SET hit_at=NULL, hit_source=NULL,"
+                                "hit_note=NULL WHERE hit_at IS NOT NULL")
+                return cur.rowcount
+            cleared = self._write(split)
+            self.meta_set("migration.optin_split", "1")
+            if cleared:
+                print(f"store: 撤销上一版误判的「中签」{cleared} 条"
+                      f"（它们是预约成功，不是中签）", flush=True)
 
-        def op(c):
-            changed = 0
-            # 1) 成功邮件到过
-            cur = c.execute(
-                "UPDATE accounts SET hit_at=COALESCE(hit_at,?), "
-                "hit_source='success-mail', "
-                "hit_note=COALESCE(hit_note,'旧记录：成功邮件已到'), "
-                "status='hit', updated_at=? "
-                "WHERE status='registered' AND hit_at IS NULL", (stamp, now()))
-            changed += cur.rowcount
-            # 2) 站点确认、页面确认，或那条「confirm OK 但成功邮件没来」
-            cur = c.execute(
-                "UPDATE accounts SET hit_at=COALESCE(hit_at,?), "
-                "hit_source='site-ok', "
-                "hit_note=COALESCE(hit_note,"
-                "'旧记录：站点已确认，活动结束后不会再有成功邮件'), "
-                "status='hit', updated_at=? "
-                "WHERE (status='submitted' OR error LIKE ?) "
-                "AND hit_at IS NULL",
-                (stamp, now(), f"%{hitcheck.NO_MAIL_OK_MARK}%"))
-            changed += cur.rowcount
-            # 3) 同一条错误可能只落在 registrations.response 上
-            cur = c.execute(
-                "UPDATE accounts SET hit_at=COALESCE(hit_at,?), "
-                "hit_source='site-ok', "
-                "hit_note=COALESCE(hit_note,"
-                "'旧记录：站点已确认，活动结束后不会再有成功邮件'), "
-                "status='hit', updated_at=? WHERE hit_at IS NULL AND id IN ("
-                "SELECT account_id FROM registrations WHERE response LIKE ?)",
-                (stamp, now(), f"%{hitcheck.NO_MAIL_OK_MARK}%"))
-            changed += cur.rowcount
-            # 4) 「这个地址预约过」的推断。
-            #
-            # 池子里绝大多数地址没预约过 —— 试过但没成功、或者只是被存着 —— 而没
-            # 预约过的邮箱不可能收到中签信。检测范围因此默认只含 opted_in=1 的
-            # 账号，这一句把上一版程序留下的「预约过」的全部证据翻出来：中签的、
-            # 状态是 registered/submitted 的、以及有 registrations 行的。
-            #
-            # 唯一不在这里的是「用别的工具/手工预约的地址」—— 那种只有操作者知道，
-            # 由界面上的标记功能补上。
+        def infer(c):
             cur = c.execute(
                 "UPDATE accounts SET opted_in=1, opted_in_source='legacy', "
-                "opted_in_at=? WHERE opted_in=0 AND ("
-                "hit_at IS NOT NULL "
-                "OR status IN ('registered','submitted') "
+                "opted_in_at=COALESCE(opted_in_at,?), "
+                "registered_at=COALESCE(registered_at, "
+                "  strftime('%s', updated_at)) "
+                "WHERE opted_in=0 AND ("
+                "status IN ('registered','submitted') "
                 "OR error LIKE ? "
                 "OR id IN (SELECT account_id FROM registrations))",
-                (stamp, f"%{hitcheck.NO_MAIL_OK_MARK}%"))
-            opted = cur.rowcount
-            return changed, opted
-        return self._write(op)
+                (time.time(), f"%{hitcheck.NO_MAIL_OK_MARK}%"))
+            return cur.rowcount
+        return self._write(infer)
 
     def mark_opted(self, account_ids, on=True, source="manual"):
         """把一批账号标进/移出检测范围。
@@ -539,7 +533,7 @@ class Store:
         sql = ("SELECT id,email,first_name,last_name,phone,date_of_birth,status,"
                "protocol,error,updated_at,hit_at,hit_source,hit_note,checked_at,"
                "check_count,check_error,last_mail_at,last_mail_subject,"
-               "opted_in,opted_in_source,opted_in_at "
+               "opted_in,opted_in_source,opted_in_at,registered_at "
                "FROM accounts ORDER BY id DESC")
         c = self.conn()
         if limit:

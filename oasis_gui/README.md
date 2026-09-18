@@ -16,23 +16,27 @@
 Playwright 基础镜像（~1.3GB 的 chromium 与它的系统库）换成 `python:3.12-slim`，
 `docker-compose.yml` 里的 `shm_size: 512mb` 与 `mem_limit: 2500m` 也一并撤掉。
 
-### 中签判定合并了两路证据
+### 中签判定：只看「注册截止之后的 Oasis 来信」
 
-1. **邮件证据**：账号收件箱里出现 Oasis 的来信。正文含
-   `successfully registered`（实测 4/4 成功信含、0/15 验证信含）或标题是
-   `… Registration Complete` 的，判为 `success-mail`；其他非验证类的 Oasis
-   来信判为 `oasis-mail`。
-2. **站点证据（merge 点）**：账号在上一版程序里已经被站点确认过，只是那封
-   成功邮件没来。这包含两类记录，它们本质是同一件事 —— **站点已经收下**：
+**预约（registration）与中签（ballot result）是两件事。** 注册在
+2026-09-17 16:00 BST（= 15:00 UTC）截止，注册期内收到的每一封信 —— 包括那封写着
+`successfully registered` 的 Registration Complete —— 都只说明「这个地址预约成功
+了」，一张票都没拿到。中签是 Oasis 之后发的结果通知，只可能出现在截止之后。
 
-   - `submitted` —— 浏览器模式页面渲染出确认页、一条成功邮件都不发
-   - 错误文本里含 `confirm answered OK but the success mail never arrived
-     within 180s` —— `confirm` 对已接受的地址回 `{"status":"OK"}`，紧接着
-     成功邮件始终不来，旧程序把它记成失败
+判定因此只有一条硬的判据：**信比截止时间晚**。外加两条排除：不是注册期那种带
+`registration?token=` 链接的验证信，也不是明说「注册成功」的信。截止之后 Oasis
+不会无缘无故再发信，所以「截止后的新 Oasis 来信」就是结果，来源记为
+`oasis-mail`。
 
-   活动已经结束，那封信不会再来，所以这两类在开局时就被并入中签名单
-   （`store.migrate_legacy_hits()`，幂等、只补不撤），而不是被「没有成功邮件」
-   这个假象吞掉。它们的中签来源标记为 `site-ok`，与 `success-mail` 分得清。
+截止时间是配置项（设置页可改，默认 `2026-09-17T15:00:00Z`），它在界面上显示成带
+时区的本地时间 —— 只写「15:00」的话，UTC 的容器和 +08:00 的机器指的是不同时刻，
+而它决定了哪些信算数。
+
+**这一版纠正的错误**：上一版把「预约成功」直接当成了中签，名单上于是出现几百个
+「已中签」。那不只是数字难看 —— 那些账号会被 `skip_hits` 当成已经查过，真正的
+结果信到了反而不查。现在旧库打开时会做一次纠正（`store.migrate_legacy()`，幂等）：
+每个 `hit_at` 搬到 `registered_at`（它记录的其实是预约成功的时间），然后清空
+`hit_at` —— 此后 `hit_at` 只由检测写。
 
 ### 检测范围：默认只查「已预约」的地址
 
@@ -1457,6 +1461,10 @@ python3 tests/test_live_sweep.py      # 轮次预算：读不通的邮箱不再�
 - **导入接口收到数组时会静默写出脏邮箱**：它把参数 `str()` 之后当文本切分，于是
   `["a@x.com", "b@x.com"]` 变成 `['a@x.com` 和 `'b@x.com']` 两个「邮箱」。界面
   一直传的是文本所以没暴露，接口却不是只能收文本。现在数组与文本分开处理。
+- **把「预约成功」当成了「中签」**：`registered` / `submitted` / 那条
+  `confirm answered OK…` 都是预约的证据，不是结果。上一版把它们写成了 `hit`，
+  于是名单上几百个「已中签」，而那些账号还会被 `skip_hits` 跳过 —— 真正中签的
+  通知来了不查。现在中签只有一个来源：注册截止之后的 Oasis 来信。
 - **桌面版用过 `FIF.SELECT_ALL`**，这个图标在真实版本的 qfluentwidgets 里
   不存在，构造窗口就 AttributeError。在容器里跑渲染测试才发现 —— 桌面版现在
   只用项目里已经在用的那几个图标。
