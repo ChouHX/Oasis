@@ -99,6 +99,7 @@ ENV_KEYS = {
     "OASIS_LOOKBACK_DAYS": "lookback_days",
     "OASIS_PER_PAGE": "per_page",
     "OASIS_LIMIT": "limit",
+    "OASIS_MAIL_FILTER": "mail_filter",
     "OASIS_DEBUG": "debug",
     "OASIS_MAIL_PROXY": "mail_proxy",
     "OASIS_HME_BASE": "hme_base",
@@ -107,7 +108,7 @@ ENV_KEYS = {
     "OASIS_ALIAS_PASSWORD": "alias_inbox_password",
 }
 _INT_KEYS = ("interval", "threads", "lookback_days", "per_page", "limit")
-_BOOL_KEYS = ("debug", "skip_hits")
+_BOOL_KEYS = ("debug", "skip_hits", "mail_filter")
 
 
 def build_config():
@@ -368,6 +369,7 @@ def main():
                           per_page=int(conf.get("per_page") or 20),
                           skip_hits=bool(conf.get("skip_hits", True)),
                           limit=int(conf.get("limit") or 0),
+                          mail_filter=bool(conf.get("mail_filter", True)),
                           rounds=1)
             monitor.join()
         except Exception as e:

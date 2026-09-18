@@ -34,6 +34,26 @@ Playwright 基础镜像（~1.3GB 的 chromium 与它的系统库）换成 `pytho
    （`store.migrate_legacy_hits()`，幂等、只补不撤），而不是被「没有成功邮件」
    这个假象吞掉。它们的中签来源标记为 `site-ok`，与 `success-mail` 分得清。
 
+### 取信：默认只让服务端回 Oasis 的信
+
+读到「最近 N 封再本地挑」和「让服务端只回 Oasis 的信」是两种成本。判据来自实测
+（2026-09-18，真实邮箱）：Oasis 的验证信与成功邮件是同一个发件人
+`oasis@openstageit.com`（显示名 "Oasis"），iCloud 别名那一侧被 Apple 遮蔽成
+`oasis_at_openstageit_com_<hash>@icloud.com` —— 两边都含 `openstage`。所以粗筛
+条件是「发件人含 openstage **或** 标题含 Oasis」（OR，不是 AND：宁可多拉几封，
+也不能因为站点换了域名就把结果信筛掉）。
+
+- Graph 走 `$filter`，Gmail/Outlook 走 IMAP `SEARCH`，iCloud HME 服务端只认
+  天窗与条数，所以那边忽略粗筛、照旧取一页回来本地判。
+- **首次检测一个账号时永远走全量。** 活动结束、结果可能早就发过了，那一次必须把
+  邮箱里已经存在的信看全 —— 粗筛的收益在之后的轮次里，代价则可能是一次漏检。
+- 服务端拒绝粗筛（IMAP 的 OR、Graph 的 `$filter` 都可能被拒）时抛
+  `MailSearchUnsupported`，monitor 退回全量读。**「筛不出来」绝不等于「读不到」**，
+  这一条有专门的回归测试。
+- 实测效果：混着无关邮件的账号，读取从 7 封降到 4 封 / 1 封，而 Oasis 的信一封
+  没少。设置页（桌面端与网页端）都有「只拉 Oasis 来信」开关，站点哪天换了发件人
+  就关掉它。
+
 **验证信不算中签。** 实测（真实 Outlook 邮箱、30 天回看窗口）：注册期间每个
 账号都被自己触发过一封 `Verify Your Email`，它同样是「Oasis 的新来信」。若只看
 「有没有新来信」，这些账号会全部被判成中签 —— 那判的是注册动作，不是结果。

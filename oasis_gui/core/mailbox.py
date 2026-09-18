@@ -149,6 +149,24 @@ def parse_cred(line):
                      "(or the 5-field Gmail form)")
 
 
+# ---------------------------------------------------------------- 服务端筛选 --
+# 只把 Oasis 的信拉回来，而不是「最近 N 封全量 RFC822 再本地挑」。
+#
+# 判据来自实测（2026-09-18，真实 Outlook 邮箱）：Oasis 的验证信与成功邮件是同一个
+# 发件人 `oasis@openstageit.com`（显示名 "Oasis"），而 iCloud 别名那一侧被 Apple
+# 遮蔽成 `oasis_at_openstageit_com_<hash>@icloud.com` —— 两边都含 `openstage`。
+# 所以按发件人域筛是可靠的，标题再兜一层（换域名也不至于全漏）。
+#
+# 这是**粗筛**：它只决定「拉哪几封回来」，判定仍然在 core.hitcheck 里做，
+# 判据一个字都没变。宽一点没关系，漏掉才贵 —— 所以两个条件是 OR 而不是 AND，
+# 而且读信失败/服务端不认这套语法时一律退回全量（见各 reader 的实现）。
+OASIS_SENDER_HINT = "openstage"
+OASIS_SUBJECT_HINT = "Oasis"
+# Graph 的 $filter：subject 支持 contains，而 from 地址只支持比较，所以这里钉住
+# 实测到的那个地址；换域名的情形由标题这一支兜住。
+GRAPH_OASIS_FILTER = (f"contains(subject,'{OASIS_SUBJECT_HINT}') or "
+                      f"from/emailAddress/address eq 'oasis@openstageit.com'")
+
 # 单次网络操作的超时，以及一次读信箱允许的重试次数。
 #
 # 这组数字是给「不可达的邮箱」定的。实测（2026-09-18）：一个直连不通的 Gmail 账号
@@ -157,6 +175,17 @@ def parse_cred(line):
 # 必须是「几十秒失败」，否则一个坏邮箱就能吃掉整轮。
 NET_TIMEOUT = 20
 NET_ATTEMPTS = 2
+
+
+class MailSearchUnsupported(Exception):
+    """Server-side search (the Oasis prefilter) was rejected or failed.
+
+    Distinct from "the search returned nothing": the caller has to fall back to
+    an unfiltered read rather than conclude the mailbox has no mail from the
+    site. Measured concern, not hypothetical - the prefilter leans on IMAP's
+    prefix OR and on Graph's $filter, and a server that dislikes either will
+    answer BAD instead of returning an empty result set.
+    """
 
 
 class MailAuthError(Exception):
@@ -324,12 +353,15 @@ class BaseMailbox:
         """
         return None
 
-    def messages(self, limit=12, not_before=None):
+    def messages(self, limit=12, not_before=None, only_oasis=False):
         """Newest-first page of Mail for this mailbox.
 
-        `not_before` is an epoch floor. Readers that can push the filter to the
-        server (Gmail's SEARCH SINCE) do; readers that cannot accept it and
-        filter at the end. Either way the caller sees only what it asked for.
+        `not_before` is an epoch floor and `only_oasis` asks the server for the
+        site's mail only. Both are hints: readers that can push them down (IMAP
+        SEARCH, Graph $filter) do, and readers that cannot (the iCloud HME
+        service) simply ignore them and return a wider page. Callers must
+        therefore never rely on either for correctness - filtering happens again
+        in core.hitcheck.
         """
         raise NotImplementedError
 
@@ -341,26 +373,34 @@ class GraphMailbox(BaseMailbox):
     protocol = "graph"
     scope = GRAPH_SCOPE
 
-    def _folder_messages(self, path, top):
+    def _folder_messages(self, path, top, only_oasis=False):
         token = self.access_token()
         opener = self._opener()
         url = f"{GRAPH}{path}?$top={top}&$select={GRAPH_SELECT}"
+        if only_oasis:
+            # Graph 的 $filter 与 $orderby 互斥，这里没有 orderby，所以安全。
+            url += "&$filter=" + urllib.parse.quote(GRAPH_OASIS_FILTER, safe="()'")
         data = _retry(lambda: _open(urllib.request.Request(
             url, headers={"Authorization": "Bearer " + token,
                           "Accept": "application/json"}), opener=opener))
         return data.get("value", [])
 
-    def messages(self, limit=15, not_before=None):
+    def messages(self, limit=15, not_before=None, only_oasis=False):
         """Inbox **and** Junk, newest first.
 
         Graph's /me/messages returns the Inbox only - measured on a real
         mailbox: 13 messages, all Inbox, with the Junk folder invisible even
         though it held mail. The site's mail is routinely filed as junk, so the
         junk folder is queried separately (well-known name `junkemail`).
+
+        `only_oasis` becomes a $filter on the request, which is the difference
+        between downloading twenty message bodies to keep four and downloading
+        the four.
         """
-        msgs = self._folder_messages("/me/messages", limit)
+        msgs = self._folder_messages("/me/messages", limit, only_oasis)
         try:
-            msgs += self._folder_messages("/me/mailFolders/junkemail/messages", limit)
+            msgs += self._folder_messages("/me/mailFolders/junkemail/messages",
+                                          limit, only_oasis)
         except Exception:
             pass                      # folder missing or not exposed by the API
         seen, out = set(), []
@@ -463,26 +503,57 @@ class ImapMailbox(BaseMailbox):
                     time.sleep(1.0)
         raise last
 
-    def messages(self, limit=12, not_before=None):
+    @staticmethod
+    def oasis_search_terms():
+        """IMAP 的搜索项：来自 openstage，**或**标题含 Oasis。
+
+        OR 是前缀操作符（`OR <a> <b>`），所以这串读作 `(FROM openstage) OR
+        (SUBJECT Oasis)`。写成这样而不是 AND：粗筛宁可多拉几封，也不能因为
+        站点换了发件人域就把那封结果信筛掉。
+        """
+        return ["OR", "FROM", f'"{OASIS_SENDER_HINT}"',
+                "SUBJECT", f'"{OASIS_SUBJECT_HINT}"']
+
+    def messages(self, limit=12, not_before=None, only_oasis=False):
         """Newest-first page of Mail, INBOX + Junk.
 
         `not_before` is accepted and ignored here: this reader always pulls the
         newest N regardless, which is right for a mailbox that only holds the
         few accounts pointed at it. Subclasses with a busier inbox use it to
         narrow the search on the server instead of filtering at the end.
+
+        `only_oasis` narrows the SEARCH itself, so a mailbox with a hundred
+        unrelated messages fetches the site's four instead of a twenty-message
+        window that is mostly noise. A server that rejects the syntax raises,
+        and the caller sees an empty page rather than a wrong answer - see
+        monitor._read_and_judge, which falls back to an unfiltered read.
         """
         M = self.connect()
         try:
             out = []
+            terms = self.oasis_search_terms() if only_oasis else ["ALL"]
             for folder in _candidate_folders(M):
                 try:
                     typ, _ = M.select(folder, readonly=True)
                     if typ != "OK":
                         continue
-                    typ, data = M.search(None, "ALL")
+                    typ, data = M.search(None, *terms)
                     if typ != "OK":
-                        continue
-                except Exception:
+                        # imaplib 对 BAD 直接抛，而 NO 是走这里的 —— 两条路都要
+                        # 按同一个规则处理。
+                        raise MailSearchUnsupported(
+                            f"服务端拒绝了这次 SEARCH（{typ}）")
+                except Exception as e:
+                    # INBOX 上「搜索失败」不能当成「没有来信」：粗筛用的 OR 语法
+                    # 不是每个服务端都认，静默返回空会让这个账号每轮都被判成
+                    # 未中签。抛给调用方，由 monitor 降级成全量读。Junk 文件夹
+                    # 失败仍然忍掉 —— 它只是补充。
+                    if isinstance(e, MailSearchUnsupported) and folder == "INBOX":
+                        raise
+                    if folder == "INBOX":
+                        raise MailSearchUnsupported(
+                            f"服务端不接受这次 SEARCH（{type(e).__name__}: "
+                            f"{str(e)[:80]}）") from e
                     continue
                 for i in reversed(data[0].split()[-limit:]):
                     try:
@@ -598,8 +669,11 @@ class HmeMailbox(BaseMailbox):
         return f"{self.email}----{self.account}----hme"
 
     # ----------------------------------------------------------------- reading
-    def messages(self, limit=12, not_before=None):
+    def messages(self, limit=12, not_before=None, only_oasis=False):
         """Newest messages for this alias, link-bearing HTML flattened in.
+
+        `only_oasis` is accepted and ignored: the local service windows by day
+        and count only, so the caller gets a wider page and hitcheck narrows it.
 
         `preview` is returned by the list endpoint but omits the button URL, so
         each message's detail is fetched to recover `body_html`. Those are
@@ -669,7 +743,7 @@ class AutoMailbox:
     def cred_line(self):
         return self._current.cred_line()
 
-    def messages(self, limit=12, not_before=None):
+    def messages(self, limit=12, not_before=None, only_oasis=False):
         """Read through whichever channel can actually see this mailbox.
 
         Graph first. A 401 means this registration has no Graph mail permission
@@ -678,7 +752,7 @@ class AutoMailbox:
         the switch because Graph may already have replaced it.
         """
         try:
-            out = self.primary.messages(limit, not_before)
+            out = self.primary.messages(limit, not_before, only_oasis)
             self._current = self.primary
             return out
         except MailAuthError as e:
@@ -689,7 +763,7 @@ class AutoMailbox:
                                        or self.fallback.refresh_token)
         self._current = self.fallback
         try:
-            return self.fallback.messages(limit, not_before)
+            return self.fallback.messages(limit, not_before, only_oasis)
         except Exception as e:
             raise MailAuthError(f"Graph 与 IMAP 都读不到：{first} / "
                                 f"{type(e).__name__}: {str(e)[:90]}") from e
@@ -876,8 +950,14 @@ class GmailAliasMailbox(ImapMailbox):
             self._junk_folders = _candidate_folders(M)[1:]
         return self._junk_folders
 
-    def _search_args(self, not_before=None):
+    def _search_args(self, not_before=None, only_oasis=False):
         args = ["TO", self.email]
+        if only_oasis:
+            # 前缀 OR 与前面的 TO 是 AND 关系：读作
+            # `TO <alias> AND ((FROM openstage) OR (SUBJECT Oasis))`。
+            # 别名收件箱里有一堆别家的邮件（实测那个 Gmail 里躺着 LA28 的结果），
+            # 这一条把它们挡在下载之前。
+            args += self.oasis_search_terms()
         if not_before:
             # SINCE has day granularity and compares the time the server took
             # the message, so widen by a day and let the exact timestamp decide.
@@ -887,15 +967,26 @@ class GmailAliasMailbox(ImapMailbox):
                 "%d-%b-%Y", time.gmtime(not_before - 86400))]
         return args
 
-    def _fetch_folder(self, M, folder, limit, not_before):
+    def _fetch_folder(self, M, folder, limit, not_before, only_oasis=False):
         try:
             typ, _ = M.select(folder, readonly=True)
             if typ != "OK":
                 return []
-            typ, hit = M.search(None, *self._search_args(not_before))
-            if typ != "OK" or not hit or not hit[0]:
+            typ, hit = M.search(None, *self._search_args(not_before, only_oasis))
+            if typ != "OK":
+                raise MailSearchUnsupported(f"服务端拒绝了这次 SEARCH（{typ}）")
+            if not hit or not hit[0]:
                 return []
-        except Exception:
+        except MailSearchUnsupported:
+            if folder == "INBOX":
+                raise
+            return []
+        except Exception as e:
+            # 见 ImapMailbox.messages：INBOX 上的搜索失败要抛，不能伪装成空邮箱。
+            if folder == "INBOX":
+                raise MailSearchUnsupported(
+                    f"服务端不接受这次 SEARCH（{type(e).__name__}: "
+                    f"{str(e)[:80]}）") from e
             return []
         out = []
         # Gmail returns ids in ascending arrival order, so the tail is the
@@ -915,10 +1006,10 @@ class GmailAliasMailbox(ImapMailbox):
             out.append(_message_mail(msg, folder))
         return out
 
-    def messages(self, limit=12, not_before=None):
+    def messages(self, limit=12, not_before=None, only_oasis=False):
         """Newest-first page of Mail, for this alias only."""
         M = self._live()
-        out = self._fetch_folder(M, "INBOX", limit, not_before)
+        out = self._fetch_folder(M, "INBOX", limit, not_before, only_oasis)
         # Junk is checked on a timer, not "only when the inbox was empty": these
         # aliases receive plenty of unrelated mail - the inbox of one here holds
         # 36 messages, including an LA28 draw confirmation - so an empty inbox
@@ -928,7 +1019,7 @@ class GmailAliasMailbox(ImapMailbox):
         if time.time() >= self._junk_after:
             self._junk_after = time.time() + self._JUNK_EVERY
             for folder in self._junk(M):
-                out += self._fetch_folder(M, folder, limit, not_before)
+                out += self._fetch_folder(M, folder, limit, not_before, only_oasis)
         out.sort(key=lambda m: m.stamp or 0, reverse=True)
         return out[:limit]
 

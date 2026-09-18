@@ -14,6 +14,12 @@ const FIELDS = [
   { key: "per_page", label: "每箱取信（封）", type: "int",
     hint: "每个邮箱取最近多少封信来判断。判据是「Oasis 来信」本身，" +
           "所以不需要把整箱读完。" },
+  { key: "mail_filter", label: "只拉 Oasis 来信", type: "bool",
+    hint: "让服务端只把 Oasis 的信拉回来（发件人 openstage 或标题含 Oasis），" +
+          "而不是把「最近 N 封」整个拉回本地挑 —— 邮箱里塞着几百封无关邮件时，" +
+          "差别是几十倍的下载量。首次检测一个账号时始终走全量，保证不漏掉" +
+          "「已经发过的结果信」。若哪天站点换了发件人域、结果信标题里又没有 " +
+          "Oasis，把它关掉。" },
   { key: "mail_proxy", label: "取件代理", type: "text", wide: true,
     hint: "留空 = 直连（推荐）。仅在网络必须走代理时才填。" },
   { key: "hme_base", label: "iCloud 服务地址", type: "text", wide: true,

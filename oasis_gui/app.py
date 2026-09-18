@@ -720,6 +720,13 @@ class SettingsPage(ScrollArea):
         self.skip_hits.setToolTip(
             "开启后已中签的账号不再重复检测 —— 同一个答案重复搜索没有意义。\n"
             "若想连后续的付款/取票通知一起盯，把它关掉。")
+        self.mail_filter = SwitchButton()
+        self.mail_filter.setChecked(bool(win.cfg.get("mail_filter", True)))
+        self.mail_filter.setToolTip(
+            "开启后只让服务端把 Oasis 的来信拉回来（发件人 openstage 或标题含 Oasis），\n"
+            "而不是把「最近 N 封」整个拉回本地挑。首次检测一个账号时始终走全量。\n"
+            "判据来自实测：验证信与成功邮件都是 oasis@openstageit.com 发的。\n"
+            "若哪天站点换了发件人域、结果信标题里又没有 Oasis，把它关掉。")
         self.debug = SwitchButton()
         self.debug.setChecked(bool(win.cfg.get("debug", False)))
 
@@ -728,6 +735,7 @@ class SettingsPage(ScrollArea):
                 ("首次回看(天)", self.lookback_days),
                 ("每箱取信(封)", self.per_page),
                 ("跳过已中签", self.skip_hits),
+                ("只拉 Oasis 来信", self.mail_filter),
                 ("调试堆栈", self.debug)]
         for i, (label, w) in enumerate(rows):
             grid.addWidget(BodyLabel(label), i, 0)
@@ -818,6 +826,7 @@ class SettingsPage(ScrollArea):
             "lookback_days": self.lookback_days.value(),
             "per_page": self.per_page.value(),
             "skip_hits": self.skip_hits.isChecked(),
+            "mail_filter": self.mail_filter.isChecked(),
             "mail_proxy": self.mail_proxy.text().strip(),
             "hme_base": self.hme_base.text().strip(),
             "hme_password": self.hme_password.text().strip(),

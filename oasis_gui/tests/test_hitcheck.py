@@ -60,9 +60,12 @@ class FakeMailbox:
         self._boom = boom
         self.closed = False
         self.calls = 0
+        # 每次读都记下「有没有要求服务端只回 Oasis 的信」，用来断言粗筛的下推。
+        self.filters = []
 
-    def messages(self, limit=12, not_before=None):
+    def messages(self, limit=12, not_before=None, only_oasis=False):
         self.calls += 1
+        self.filters.append(only_oasis)
         if self.email == "g-broken@outlook.com":
             raise OSError("imap connect refused")
         out = list(INBOX.get(self.email, []))
@@ -174,10 +177,24 @@ print(f"[{'OK ' if len(alias_readers) == 1 else 'FAIL'}] "
 if len(alias_readers) != 1:
     ok = False
 
+# 粗筛下推：首次读一个账号要全量（保证不漏掉已经发过的结果信），
+# 之后才让服务端只回 Oasis 的信。
+probe_email = "d-foreign@outlook.com"
+reads = [m.filters for m in built if m.email == probe_email]
+first_pass = reads[0] if reads else []
+
 # 幂等：再扫一轮，中签结论不变、不会被抹掉
 mon2 = monitor_mod.HitMonitor(store, lambda lvl, msg: None,
                               lambda kind, payload=None: None, {})
 mon2.sweep()
+reads = [m.filters for m in built if m.email == probe_email]
+later = reads[1] if len(reads) > 1 else []
+filter_ok = first_pass == [False] and later == [True]
+print(f"[{'OK ' if filter_ok else 'FAIL'}] 首次全量、其后服务端粗筛"
+      f"（首轮 {first_pass}，次轮 {later}）")
+if not filter_ok:
+    ok = False
+
 again = {r["email"]: r.get("hit_source") for r in store.accounts()}
 stable = all(again[e] == w for e, w, _ in checks)
 print(f"[{'OK ' if stable else 'FAIL'}] 第二轮不改变已有结论")

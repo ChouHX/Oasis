@@ -23,6 +23,8 @@ from http.cookies import SimpleCookie
 from core import hitcheck, mailbox, sysinfo
 
 SESSION_COOKIE = "oasis_session"
+# /api/start 里按原值落盘的键（其余按整数转）。
+_BOOL_KEYS = ("skip_hits", "mail_filter")
 
 # Shown when the React bundle is absent - the usual case when running from a
 # source checkout without a build. Saying so beats an empty white page.
@@ -333,10 +335,10 @@ class WebAdmin:
             # 不必等下一轮或重启。
             body = body or {}
             for key in ("interval", "threads", "lookback_days", "per_page",
-                        "skip_hits", "limit"):
+                        "skip_hits", "limit", "mail_filter"):
                 if body.get(key) in (None, ""):
                     continue
-                self.config.data[key] = (body[key] if key == "skip_hits"
+                self.config.data[key] = (body[key] if key in _BOOL_KEYS
                                          else int(body[key]))
             self.config.save()
             if self.controller.running():

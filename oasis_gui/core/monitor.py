@@ -22,7 +22,8 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from . import hitcheck
-from .mailbox import ALIAS_PROTOCOL, MailAuthError, make_mailbox
+from .mailbox import (ALIAS_PROTOCOL, MailAuthError,
+                      MailSearchUnsupported, make_mailbox)
 
 # 默认值。都可由 config 覆盖，改一处就能在 Web UI 上调。
 DEFAULT_INTERVAL = 300          # 秒；一轮跑完到下一轮开始之间的等待
@@ -65,6 +66,12 @@ class HitMonitor:
         self.skip_hits = bool(self.setting("skip_hits", None, True))
         # 一轮最多查几个账号，0 = 全部。留给「先拿一两个试」和排查单个邮箱。
         self.limit = max(0, int(self.setting("limit", None, 0) or 0))
+        # 服务端只拉 Oasis 的来信（见 core.mailbox 的 OASIS_SENDER_HINT）。
+        # 首次检测一个账号时始终走全量，之后才用粗筛 —— 理由在 _read_and_judge 里。
+        self.mail_filter = bool(self.setting("mail_filter", None, True))
+        # 某个服务端明确拒绝粗筛之后置位：本轮剩下的账号直接走全量，不浪费一次
+        # 必然失败的搜索。
+        self.mail_filter_broken = False
         self._rounds = 0
         # 一轮的时间预算。一轮要给几十上百个邮箱轮一遍，而单个坏邮箱（出口不通、
         # 被墙、账号被限）能让一次读信花掉好几分钟 —— 实测过一个直连不通的 Gmail
@@ -115,7 +122,8 @@ class HitMonitor:
 
     # ------------------------------------------------------------------- control
     def start(self, threads=None, interval=None, lookback_days=None,
-              per_page=None, skip_hits=None, limit=None, rounds=0):
+              per_page=None, skip_hits=None, limit=None, mail_filter=None,
+              rounds=0):
         """开始巡检。
 
         `rounds=0` 是常驻（一直跑，每轮之间等 interval）；`rounds=1` 只跑一轮
@@ -135,6 +143,8 @@ class HitMonitor:
                                            True if skip_hits is None
                                            else skip_hits, True))
         self.limit = max(0, int(self.setting("limit", limit, 0) or 0))
+        self.mail_filter = bool(self.setting("mail_filter", mail_filter, True))
+        self.mail_filter_broken = False
         self._rounds = int(rounds or 0)
         self._stop.clear()
         self._wake.clear()
@@ -352,15 +362,47 @@ class HitMonitor:
             # 「现在」，那些信会被当成历史而白白漏掉。
             baseline = (time.time() - self.lookback_days * 86400
                         if self.lookback_days > 0 else 0.0)
+        # 粗筛还是全量，取决于这个账号查过几次。
+        #
+        # 首次检测走全量：那一次要把邮箱里**已经存在**的信看全 —— 活动结束、结果
+        # 可能早就发过了，任何粗筛都有漏掉它的风险，而这正是这一版程序最要紧的
+        # 一次读。之后的轮次只做服务端粗筛（发件人 openstage 或标题含 Oasis），
+        # 因为此后要找的都是「新到的信」，而 Oasis 的信实测来自同一个发件人。
+        #
+        # 代价与收益都清楚：全量 = 拉 N 封正文本地挑；粗筛 = 服务端只回那几封。
+        # 邮箱里塞着几百封无关邮件的账号，差别是几十倍的下载量。若哪天站点换了
+        # 发件人，把 mail_filter 关掉即可 —— 那等于每轮都按首次的标准读。
+        first_look = not acct.get("check_count")
+        only_oasis = (self.mail_filter and not first_look
+                      and not self.mail_filter_broken)
         try:
             mails = mailbox.messages(limit=self.per_page,
-                                     not_before=baseline or None)
+                                     not_before=baseline or None,
+                                     only_oasis=only_oasis)
+        except MailSearchUnsupported as e:
+            # 粗筛这条路走不通（服务端不认这套搜索语法）。退回全量 —— 把
+            # 「筛不出来」当成「读不到」，会让这个账号每轮都被记一次失败，
+            # 而它其实完全可以读。
+            self._log("warn", f"{acct['email']}：{e} —— 改为全量读取")
+            self.mail_filter_broken = True
+            try:
+                mails = mailbox.messages(limit=self.per_page,
+                                         not_before=baseline or None)
+            except MailAuthError as e2:
+                self._record_error(acct, f"取件被拒：{str(e2)[:200]}")
+                return
+            except Exception as e2:
+                self._record_error(acct, f"{type(e2).__name__}: {str(e2)[:200]}")
+                return
         except MailAuthError as e:
             self._record_error(acct, f"取件被拒：{str(e)[:200]}")
             return
         except Exception as e:
             self._record_error(acct, f"{type(e).__name__}: {str(e)[:200]}")
             return
+        if first_look and self.mail_filter:
+            self._log("debug", f"{acct['email']}：首次检测，取全量 "
+                               f"{len(mails)} 封做基准")
 
         verdict = hitcheck.pick_oasis(mails, baseline_at=baseline)
         latest_at, latest_subject = verdict["latest"] or (None, "")

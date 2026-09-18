@@ -93,6 +93,7 @@ export default function Dashboard({ state, refresh }) {
   const [interval, setInterval] = useState(300);
   const [lookback, setLookback] = useState(30);
   const [skipHits, setSkipHits] = useState(true);
+  const [mailFilter, setMailFilter] = useState(true);
   const [busy, setBusy] = useState(false);
 
   // Seed the run controls once per visit, and never again.
@@ -112,6 +113,7 @@ export default function Dashboard({ state, refresh }) {
     if (c.interval) setInterval(c.interval);
     if (c.lookback_days !== undefined) setLookback(c.lookback_days);
     if (c.skip_hits !== undefined) setSkipHits(!!c.skip_hits);
+    if (c.mail_filter !== undefined) setMailFilter(!!c.mail_filter);
   }, [state?.config]);
 
   const stats = state?.stats || {};
@@ -137,6 +139,7 @@ export default function Dashboard({ state, refresh }) {
     persist({ lookback_days: n });
   };
   const changeSkipHits = (v) => { setSkipHits(v); persist({ skip_hits: v }); };
+  const changeMailFilter = (v) => { setMailFilter(v); persist({ mail_filter: v }); };
 
   const run = async (fn, ok) => {
     setBusy(true);
@@ -210,6 +213,13 @@ export default function Dashboard({ state, refresh }) {
             <Text type="secondary">跳过已中签</Text>
             <Switch size="small" checked={skipHits} onChange={changeSkipHits} />
           </Space>
+          <Space size={6}>
+            <Text type="secondary">只拉 Oasis 来信</Text>
+            <Tooltip title="让服务端只把 Oasis 的信拉回来（发件人 openstage 或标题含 Oasis），而不是把「最近 N 封」整个拉回本地挑。首次检测一个账号时始终走全量，保证不漏掉已经发过的结果信。若站点换了发件人域、结果标题里又没有 Oasis，把它关掉。">
+              <Switch size="small" checked={mailFilter}
+                      onChange={changeMailFilter} />
+            </Tooltip>
+          </Space>
           <Button
             type="primary"
             icon={<CaretRightOutlined />}
@@ -217,7 +227,7 @@ export default function Dashboard({ state, refresh }) {
             disabled={state?.running}
             onClick={() => run(
               () => api.start({ threads, interval, lookback_days: lookback,
-                                skip_hits: skipHits }),
+                                skip_hits: skipHits, mail_filter: mailFilter }),
               "已开始检测")}
           >
             开始检测
